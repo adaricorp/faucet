@@ -299,22 +299,38 @@ class VLAN(Conf):
         self.dyn_unresolved_route_ip_gws = collections.defaultdict(list)
         self.dyn_unresolved_host_ip_gws = collections.defaultdict(list)
 
+    def is_same_vlan(self, other):
+        """Return True if other is this VLAN, checking the VID before the hash.
+
+        Conf equality hashes the whole config, and the hash is not cached
+        until finalize(). A differing VID settles it without hashing; a
+        matching VID does not, because after a reload Conf.merge_dyn can
+        leave a port pointing at the previous config's object for this VID.
+        """
+        if other is None or other.vid != self.vid:
+            return False
+        return other is self or other == self
+
     def reset_ports(self, ports):
         """Reset tagged and untagged port lists."""
         sorted_ports = sorted(ports, key=lambda i: i.number)
-        # pylint: disable=consider-using-generator
         self.tagged = tuple(
-            [port for port in sorted_ports if self in port.tagged_vlans]
+            port
+            for port in sorted_ports
+            if any(self.is_same_vlan(vlan) for vlan in port.tagged_vlans)
         )
         self.untagged = tuple(
-            [
-                port
-                for port in sorted_ports
-                if (self == port.native_vlan and port.dyn_dot1x_native_vlan is None)
-            ]
+            port
+            for port in sorted_ports
+            if (
+                self.is_same_vlan(port.native_vlan)
+                and port.dyn_dot1x_native_vlan is None
+            )
         )
         self.dot1x_untagged = tuple(
-            [port for port in sorted_ports if self == port.dyn_dot1x_native_vlan]
+            port
+            for port in sorted_ports
+            if self.is_same_vlan(port.dyn_dot1x_native_vlan)
         )
 
     def add_cache_host(self, eth_src, port, cache_time):
