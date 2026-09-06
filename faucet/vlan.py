@@ -299,22 +299,57 @@ class VLAN(Conf):
         self.dyn_unresolved_route_ip_gws = collections.defaultdict(list)
         self.dyn_unresolved_host_ip_gws = collections.defaultdict(list)
 
-    def reset_ports(self, ports):
-        """Reset tagged and untagged port lists."""
+    def is_same_vlan(self, other):
+        """Return True if other is this VLAN, checking the VID before the hash.
+
+        Conf equality hashes the whole config, and the hash is not cached
+        until finalize(). A differing VID settles it without hashing; a
+        matching VID does not, because after a reload Conf.merge_dyn can
+        leave a port pointing at the previous config's object for this VID.
+        """
+        if other is None or other.vid != self.vid:
+            return False
+        return other is self or other == self
+
+    @staticmethod
+    def tagged_vlans_by_vid(ports):
+        """Return the ports' tagged VLANs, by port number and VID."""
+        tagged_by_vid = collections.defaultdict(list)
+        for port in ports:
+            for vlan in port.tagged_vlans:
+                tagged_by_vid[(port.number, vlan.vid)].append(vlan)
+        return tagged_by_vid
+
+    def reset_ports(self, ports, tagged_by_vid=None):
+        """Reset tagged and untagged port lists.
+
+        Pass tagged_vlans_by_vid() of these ports, or of more, to reset many
+        VLANs: building it reads every tagged VLAN of each port, so building
+        it for each VLAN reads a trunk's once for every VLAN it carries.
+        """
         sorted_ports = sorted(ports, key=lambda i: i.number)
-        # pylint: disable=consider-using-generator
+        if tagged_by_vid is None:
+            tagged_by_vid = self.tagged_vlans_by_vid(sorted_ports)
         self.tagged = tuple(
-            [port for port in sorted_ports if self in port.tagged_vlans]
+            port
+            for port in sorted_ports
+            if any(
+                self.is_same_vlan(vlan)
+                for vlan in tagged_by_vid.get((port.number, self.vid), ())
+            )
         )
         self.untagged = tuple(
-            [
-                port
-                for port in sorted_ports
-                if (self == port.native_vlan and port.dyn_dot1x_native_vlan is None)
-            ]
+            port
+            for port in sorted_ports
+            if (
+                self.is_same_vlan(port.native_vlan)
+                and port.dyn_dot1x_native_vlan is None
+            )
         )
         self.dot1x_untagged = tuple(
-            [port for port in sorted_ports if self == port.dyn_dot1x_native_vlan]
+            port
+            for port in sorted_ports
+            if self.is_same_vlan(port.dyn_dot1x_native_vlan)
         )
 
     def add_cache_host(self, eth_src, port, cache_time):
