@@ -5,16 +5,176 @@
 # pylint: disable=protected-access
 # pylint: disable=too-many-lines
 
+import contextlib
 import logging
+import random
 import re
 import shutil
 import tempfile
 import os
 import unittest
+from collections import defaultdict
+from unittest import mock
+
+import yaml
 
 from faucet import config_parser as cp
+from faucet.conf import Conf
+from faucet.dp import DP
+from faucet.port import Port
+from faucet.router import Router
+from faucet.vlan import VLAN
 
 LOGNAME = "/dev/null"
+
+
+def replaced_reset_ports(self, ports):
+    """VLAN.reset_ports() as it was before VIDs were compared first.
+
+    Kept verbatim, as the oracle for the differential tests below.
+    """
+    sorted_ports = sorted(ports, key=lambda i: i.number)
+    # pylint: disable=consider-using-generator
+    self.tagged = tuple([port for port in sorted_ports if self in port.tagged_vlans])
+    self.untagged = tuple(
+        [
+            port
+            for port in sorted_ports
+            if (self == port.native_vlan and port.dyn_dot1x_native_vlan is None)
+        ]
+    )
+    self.dot1x_untagged = tuple(
+        [port for port in sorted_ports if self == port.dyn_dot1x_native_vlan]
+    )
+
+
+def replaced_reset_refs(self, vlans=None):
+    """DP.reset_refs() as it was before ports were collected by VID.
+
+    Kept verbatim, as the oracle for the differential tests below.
+    """
+    if vlans is None:
+        vlans = self.vlans
+        router_vlans = {
+            vlan._id for router in self.routers.values() for vlan in router.vlans
+        }
+    else:
+        router_vlans = {
+            vlan for router in self.routers.values() for vlan in router.vlans
+        }
+
+    vlan_ports = defaultdict(set)
+    for port in self.ports.values():
+        for vlan in port.vlans():
+            vlan_ports[vlan].add(port)
+
+    if self.stack_ports or self.stack.is_root():
+        new_vlans = list(vlans.values())
+    else:
+        new_vlans = []
+        for vlan in vlans.values():
+            if (
+                vlan_ports[vlan]
+                or vlan.reserved_internal_vlan
+                or vlan.dot1x_assigned
+                or vlan._id in router_vlans
+            ):
+                new_vlans.append(vlan)
+
+    self.vlans = {}
+    for vlan in new_vlans:
+        vlan.reset_ports(vlan_ports[vlan])
+        self.vlans[vlan.vid] = vlan
+
+
+def random_vlans(rng):
+    """Return random VLAN configs, and every way a port may refer to one.
+
+    Named and numbered VLAN keys, some with VIPs so a router can name them,
+    some dot1x assigned. A port may refer to a VLAN by its key, by its
+    number, or by a number no VLAN is declared under, which the parser turns
+    into an implicit VLAN.
+    """
+    vids = rng.sample(range(2, 4000), rng.randint(3, 7))
+    vlans = {}
+    for index, vid in enumerate(vids):
+        body = {}
+        if rng.random() < 0.6:
+            key = "v%d" % vid
+            body["vid"] = vid
+        else:
+            key = vid
+        if rng.random() < 0.5:
+            body["faucet_vips"] = ["10.%d.%d.1/24" % (index, vid % 250)]
+        if rng.random() < 0.2:
+            body["dot1x_assigned"] = True
+        vlans[key] = body
+    identity = dict(zip(vlans, vids))
+    by_number = rng.choice(vids)
+    identity[by_number] = by_number
+    implicit = rng.randint(4000, 4090)
+    identity[implicit] = implicit
+    return vlans, identity
+
+
+def random_interface(rng, identity):
+    """Return one port config: a native VLAN, tagged VLANs, or both.
+
+    The parser rejects a VLAN that is both native and tagged on one port,
+    and one listed twice under different names, so references are
+    deduplicated by the VLAN they resolve to.
+    """
+    refs = list(identity)
+    iface = {}
+    taken = set()
+    if rng.random() < 0.6:
+        native = rng.choice(refs)
+        iface["native_vlan"] = native
+        taken.add(identity[native])
+    if rng.random() < 0.5 or not iface:
+        tagged = []
+        for ref in rng.sample(refs, rng.randint(1, min(4, len(refs)))):
+            if identity[ref] not in taken:
+                tagged.append(ref)
+                taken.add(identity[ref])
+        if tagged:
+            iface["tagged_vlans"] = tagged
+    if not iface:
+        iface["native_vlan"] = rng.choice(refs)
+    return iface
+
+
+def random_config(rng):
+    """Return one config of the shapes the parser accepts, or nearly.
+
+    Up to three DPs, an optional stack link between the first two, and an
+    optional router over the VLANs with VIPs. The caller skips whatever the
+    parser rejects: the point is breadth, not validity.
+    """
+    vlans, identity = random_vlans(rng)
+    dps = {}
+    for number in range(1, rng.randint(1, 3) + 1):
+        dps["sw%d" % number] = {
+            "dp_id": number,
+            "hardware": "Open vSwitch",
+            "interfaces": {
+                port: random_interface(rng, identity)
+                for port in range(1, rng.randint(2, 6))
+            },
+        }
+    if len(dps) >= 2 and rng.random() < 0.5:
+        link_a = max(dps["sw1"]["interfaces"]) + 1
+        link_b = max(dps["sw2"]["interfaces"]) + 1
+        dps["sw1"]["stack"] = {"priority": 1}
+        dps["sw1"]["interfaces"][link_a] = {"stack": {"dp": "sw2", "port": link_b}}
+        dps["sw2"]["interfaces"][link_b] = {"stack": {"dp": "sw1", "port": link_a}}
+    config = {"vlans": vlans, "dps": dps}
+    routed = [key for key, body in vlans.items() if "faucet_vips" in body]
+    if len(routed) >= 2 and rng.random() < 0.6:
+        config["routers"] = {
+            "edge": {"vlans": rng.sample(routed, min(len(routed), rng.randint(2, 3)))}
+        }
+    return yaml.safe_dump(config, default_flow_style=False, sort_keys=False)
 
 
 class TestConfig(unittest.TestCase):  # pytype: disable=module-attr
@@ -5440,6 +5600,380 @@ dps:
                 native_vlan: vlan100
 """
         self.check_config_failure(config, cp.dp_parser)
+
+    def test_reset_refs_vlan_ports(self):
+        """Test each VLAN is given its DP's ports, ordered by port number."""
+        config = """
+vlans:
+    office:
+        vid: 100
+    guest:
+        vid: 200
+dps:
+    sw1:
+        dp_id: 0x1
+        interfaces:
+            9:
+                native_vlan: office
+            3:
+                native_vlan: office
+            7:
+                tagged_vlans: [office, guest]
+            1:
+                tagged_vlans: [office]
+"""
+        self.check_config_success(config, cp.dp_parser)
+        dp = self._get_dps_as_dict(config)[0x1]
+        office = dp.vlans[100]
+        guest = dp.vlans[200]
+        self.assertEqual(
+            [port.number for port in office.tagged],
+            [1, 7],
+            "tagged ports not resolved in port number order",
+        )
+        self.assertEqual(
+            [port.number for port in office.untagged],
+            [3, 9],
+            "untagged ports not resolved in port number order",
+        )
+        self.assertEqual(office.dot1x_untagged, (), "unexpected dot1x untagged ports")
+        self.assertEqual(
+            [port.number for port in guest.tagged], [7], "guest tagged ports wrong"
+        )
+        self.assertEqual(guest.untagged, (), "guest has untagged ports")
+        for vid, vlan in dp.vlans.items():
+            self.assertEqual(vid, vlan.vid, "dp.vlans not keyed by VID")
+        for port in dp.ports.values():
+            for vlan in port.vlans():
+                self.assertTrue(
+                    vlan is dp.vlans[vlan.vid],
+                    "port refers to a different VLAN object than the DP",
+                )
+
+    def test_reset_refs_unreferenced_vlan(self):
+        """Test a VLAN that no port on a DP refers to is still configured.
+
+        DP.reset_refs() prunes only when a DP has neither stack ports nor is
+        the stack root, and it reads self.stack_ports (the bound method,
+        always true) rather than calling it, so the prune never happens and
+        every configured VLAN is present on every DP.
+        """
+        config = """
+vlans:
+    office:
+        vid: 100
+    guest:
+        vid: 200
+dps:
+    sw1:
+        dp_id: 0x1
+        interfaces:
+            1:
+                native_vlan: office
+    sw2:
+        dp_id: 0x2
+        interfaces:
+            1:
+                native_vlan: guest
+"""
+        self.check_config_success(config, cp.dp_parser)
+        dps = self._get_dps_as_dict(config)
+        for dp_id in (0x1, 0x2):
+            self.assertEqual(
+                sorted(dps[dp_id].vlans),
+                [100, 200],
+                "VLAN not configured on datapath %x" % dp_id,
+            )
+        self.assertEqual(
+            [port.number for port in dps[0x1].vlans[100].untagged],
+            [1],
+            "office not resolved to its port on sw1",
+        )
+        self.assertEqual(
+            dps[0x1].vlans[200].untagged, (), "guest resolved to a port on sw1"
+        )
+        self.assertEqual(
+            dps[0x2].vlans[100].untagged, (), "office resolved to a port on sw2"
+        )
+        self.assertEqual(
+            [port.number for port in dps[0x2].vlans[200].untagged],
+            [1],
+            "guest not resolved to its port on sw2",
+        )
+
+    @staticmethod
+    def replaced_reset_algorithms():
+        """Return a context in which the parser runs the replaced algorithms."""
+        patches = contextlib.ExitStack()
+        patches.enter_context(
+            mock.patch.object(VLAN, "reset_ports", replaced_reset_ports)
+        )
+        patches.enter_context(mock.patch.object(DP, "reset_refs", replaced_reset_refs))
+        return patches
+
+    @staticmethod
+    def dp_for_reset_refs(vlans, ports, routers=None, stack_root=False):
+        """Return a DP, built directly, whose reset_refs() prunes VLANs.
+
+        reset_refs() prunes only when self.stack_ports is false, and as it
+        reads the bound method rather than calling it, that is never so for
+        a parsed DP. Shadow the method so that the prune runs here.
+        """
+        dp = DP("sw1", 0x1, {"dp_id": 0x1, "interfaces": {1: {}}})
+        dp.stack_ports = ()
+        if stack_root:
+            dp.stack.root_name = dp.name
+        dp.vlans = vlans
+        dp.ports = ports
+        dp.routers = routers if routers else {}
+        return dp
+
+    @staticmethod
+    def vlan_membership(dps):
+        """Return each DP's VLANs by VID, and each VLAN's port numbers by kind."""
+        return {
+            dp.name: {
+                vid: (
+                    [port.number for port in vlan.tagged],
+                    [port.number for port in vlan.untagged],
+                    [port.number for port in vlan.dot1x_untagged],
+                )
+                for vid, vlan in sorted(dp.vlans.items())
+            }
+            for dp in dps
+        }
+
+    def parse_membership(self, config):
+        """Return the VLAN membership a config parses to, or None if rejected."""
+        try:
+            _, _, dps, _ = cp.dp_parser(self.create_config_file(config), LOGNAME)
+        except cp.InvalidConfigError:
+            return None
+        return self.vlan_membership(dps)
+
+    def test_reset_refs_stack_root_keeps_unreferenced_vlan(self):
+        """Test a stack root keeps a VLAN that nothing on the DP refers to."""
+        portless = VLAN("portless", 0x1, {"vid": 400})
+        dp = self.dp_for_reset_refs({"portless": portless}, {}, stack_root=True)
+        dp.reset_refs()
+        self.assertEqual(sorted(dp.vlans), [400], "stack root pruned a VLAN")
+
+    def test_reset_refs_prunes_unreferenced_vlan(self):
+        """Test a VLAN off the stack root needs a port, a router or a flag."""
+        office = VLAN("office", 0x1, {"vid": 100})
+        portless = VLAN("portless", 0x1, {"vid": 400})
+        reserved = VLAN("reserved", 0x1, {"vid": 500, "reserved_internal_vlan": True})
+        assigned = VLAN("assigned", 0x1, {"vid": 550, "dot1x_assigned": True})
+        routed = VLAN("routed", 0x1, {"vid": 600})
+        port = Port(1, 0x1, {})
+        port.native_vlan = office
+        router = Router("edge", 0x1, {"vlans": ["routed"]})
+        router.vlans = [routed]
+        dp = self.dp_for_reset_refs(
+            {
+                "office": office,
+                "portless": portless,
+                "reserved": reserved,
+                "assigned": assigned,
+                "routed": routed,
+            },
+            {1: port},
+            routers={"edge": router},
+        )
+        dp.reset_refs()
+        self.assertEqual(
+            sorted(dp.vlans), [100, 500, 550, 600], "unreferenced VLAN not pruned"
+        )
+
+    def test_reset_refs_router_vlans_by_key_and_by_object(self):
+        """Test a routed VLAN survives with the router naming it either way.
+
+        When the parser calls reset_refs(vlans), a router still holds the
+        keys its VLANs were configured under; finalize_config() resolves
+        them to VLAN objects afterwards, and on a reload the router holds
+        the objects.
+        """
+        for resolved in (False, True):
+            with self.subTest(resolved=resolved):
+                routed = VLAN("routed", 0x1, {"vid": 600})
+                router = Router("edge", 0x1, {"vlans": ["routed"]})
+                dp = self.dp_for_reset_refs({}, {}, routers={"edge": router})
+                if resolved:
+                    router.vlans = [routed]
+                    dp.vlans = {"routed": routed}
+                    dp.reset_refs()
+                else:
+                    dp.reset_refs(vlans={"routed": routed})
+                self.assertEqual(sorted(dp.vlans), [600], "routed VLAN pruned")
+
+    def test_reset_refs_port_native_and_tagged_in_one_vlan(self):
+        """Test a port naming one VLAN twice is collected for it once.
+
+        The parser rejects a VLAN that is both native and tagged on one
+        port, so reset_refs() must not depend on that: a port is grouped by
+        its number, not once per mention.
+        """
+        office = VLAN("office", 0x1, {"vid": 100})
+        port = Port(1, 0x1, {})
+        port.native_vlan = office
+        port.tagged_vlans = [office]
+        dp = self.dp_for_reset_refs({"office": office}, {1: port})
+        dp.reset_refs()
+        self.assertEqual(
+            [member.number for member in office.tagged],
+            [1],
+            "port collected more than once",
+        )
+        self.assertEqual(
+            [member.number for member in office.untagged],
+            [1],
+            "port collected more than once",
+        )
+
+    def test_reset_refs_port_holds_previous_config_vlan(self):
+        """Test a VLAN keeps a port also naming its VID from a previous config.
+
+        Port.vlans() returns the native VLAN and the dot1x assigned VLAN,
+        and after a reload those can be one VID held by two objects, since
+        merge_dyn() carries dyn_dot1x_native_vlan over from the previous
+        config. The configured VLAN must still see the port, so that it
+        survives the prune, while claiming it neither as untagged, since
+        dot1x moved it, nor as dot1x untagged, which is the other object's.
+        """
+        office = VLAN("office", 0x1, {"vid": 100})
+        previous = VLAN("office", 0x1, {"vid": 100, "description": "previous"})
+        port = Port(1, 0x1, {})
+        port.native_vlan = office
+        port.dyn_dot1x_native_vlan = previous
+        dp = self.dp_for_reset_refs({"office": office}, {1: port})
+        dp.reset_refs()
+        self.assertNotEqual(office, previous, "the two VLANs must differ as configs")
+        self.assertEqual(sorted(dp.vlans), [100], "configured VLAN pruned")
+        self.assertEqual(office.untagged, (), "port still untagged in its native VLAN")
+        self.assertEqual(
+            office.dot1x_untagged, (), "port dot1x untagged in the wrong VLAN"
+        )
+
+    def test_reset_refs_random_configs_match_replaced_algorithms(self):
+        """Test generated configs parse to the same VLAN membership as before.
+
+        Collecting ports by VID rather than by VLAN object is only safe if
+        every config resolves to the same membership either way, and a
+        difference would not show: the config parses, the controller starts
+        and forwards subtly wrongly. Parse a seeded sample of generated
+        configs with the replaced algorithms and with these, and compare.
+        Configs the parser rejects are skipped and counted, so a generator
+        drifting into mostly invalid ones fails too.
+        """
+        rng = random.Random(1)
+        configs = [random_config(rng) for _ in range(200)]
+        with self.replaced_reset_algorithms():
+            before = [self.parse_membership(config) for config in configs]
+        after = [self.parse_membership(config) for config in configs]
+        parsed = sum(1 for membership in before if membership is not None)
+        self.assertGreaterEqual(parsed, 100, "too few generated configs parsed")
+        mismatches = [
+            index for index, (was, now) in enumerate(zip(before, after)) if was != now
+        ]
+        self.assertEqual(
+            mismatches,
+            [],
+            "membership differs from the replaced algorithms, first config:\n%s"
+            % (configs[mismatches[0]] if mismatches else ""),
+        )
+
+    def test_reset_refs_hashes_fewer_conf_objects(self):
+        """Test the parse no longer hashes a Conf object per VLAN comparison.
+
+        Every other test here checks that the parse gives the same answer.
+        None checks that it gives it without the hashing this change
+        removes, and the two are a short circuit apart: drop the VID check
+        from is_same_vlan() and every result is unchanged while the parse
+        is quadratic again. Counting Conf.__hash__ calls is that quantity
+        without a timer.
+        """
+        config = """
+vlans:
+    office:
+        vid: 100
+        faucet_vips: ["10.0.100.1/24"]
+    guest:
+        vid: 200
+        faucet_vips: ["10.0.200.1/24"]
+    named_only:
+        vid: 300
+    portless:
+        vid: 400
+    routed_only:
+        vid: 500
+        faucet_vips: ["10.0.5.1/24"]
+routers:
+    edge:
+        vlans: [office, routed_only]
+dps:
+    sw1:
+        dp_id: 0x1
+        hardware: Open vSwitch
+        stack:
+            priority: 1
+        interfaces:
+            1:
+                native_vlan: office
+            2:
+                native_vlan: guest
+            3:
+                tagged_vlans: [office, guest, named_only, 600]
+            4:
+                tagged_vlans: [300]
+            5:
+                native_vlan: named_only
+                tagged_vlans: [office]
+            6:
+                stack:
+                    dp: sw2
+                    port: 3
+    sw2:
+        dp_id: 0x2
+        hardware: Open vSwitch
+        interfaces:
+            1:
+                native_vlan: guest
+            2:
+                tagged_vlans: [office, 600]
+            3:
+                stack:
+                    dp: sw1
+                    port: 6
+"""
+        calls = [0]
+        conf_hash = Conf.__hash__
+
+        def counting_hash(conf):
+            calls[0] += 1
+            return conf_hash(conf)
+
+        with mock.patch.object(Conf, "__hash__", counting_hash):
+            with self.replaced_reset_algorithms():
+                self._get_dps_as_dict(config)
+            before = calls[0]
+            calls[0] = 0
+            self._get_dps_as_dict(config)
+            after = calls[0]
+        self.assertGreater(before, 50, "config too small to show the hashing")
+        # A ceiling rather than a ratio: a ratio generous enough for a clean
+        # run lets a partial regression through. Measured on this config:
+        # 101 before this change and 8 after; 53 to 56 with only one of
+        # reset_ports() and reset_refs() changed; 20 to 25 with any one of
+        # the three comparisons in reset_ports() reverted; 26 without the
+        # VID check in is_same_vlan(). Change the config and these move, so
+        # measure again rather than widening the ceiling.
+        self.assertLessEqual(
+            after,
+            12,
+            "parse hashed %d Conf objects, against %d before this change and 8 "
+            "for a clean run: a comparison falls through to Conf.__eq__ again"
+            % (after, before),
+        )
 
 
 if __name__ == "__main__":
