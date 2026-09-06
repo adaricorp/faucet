@@ -3,6 +3,7 @@
 import unittest
 from ipaddress import ip_address, ip_network, ip_interface
 
+from faucet.port import Port
 from faucet.vlan import VLAN
 
 
@@ -243,6 +244,72 @@ class FaucetVLANMethodTest(unittest.TestCase):
             vlan.routes_by_ipv(6),
             {ip_network("fc00::30:0/112"): ip_address("fc00::1:99")},
         )
+
+    def test_reset_ports(self):
+        """Tests the reset_ports() method sorts and classifies a DP's ports"""
+
+        vlan = VLAN(100, 1, {})
+        other_vlan = VLAN(200, 1, {})
+
+        native_high = Port(9, 1, {})
+        native_high.native_vlan = vlan
+        native_low = Port(3, 1, {})
+        native_low.native_vlan = vlan
+        tagged_high = Port(7, 1, {})
+        tagged_high.tagged_vlans = [vlan, other_vlan]
+        tagged_low = Port(1, 1, {})
+        tagged_low.tagged_vlans = [vlan]
+        unrelated = Port(11, 1, {})
+        unrelated.native_vlan = other_vlan
+
+        vlan.reset_ports([native_high, tagged_low, unrelated, tagged_high, native_low])
+
+        self.assertEqual([port.number for port in vlan.tagged], [1, 7])
+        self.assertEqual([port.number for port in vlan.untagged], [3, 9])
+        self.assertEqual(vlan.dot1x_untagged, ())
+
+    def test_reset_ports_no_native_vlan(self):
+        """Tests the reset_ports() method with a port that has no VLANs"""
+
+        vlan = VLAN(100, 1, {})
+        port = Port(1, 1, {})
+
+        vlan.reset_ports([port])
+
+        self.assertEqual(vlan.tagged, ())
+        self.assertEqual(vlan.untagged, ())
+        self.assertEqual(vlan.dot1x_untagged, ())
+
+    def test_reset_ports_dot1x_native_vlan(self):
+        """Tests the reset_ports() method with a dot1x assigned native VLAN"""
+
+        vlan = VLAN(100, 1, {})
+        dot1x_vlan = VLAN(200, 1, {})
+
+        port = Port(1, 1, {})
+        port.native_vlan = vlan
+        port.dyn_dot1x_native_vlan = dot1x_vlan
+
+        vlan.reset_ports([port])
+        dot1x_vlan.reset_ports([port])
+
+        self.assertEqual(vlan.untagged, ())
+        self.assertEqual(vlan.dot1x_untagged, ())
+        self.assertEqual(dot1x_vlan.untagged, ())
+        self.assertEqual([port.number for port in dot1x_vlan.dot1x_untagged], [1])
+
+    def test_reset_ports_vlan_from_a_previous_config(self):
+        """Tests reset_ports() ignores a VLAN carried over from a reload"""
+
+        vlan = VLAN(100, 1, {"description": "current"})
+        previous = VLAN(100, 1, {"description": "previous"})
+        port = Port(1, 1, {})
+        port.dyn_dot1x_native_vlan = previous
+
+        vlan.reset_ports([port])
+
+        self.assertNotEqual(vlan, previous, "same VID and config, not a reload")
+        self.assertEqual(vlan.dot1x_untagged, ())
 
 
 if __name__ == "__main__":
