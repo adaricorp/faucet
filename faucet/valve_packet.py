@@ -831,6 +831,13 @@ class PacketMeta:
         valve_of.ether.ETH_TYPE_IP: VLAN_ICMP_ECHO_REQ_SIZE,
     }
 
+    # Protocols whose payload has a fixed size: once the retained data covers
+    # it, everything beyond was Ethernet padding, which peers add in differing
+    # amounts (a hardware NIC pads to 60 bytes, some devices to more).
+    # reparse() discards that padding on purpose, so it must not make the
+    # packet look truncated.
+    FIXED_SIZE_ETH_TYPES = frozenset([valve_of.ether.ETH_TYPE_ARP])
+
     def __init__(
         self,
         reason,
@@ -928,6 +935,10 @@ class PacketMeta:
 
     def packet_complete(self):
         """True if we have the complete packet."""
+        if self.eth_type in self.FIXED_SIZE_ETH_TYPES:
+            return len(self.data) >= min(
+                self.orig_len, self.MAX_ETH_TYPE_PKT_SIZE[self.eth_type]
+            )
         return len(self.data) == self.orig_len
 
     def l3_offset(self):
