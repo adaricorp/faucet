@@ -901,10 +901,23 @@ class DP(Conf):
                 vlan for router in self.routers.values() for vlan in router.vlans
             }
 
-        vlan_ports = defaultdict(set)
+        # Group by VID and port number, not by Conf object: hashing a VLAN or
+        # a Port re-stringifies its config until finalize() runs, after this.
+        # Keep every VLAN a port named for a VID, since the native and dot1x
+        # VLANs can be different objects after a reload; see VLAN.is_same_vlan().
+        ports_by_vid = defaultdict(dict)
         for port in self.ports.values():
             for vlan in port.vlans():
-                vlan_ports[vlan].add(port)
+                named = ports_by_vid[vlan.vid].setdefault(port.number, (port, []))
+                named[1].append(vlan)
+
+        def ports_for_vlan(vlan):
+            """Return the ports that named this VLAN, in configuration order."""
+            return [
+                port
+                for port, named in ports_by_vid.get(vlan.vid, {}).values()
+                if any(vlan.is_same_vlan(candidate) for candidate in named)
+            ]
 
         if self.stack_ports or self.stack.is_root():
             new_vlans = list(vlans.values())
@@ -912,7 +925,7 @@ class DP(Conf):
             new_vlans = []
             for vlan in vlans.values():
                 if (
-                    vlan_ports[vlan]
+                    ports_for_vlan(vlan)
                     or vlan.reserved_internal_vlan
                     or vlan.dot1x_assigned
                     or vlan._id in router_vlans
@@ -921,7 +934,7 @@ class DP(Conf):
 
         self.vlans = {}
         for vlan in new_vlans:
-            vlan.reset_ports(vlan_ports[vlan])
+            vlan.reset_ports(ports_for_vlan(vlan))
             self.vlans[vlan.vid] = vlan
 
     def resolve_port(self, port_name):

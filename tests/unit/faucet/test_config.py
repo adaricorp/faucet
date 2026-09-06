@@ -5441,6 +5441,106 @@ dps:
 """
         self.check_config_failure(config, cp.dp_parser)
 
+    def test_reset_refs_vlan_ports(self):
+        """Test each VLAN is given its DP's ports, ordered by port number."""
+        config = """
+vlans:
+    office:
+        vid: 100
+    guest:
+        vid: 200
+dps:
+    sw1:
+        dp_id: 0x1
+        interfaces:
+            9:
+                native_vlan: office
+            3:
+                native_vlan: office
+            7:
+                tagged_vlans: [office, guest]
+            1:
+                tagged_vlans: [office]
+"""
+        self.check_config_success(config, cp.dp_parser)
+        dp = self._get_dps_as_dict(config)[0x1]
+        office = dp.vlans[100]
+        guest = dp.vlans[200]
+        self.assertEqual(
+            [port.number for port in office.tagged],
+            [1, 7],
+            "tagged ports not resolved in port number order",
+        )
+        self.assertEqual(
+            [port.number for port in office.untagged],
+            [3, 9],
+            "untagged ports not resolved in port number order",
+        )
+        self.assertEqual(office.dot1x_untagged, (), "unexpected dot1x untagged ports")
+        self.assertEqual(
+            [port.number for port in guest.tagged], [7], "guest tagged ports wrong"
+        )
+        self.assertEqual(guest.untagged, (), "guest has untagged ports")
+        for vid, vlan in dp.vlans.items():
+            self.assertEqual(vid, vlan.vid, "dp.vlans not keyed by VID")
+        for port in dp.ports.values():
+            for vlan in port.vlans():
+                self.assertTrue(
+                    vlan is dp.vlans[vlan.vid],
+                    "port refers to a different VLAN object than the DP",
+                )
+
+    def test_reset_refs_unreferenced_vlan(self):
+        """Test a VLAN that no port on a DP refers to is still configured.
+
+        DP.reset_refs() prunes only when a DP has neither stack ports nor is
+        the stack root, and it reads self.stack_ports (the bound method,
+        always true) rather than calling it, so the prune never happens and
+        every configured VLAN is present on every DP.
+        """
+        config = """
+vlans:
+    office:
+        vid: 100
+    guest:
+        vid: 200
+dps:
+    sw1:
+        dp_id: 0x1
+        interfaces:
+            1:
+                native_vlan: office
+    sw2:
+        dp_id: 0x2
+        interfaces:
+            1:
+                native_vlan: guest
+"""
+        self.check_config_success(config, cp.dp_parser)
+        dps = self._get_dps_as_dict(config)
+        for dp_id in (0x1, 0x2):
+            self.assertEqual(
+                sorted(dps[dp_id].vlans),
+                [100, 200],
+                "VLAN not configured on datapath %x" % dp_id,
+            )
+        self.assertEqual(
+            [port.number for port in dps[0x1].vlans[100].untagged],
+            [1],
+            "office not resolved to its port on sw1",
+        )
+        self.assertEqual(
+            dps[0x1].vlans[200].untagged, (), "guest resolved to a port on sw1"
+        )
+        self.assertEqual(
+            dps[0x2].vlans[100].untagged, (), "office resolved to a port on sw2"
+        )
+        self.assertEqual(
+            [port.number for port in dps[0x2].vlans[200].untagged],
+            [1],
+            "guest not resolved to its port on sw2",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()  # pytype: disable=module-attr
