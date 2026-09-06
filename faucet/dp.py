@@ -919,9 +919,11 @@ class DP(Conf):
                 ):
                     new_vlans.append(vlan)
 
+        # Once for all VLANs, so that a trunk's are not read for each of them.
+        tagged_by_vid = VLAN.tagged_vlans_by_vid(self.ports.values())
         self.vlans = {}
         for vlan in new_vlans:
-            vlan.reset_ports(vlan_ports[vlan])
+            vlan.reset_ports(vlan_ports[vlan], tagged_by_vid)
             self.vlans[vlan.vid] = vlan
 
     def resolve_port(self, port_name):
