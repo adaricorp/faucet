@@ -113,6 +113,7 @@ class ValveRouteManager(ValveManagerBase):
         "proactive_learn",
         "route_priority",
         "routers",
+        "routers_by_vid",
         "vip_table",
         "switch_manager",
     ]
@@ -158,6 +159,7 @@ class ValveRouteManager(ValveManagerBase):
         self.pipeline = pipeline
         self.route_priority = self._LPM_PRIORITY
         self.routers = routers
+        self.routers_by_vid = self._routers_by_vid()
         self.active = False
         self.global_routing = self._global_routing()
         self.stack_manager = stack_manager
@@ -377,12 +379,34 @@ class ValveRouteManager(ValveManagerBase):
         prefixlen = ipaddress.ip_network(ip_dst).prefixlen
         return self.route_priority + prefixlen
 
-    def _router_for_vlan(self, vlan):
-        """Return vlan router if any"""
+    def _routers_by_vid(self):
+        """Return each VID's (VLAN, router) pairs, in configuration order."""
+        # Asking every router whether it names a VLAN, for every VLAN, is
+        # quadratic and every miss compares two Conf objects. Keep the VLAN
+        # each router named, not just the VID: after a reload merge_dyn can
+        # leave a port pointing at the previous config's object for that VID.
+        routers_by_vid = {}
         if self.routers:
             for router in self.routers.values():
-                if vlan in router.vlans:
-                    return router
+                for router_vlan in router.vlans:
+                    routers_by_vid.setdefault(router_vlan.vid, []).append(
+                        (router_vlan, router)
+                    )
+        return routers_by_vid
+
+    def _routers_for_vlan(self, vlan):
+        """Return the routers that name this VLAN, in configuration order."""
+        # A generator, so _router_for_vlan() stops at the first one.
+        return (
+            router
+            for router_vlan, router in self.routers_by_vid.get(vlan.vid, ())
+            if router_vlan is vlan or router_vlan == vlan
+        )
+
+    def _router_for_vlan(self, vlan):
+        """Return vlan router if any"""
+        for router in self._routers_for_vlan(vlan):
+            return router
         return None
 
     def _routed_vlans(self, vlan):
@@ -390,10 +414,9 @@ class ValveRouteManager(ValveManagerBase):
         if self.global_routing:
             return set([self.global_vlan])
         vlans = set([vlan])
-        if self.routers:
-            for router in self.routers.values():
-                if vlan in router.vlans:
-                    vlans = vlans.union(router.vlans)
+        for router in self._routers_for_vlan(vlan):
+            # union(), as before: only the search changes, not the set.
+            vlans = vlans.union(router.vlans)
         return vlans
 
     @staticmethod
