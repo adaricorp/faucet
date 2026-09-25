@@ -732,6 +732,42 @@ class ValveRouteManager(ValveManagerBase):
             )
         return ofmsgs
 
+    def add_routed_vlan_routes(self, vlan):
+        """Add routes via nexthops resolved on the other VLANs routed with a VLAN.
+
+        A route is installed on every VLAN routed with its nexthop's VLAN when
+        the nexthop resolves, and not again unless the nexthop's MAC changes.
+        A VLAN added or changed by a warm start gets them from the nexthop cache.
+
+        Args:
+            vlan (vlan): VLAN to add the routes to.
+        Returns:
+            list: OpenFlow messages.
+        """
+        ofmsgs = []
+        if self.global_routing:
+            # Routes match the global VLAN, which a warm start leaves in place.
+            return ofmsgs
+        for routed_vlan in self._routed_vlans(vlan):
+            if routed_vlan == vlan or isinstance(routed_vlan, AnonVLAN):
+                continue
+            for ip_gw in self._vlan_nexthop_cache(routed_vlan):
+                eth_dst = self._cached_nexthop_eth_dst(routed_vlan, ip_gw)
+                if eth_dst is None:
+                    continue
+                inst = self.pipeline.accept_to_l2_forwarding(
+                    actions=self._nexthop_actions(eth_dst, routed_vlan)
+                )
+                for ip_dst in routed_vlan.ip_dsts_for_ip_gw(ip_gw):
+                    ofmsgs.append(
+                        self.fib_table.flowmod(
+                            self._route_match(vlan, ip_dst),
+                            priority=self._route_priority(ip_dst),
+                            inst=inst,
+                        )
+                    )
+        return ofmsgs
+
     def _update_nexthop_cache(self, now, vlan, eth_src, port, ip_gw):
         """Add information to the nexthop cache and return the new object"""
         nexthop = NextHop(eth_src, port, now)
