@@ -3871,5 +3871,204 @@ dps:
         self.assertLessEqual(len(vip_hosts), 10 * self.VLANS)
 
 
+class ValveChangeVLANTrunkNextHopTestCase(ValveTestBases.ValveTestNetwork):
+    """Test next hops learned on a trunk when the config of the trunk changes."""
+
+    # A VLAN change can only be a warm start if the pipeline need not be resized.
+    REQUIRE_TFM = False
+
+    CONFIG = """
+vlans:
+  vlan1:
+    vid: 0x100
+    faucet_vips:
+      - "10.10.0.254/24"
+    routes:
+        - route:
+            ip_dst: 10.99.0.0/24
+            ip_gw: 10.10.0.1
+  vlan2:
+    vid: 0x200
+    faucet_vips:
+      - "10.20.0.254/24"
+    faucet_mac: "0e:00:00:00:00:02"
+  vlan3:
+    vid: 0x300
+    faucet_vips:
+      - "10.30.0.254/24"
+    faucet_mac: "0e:00:00:00:00:03"
+routers:
+    router-1:
+        vlans: [vlan1, vlan3]
+    router-2:
+        vlans: [vlan2, vlan3]
+dps:
+    s1:
+        dp_id: 1
+        hardware: "Open vSwitch"
+        interfaces:
+            1:
+                tagged_vlans: [vlan1, vlan2]
+            2:
+                native_vlan: vlan2
+            3:
+                native_vlan: vlan3
+"""
+
+    def setUp(self):
+        """Setup basic port and vlan config"""
+        self.setup_valves(self.CONFIG)
+
+    def _learn_host(self, vid, host_mac, host_ip, faucet_vip):
+        """Resolve a host on the trunk port."""
+        self.rcv_packet(
+            1,
+            vid,
+            {
+                "eth_src": host_mac,
+                "eth_dst": self.BROADCAST_MAC,
+                "eth_type": 0x806,
+                "arp_source_ip": host_ip,
+                "arp_target_ip": faucet_vip,
+            },
+        )
+        self.assertTrue(self._routed(vid, host_ip, host_mac))
+
+    def _learn_trunk_hosts(self):
+        """Resolve a host on each VLAN of the trunk port."""
+        self._learn_host(0x100, self.P1_V100_MAC, "10.10.0.1", "10.10.0.254")
+        self._learn_host(0x200, self.P1_V200_MAC, "10.20.0.1", "10.20.0.254")
+        # VLAN 3 is routed to the VLAN 2 host, and via the VLAN 1 host.
+        self.assertTrue(self._routed(0x300, "10.20.0.1", self.P1_V200_MAC))
+        self.assertTrue(self._routed(0x300, "10.99.0.1", self.P1_V100_MAC))
+
+    def _update_trunk_config(self, update_func):
+        """Warm start with the config changed by update_func."""
+        config = config_parser_util.yaml_load(self.CONFIG)
+        update_func(config)
+        self.update_config(config_parser_util.yaml_dump(config), reload_type="warm")
+
+    def _nexthops(self, vid):
+        """Return the IPv4 next hops learned on a VLAN."""
+        vlan = self.valves_manager.valves[self.DP_ID].dp.vlans[vid]
+        return vlan.neigh_cache_by_ipv(4)
+
+    def _fib_flows(self, vid):
+        """Return the IPv4 FIB flows of a VLAN, as strings."""
+        table = self.network.tables[self.DP_ID]
+        fib_table_id = (
+            self.valves_manager.valves[self.DP_ID].dp.tables["ipv4_fib"].table_id
+        )
+        return sorted(
+            str(flow)
+            for flow in table.tables[fib_table_id]
+            if flow.match_values.get("vlan_vid")
+            == flow.match_to_bits("vlan_vid", vid | ofp.OFPVID_PRESENT)
+        )
+
+    def _routed(self, vid, ipv4_dst, eth_dst):
+        """Return True if the FIB of a VLAN routes ipv4_dst to eth_dst."""
+        table = self.network.tables[self.DP_ID]
+        tables = self.valves_manager.valves[self.DP_ID].dp.tables
+        _, packet, next_table = table.get_table_output(
+            {
+                "vlan_vid": vid | ofp.OFPVID_PRESENT,
+                "eth_type": 0x800,
+                "ipv4_dst": ipv4_dst,
+            },
+            tables["ipv4_fib"].table_id,
+        )
+        return (
+            next_table == tables["eth_dst"].table_id
+            and packet.get("eth_dst") == eth_dst
+        )
+
+    def test_change_vlan_keeps_trunk_nexthops(self):
+        """Test changing one VLAN on a trunk keeps next hops on its other VLANs."""
+        self._learn_trunk_hosts()
+        before_fib_flows = self._fib_flows(0x200)
+
+        def change_vlan1(config):
+            config["vlans"]["vlan1"]["faucet_vips"] = ["10.10.0.253/24"]
+
+        self._update_trunk_config(change_vlan1)
+        # The changed VLAN's next hop is expired, with the routes through it.
+        self.assertNotIn(ip_address("10.10.0.1"), self._nexthops(0x100))
+        self.assertFalse(self._routed(0x300, "10.99.0.1", self.P1_V100_MAC))
+        # The other VLAN's next hop is still routed to.
+        self.assertIn(ip_address("10.20.0.1"), self._nexthops(0x200))
+        self.assertEqual(before_fib_flows, self._fib_flows(0x200))
+        self.assertTrue(self._routed(0x300, "10.20.0.1", self.P1_V200_MAC))
+
+    def test_change_overlapping_vlan_expires_trunk_nexthops(self):
+        """Test changing a VLAN expires next hops on VLANs overlapping its subnet."""
+        self._learn_trunk_hosts()
+
+        def overlap_vlan2(config):
+            config["vlans"]["vlan1"]["faucet_vips"] = ["10.20.1.254/23"]
+            del config["vlans"]["vlan1"]["routes"]
+
+        self._update_trunk_config(overlap_vlan2)
+        self.assertNotIn(ip_address("10.20.0.1"), self._nexthops(0x200))
+        # Hosts on both VLANs with the same address share a host route on VLAN 3.
+        self._learn_host(0x100, self.P1_V100_MAC, "10.20.0.1", "10.20.1.254")
+        self.assertTrue(self._routed(0x300, "10.20.0.1", self.P1_V100_MAC))
+        # So relearning the VLAN 2 host restores its host route on VLAN 3.
+        self._learn_host(0x200, self.P1_V200_MAC, "10.20.0.1", "10.20.0.254")
+        self.assertTrue(self._routed(0x300, "10.20.0.1", self.P1_V200_MAC))
+
+    def test_change_same_route_vlan_expires_trunk_nexthops(self):
+        """Test changing a VLAN expires next hops on VLANs with the same route."""
+
+        def route_vlan2(config):
+            config["vlans"]["vlan2"]["routes"] = [
+                {"route": {"ip_dst": "10.99.0.0/24", "ip_gw": "10.20.0.1"}}
+            ]
+
+        def unroute_vlan1(config):
+            route_vlan2(config)
+            del config["vlans"]["vlan1"]["routes"]
+
+        self._update_trunk_config(route_vlan2)
+        # Both VLANs route the destination on VLAN 3, via the host learned last.
+        self._learn_host(0x100, self.P1_V100_MAC, "10.10.0.1", "10.10.0.254")
+        self._learn_host(0x200, self.P1_V200_MAC, "10.20.0.1", "10.20.0.254")
+        self.assertTrue(self._routed(0x300, "10.99.0.1", self.P1_V200_MAC))
+        # Expiring the VLAN 1 host deletes the route on VLAN 3.
+        self._update_trunk_config(unroute_vlan1)
+        self.assertFalse(self._routed(0x300, "10.99.0.1", self.P1_V200_MAC))
+        self.assertNotIn(ip_address("10.20.0.1"), self._nexthops(0x200))
+        # So relearning the VLAN 2 host restores the route via it.
+        self._learn_host(0x200, self.P1_V200_MAC, "10.20.0.1", "10.20.0.254")
+        self.assertTrue(self._routed(0x300, "10.99.0.1", self.P1_V200_MAC))
+
+    def test_remove_vlan_expires_trunk_nexthops(self):
+        """Test removing a VLAN from a trunk expires next hops learned on it."""
+        self._learn_trunk_hosts()
+
+        def remove_vlan2(config):
+            config["dps"]["s1"]["interfaces"][1]["tagged_vlans"] = ["vlan1"]
+
+        self._update_trunk_config(remove_vlan2)
+        self.assertNotIn(ip_address("10.20.0.1"), self._nexthops(0x200))
+        self.assertFalse(self._routed(0x200, "10.20.0.1", self.P1_V200_MAC))
+
+    def test_change_port_expires_trunk_nexthops(self):
+        """Test changing a trunk's own config expires next hops on all its VLANs."""
+        self._learn_trunk_hosts()
+
+        def disable_port1(config):
+            config["dps"]["s1"]["interfaces"][1]["enabled"] = False
+
+        self._update_trunk_config(disable_port1)
+        for vid, host_ip, host_mac in (
+            (0x100, "10.10.0.1", self.P1_V100_MAC),
+            (0x200, "10.20.0.1", self.P1_V200_MAC),
+        ):
+            self.assertNotIn(ip_address(host_ip), self._nexthops(vid))
+            self.assertFalse(self._routed(vid, host_ip, host_mac))
+        self.assertFalse(self._routed(0x300, "10.99.0.1", self.P1_V100_MAC))
+
+
 if __name__ == "__main__":
     unittest.main()  # pytype: disable=module-attr
