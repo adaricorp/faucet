@@ -28,6 +28,7 @@ import time
 
 from ipaddress import ip_address
 
+from os_ken.lib.packet import arp
 from os_ken.ofproto import ofproto_v1_3 as ofp
 
 from clib.fakeoftable import CONTROLLER_PORT
@@ -2800,24 +2801,25 @@ dps:
         """Test adding static routes to a VLAN with InterVLAN routing is a warm start."""
         table = self.network.tables[self.DP_ID]
         self.l2_learn_host(1, 0x100, self.P1_V100_MAC)
+        # Hosts learned on the unchanged VLAN must survive the reloads.
+        self.l3_learn_host(
+            1,
+            0x100,
+            self.P1_V100_MAC,
+            [
+                ip_address("10.10.0.1"),
+                ip_address("fa00::1"),
+                ip_address("fe80::200:ff:fe01:1"),
+            ],
+            [
+                ip_address("10.10.0.254"),
+                ip_address("fa00::254"),
+                ip_address("fe80::c00:ff:fe00:1"),
+            ],
+        )
         before_table_state = table.table_state()
 
         def verify_func():
-            self.l3_learn_host(
-                1,
-                0x100,
-                self.P1_V100_MAC,
-                [
-                    ip_address("10.10.0.1"),
-                    ip_address("fa00::1"),
-                    ip_address("fe80::200:ff:fe01:1"),
-                ],
-                [
-                    ip_address("10.10.0.254"),
-                    ip_address("fa00::254"),
-                    ip_address("fe80::c00:ff:fe00:1"),
-                ],
-            )
             self.l3_learn_host(
                 2,
                 0x200,
@@ -2975,24 +2977,25 @@ dps:
         """Test deleting static routes from a VLAN with InterVLAN routing is a warm start."""
         table = self.network.tables[self.DP_ID]
         self.l2_learn_host(1, 0x100, self.P1_V100_MAC)
+        # Hosts learned on the unchanged VLAN must survive the reloads.
+        self.l3_learn_host(
+            1,
+            0x100,
+            self.P1_V100_MAC,
+            [
+                ip_address("10.10.0.1"),
+                ip_address("fa00::1"),
+                ip_address("fe80::200:ff:fe01:1"),
+            ],
+            [
+                ip_address("10.10.0.254"),
+                ip_address("fa00::254"),
+                ip_address("fe80::c00:ff:fe00:1"),
+            ],
+        )
         before_table_state = table.table_state()
 
         def verify_func():
-            self.l3_learn_host(
-                1,
-                0x100,
-                self.P1_V100_MAC,
-                [
-                    ip_address("10.10.0.1"),
-                    ip_address("fa00::1"),
-                    ip_address("fe80::200:ff:fe01:1"),
-                ],
-                [
-                    ip_address("10.10.0.254"),
-                    ip_address("fa00::254"),
-                    ip_address("fe80::c00:ff:fe00:1"),
-                ],
-            )
             self.l3_learn_host(
                 2,
                 0x200,
@@ -3065,6 +3068,213 @@ dps:
             verify_func=verify_func,
             before_table_states={self.DP_ID: before_table_state},
         )
+
+
+class ValveWarmRoutedVLANTestBase(ValveTestBases.ValveTestNetwork):
+    """Warm start a VLAN routed with other VLANs, without relearning any hosts.
+
+    Uses Open vSwitch, so that adding a VLAN does not change the pipeline.
+    """
+
+    REQUIRE_TFM = False
+
+    CONFIG = """
+vlans:
+    uplink:
+        vid: 0x100
+        faucet_vips: ["10.0.0.254/24", "fc00::254/64"]
+        routes:
+            - route:
+                ip_dst: 0.0.0.0/0
+                ip_gw: 10.0.0.1
+            - route:
+                ip_dst: ::/0
+                ip_gw: fc00::1%(uplink_routes)s
+    servers:
+        vid: 0x200
+        faucet_vips: ["10.2.0.254/24", "fc02::254/64"]
+    clients1:
+        vid: %(clients1_vid)u
+        faucet_vips: ["10.11.0.254/%(clients1_prefixlen)u", "fc11::254/64"]
+    clients2:
+        vid: 0x400
+        faucet_vips: ["10.12.0.254/24", "fc12::254/64"]
+routers:%(routers)s
+dps:
+    s1:
+        dp_id: 1
+        hardware: "Open vSwitch"
+        ignore_learn_ins: 0
+        global_vlan: %(global_vlan)u
+        interfaces:
+            1:
+                native_vlan: uplink
+            2:
+                native_vlan: servers
+            3:
+                native_vlan: clients1
+            4:
+                native_vlan: clients2
+"""
+
+    ROUTERS = """
+    clients1-servers:
+        vlans: [servers, clients1]
+    clients1-uplink:
+        vlans: [uplink, clients1]
+    clients2-servers:
+        vlans: [servers, clients2]
+    clients2-uplink:
+        vlans: [uplink, clients2]"""
+    GLOBAL_VLAN = 0
+
+    # MAC, IPv4 and IPv6 address of the host learned on each port.
+    HOSTS = {
+        1: ("00:00:00:01:00:01", "10.0.0.1", "fc00::1"),
+        2: ("00:00:00:02:00:01", "10.2.0.1", "fc02::1"),
+        3: ("00:00:00:03:00:01", "10.11.0.1", "fc11::1"),
+        4: ("00:00:00:04:00:01", "10.12.0.1", "fc12::1"),
+    }
+    INTERNET = ("192.0.2.1", "2001:db8::1")
+
+    def config(self, clients1_vid=0x300, clients1_prefixlen=24, uplink_routes=""):
+        """Return the config, optionally with clients1 or uplink changed."""
+        return self.CONFIG % {
+            "clients1_vid": clients1_vid,
+            "clients1_prefixlen": clients1_prefixlen,
+            "uplink_routes": uplink_routes,
+            "routers": self.ROUTERS,
+            "global_vlan": self.GLOBAL_VLAN,
+        }
+
+    def setUp(self):
+        """Setup routed VLANs and learn a host on each."""
+        self.setup_valves(self.config())
+        dp = self.valves_manager.valves[self.DP_ID].dp
+        for port, (mac, ipv4, ipv6) in self.HOSTS.items():
+            vlan = dp.ports[port].native_vlan
+            self.l3_learn_host(
+                port,
+                vlan.vid,
+                mac,
+                [ip_address(ipv4), ip_address(ipv6)],
+                [vip.ip for vip in vlan.faucet_vips],
+            )
+
+    def routed(self, in_port, ip_dst, out_port, eth_dst=None):
+        """Return True if the host on in_port is routed to ip_dst via out_port."""
+        eth_src, ipv4, ipv6 = self.HOSTS[in_port]
+        ipv = ip_address(ip_dst).version
+        match = {
+            "in_port": in_port,
+            "vlan_vid": 0,
+            "eth_type": 0x800 if ipv == 4 else 0x86DD,
+            "eth_src": eth_src,
+            "eth_dst": FAUCET_MAC,
+            "ipv%u_src" % ipv: ipv4 if ipv == 4 else ipv6,
+            "ipv%u_dst" % ipv: ip_dst,
+        }
+        if eth_dst is None:
+            eth_dst = self.HOSTS[out_port][0]
+        outputs = self.network.tables[self.DP_ID].get_port_outputs(match)
+        return any(pkt["eth_dst"] == eth_dst for pkt in outputs.get(out_port, []))
+
+    def assert_routed_via_other_vlans(self, port):
+        """Assert the host on port reaches the internet and the server."""
+        destinations = [(ip_dst, 1) for ip_dst in self.INTERNET + self.HOSTS[1][1:]]
+        destinations.extend((ip_dst, 2) for ip_dst in self.HOSTS[2][1:])
+        for ip_dst, out_port in destinations:
+            self.assertTrue(
+                self.routed(port, ip_dst, out_port),
+                msg="port %u to %s not routed" % (port, ip_dst),
+            )
+
+
+class ValveWarmChangeRoutedVLANTestCase(ValveWarmRoutedVLANTestBase):
+    """Test changing a routed VLAN keeps routes resolved on other VLANs."""
+
+    def test_change_routed_vlan(self):
+        """Test changing clients1 does not remove routes from clients2."""
+        self.update_config(self.config(clients1_prefixlen=23), reload_type="warm")
+        self.assert_routed_via_other_vlans(4)
+        self.assert_routed_via_other_vlans(3)
+
+
+class ValveWarmChangeGlobalRoutedVLANTestCase(ValveWarmChangeRoutedVLANTestCase):
+    """Test changing a globally routed VLAN keeps routes resolved on other VLANs."""
+
+    ROUTERS = """
+    router-1:
+        vlans: [uplink, servers, clients1, clients2]"""
+    GLOBAL_VLAN = 4000
+
+
+class ValveWarmChangeRoutedVLANVIDTestCase(ValveWarmRoutedVLANTestBase):
+    """Test changing the VID of a routed VLAN."""
+
+    def test_change_vid(self):
+        """Test the new VID gets the routes resolved on other VLANs."""
+        self.update_config(self.config(clients1_vid=0x500), reload_type="warm")
+        self.assert_routed_via_other_vlans(3)
+
+
+class ValveWarmChangeUplinkVLANTestCase(ValveWarmRoutedVLANTestBase):
+    """Test changing the uplink VLAN."""
+
+    UPLINK_ROUTES = """
+            - route:
+                ip_dst: 198.51.100.0/24
+                ip_gw: 10.0.0.1"""
+
+    def test_change_uplink_vlan(self):
+        """Test hosts learned on the client VLANs stay reachable from the uplink."""
+        self.update_config(
+            self.config(uplink_routes=self.UPLINK_ROUTES), reload_type="warm"
+        )
+        for port in (3, 4):
+            for ip_dst in self.HOSTS[port][1:]:
+                self.assertTrue(
+                    self.routed(1, ip_dst, port),
+                    msg="uplink to %s not routed" % ip_dst,
+                )
+
+
+class ValveWarmChangeRoutedVLANResolvingTestCase(ValveWarmRoutedVLANTestBase):
+    """Test changing a routed VLAN while a nexthop on another VLAN resolves."""
+
+    SERVER2_MAC = "00:00:00:02:00:02"
+    SERVER2_IP = "10.2.0.2"
+
+    def test_resolving_nexthop(self):
+        """Test a nexthop resolving during a warm start is routed once resolved."""
+        mac, ipv4, _ = self.HOSTS[4]
+        # Traffic for an unresolved server is dropped while it is resolved.
+        self.rcv_packet(
+            4,
+            0x400,
+            {
+                "eth_src": mac,
+                "eth_dst": FAUCET_MAC,
+                "ipv4_src": ipv4,
+                "ipv4_dst": self.SERVER2_IP,
+                "echo_request_data": self.ICMP_PAYLOAD,
+            },
+        )
+        self.assertFalse(self.routed(4, self.SERVER2_IP, 2, self.SERVER2_MAC))
+        self.update_config(self.config(clients1_prefixlen=23), reload_type="warm")
+        self.rcv_packet(
+            2,
+            0x200,
+            {
+                "eth_src": self.SERVER2_MAC,
+                "eth_dst": FAUCET_MAC,
+                "eth_type": 0x806,
+                "arp_code": arp.ARP_REPLY,
+                "arp_source_ip": self.SERVER2_IP,
+                "arp_target_ip": "10.2.0.254",
+            },
+        )
+        self.assertTrue(self.routed(4, self.SERVER2_IP, 2, self.SERVER2_MAC))
 
 
 if __name__ == "__main__":
