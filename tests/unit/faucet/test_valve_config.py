@@ -728,6 +728,118 @@ dps:
         self._unicast_between(3, 2)
 
 
+class ValveAddPortRelearnTestCase(ValveTestBases.ValveTestNetwork):
+    """Test hosts are learned again after a port is added to their VLAN."""
+
+    # NOTE: This uses 'Open vSwitch' hardware, as with GenericTFM
+    #  a change in table sizes would make the reload a cold start.
+    REQUIRE_TFM = False
+
+    CONFIG = """
+vlans:
+    v100:
+        vid: 0x100
+        faucet_vips: ["10.0.0.254/24"]
+    v200:
+        vid: 0x200
+dps:
+    s1:
+        dp_id: 1
+        hardware: Open vSwitch
+        ignore_learn_ins: 0
+        interfaces:
+            p1:
+                number: 1
+                native_vlan: v100
+            p2:
+                number: 2
+                native_vlan: v200
+"""
+
+    def setUp(self):
+        """Setup basic port and vlan config"""
+        self.setup_valves(self.CONFIG)
+
+    def _learn(self, in_port, vid, eth_src):
+        """Receive an ARP request from a host."""
+        self.rcv_packet(
+            in_port,
+            vid,
+            {
+                "eth_src": eth_src,
+                "eth_dst": self.BROADCAST_MAC,
+                "arp_source_ip": "10.0.0.%u" % in_port,
+                "arp_target_ip": "10.0.0.254",
+            },
+        )
+
+    def _learned(self, in_port, vid, eth_src):
+        """Return True if a host has an eth_src flow and is not punted."""
+        table = self.network.tables[self.DP_ID]
+        valve = self.valves_manager.valves[self.DP_ID]
+        match = {
+            "in_port": in_port,
+            "vlan_vid": 0,
+            "eth_src": eth_src,
+            "eth_dst": self.UNKNOWN_MAC,
+            "eth_type": 0x800,
+            "ipv4_src": "10.0.0.%u" % in_port,
+            "ipv4_dst": "10.0.0.99",
+        }
+        eth_src_flow = table.single_table_lookup(
+            dict(match, vlan_vid=vid | ofp.OFPVID_PRESENT),
+            valve.dp.tables["eth_src"].table_id,
+        )
+        return (
+            eth_src_flow is not None
+            and "eth_src" in eth_src_flow.match_values
+            and not table.is_output(match, port=CONTROLLER_PORT)
+        )
+
+    def test_port_add_relearn(self):
+        """Test hosts on a VLAN a port is added to are learned again."""
+        self._learn(1, 0x100, self.P1_V100_MAC)
+        self._learn(2, 0x200, self.P2_V200_MAC)
+        self.assertTrue(self._learned(1, 0x100, self.P1_V100_MAC))
+        self.assertTrue(self._learned(2, 0x200, self.P2_V200_MAC))
+
+        config = config_parser_util.yaml_load(self.CONFIG)
+        config["dps"]["s1"]["interfaces"]["p3"] = {"number": 3, "native_vlan": "v100"}
+        self.update_config(config_parser_util.yaml_dump(config), reload_type="warm")
+        self.set_port_up(3)
+        # Only the VLAN the port was added to had its flows deleted.
+        self.assertFalse(self._learned(1, 0x100, self.P1_V100_MAC))
+        self.assertTrue(self._learned(2, 0x200, self.P2_V200_MAC))
+
+        # Well within cache_update_guard_time, the host is learned again.
+        self._learn(1, 0x100, self.P1_V100_MAC)
+        self.assertTrue(self._learned(1, 0x100, self.P1_V100_MAC))
+
+
+class ValveAddPortRelearnL2TestCase(ValveAddPortRelearnTestCase):
+    """Test hosts are learned again after a port is added to an unrouted VLAN."""
+
+    CONFIG = """
+vlans:
+    v100:
+        vid: 0x100
+    v200:
+        vid: 0x200
+dps:
+    s1:
+        dp_id: 1
+        hardware: Open vSwitch
+        ignore_learn_ins: 0
+        interfaces:
+            p1:
+                number: 1
+                native_vlan: v100
+            p2:
+                number: 2
+                native_vlan: v200
+"""
+
+
 class ValveWarmStartVLANTestCase(ValveTestBases.ValveTestNetwork):
     """Test change of port VLAN only is a warm start."""
 

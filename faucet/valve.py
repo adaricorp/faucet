@@ -458,7 +458,11 @@ class Valve:
         expired_hosts = list(vlan.dyn_host_cache.values())
         for entry in expired_hosts:
             self._update_expired_host(entry, vlan)
-        vlan.reset_caches()
+        # On a warm start this is the previous config's VLAN. If only its
+        # ports changed, the new config's VLAN shares its caches, so clear
+        # them in place: the VLAN's hosts must be learned again, as their
+        # flows have been deleted.
+        vlan.clear_caches()
         return ofmsgs
 
     def del_vlans(self, vlans, dp_vlans):
