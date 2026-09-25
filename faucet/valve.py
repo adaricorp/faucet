@@ -837,11 +837,11 @@ class Valve:
         self._reset_dp_status()
         self.ports_delete(self.dp.ports.keys(), now=now)
 
-    def _port_delete_flows_state(self, port, keep_cache=False):
+    def _port_delete_flows_state(self, port, keep_cache=False, expire_vids=None):
         """Delete flows/state for a port."""
         ofmsgs = []
         for route_manager in self._route_manager_by_ipv.values():
-            ofmsgs.extend(route_manager.expire_port_nexthops(port))
+            ofmsgs.extend(route_manager.expire_port_nexthops(port, vids=expire_vids))
         for manager in self._managers:
             ofmsgs.extend(manager.del_port(port))
         if not keep_cache:
@@ -904,17 +904,27 @@ class Valve:
         return self.ports_add([port_num])
 
     def ports_delete(
-        self, port_nums, log_msg="down", keep_cache=False, other_valves=None, now=None
+        self,
+        port_nums,
+        log_msg="down",
+        keep_cache=False,
+        other_valves=None,
+        now=None,
+        expire_vids_by_port=None,
     ):
         """Handle the deletion of ports.
 
         Args:
             port_nums (list): list of port numbers.
+            expire_vids_by_port (dict): VLAN IDs to expire next hops on, by
+                port number (all VLANs of a port that is not present).
         Returns:
             list: OpenFlow messages, if any.
         """
         ofmsgs = []
         vlans_with_deleted_ports = set()
+        if expire_vids_by_port is None:
+            expire_vids_by_port = {}
 
         for port_num in port_nums:
             if not self.dp.port_no_valid(port_num):
@@ -933,7 +943,11 @@ class Valve:
                 ofmsgs.extend(self.lacp_update(port, False, other_valves=other_valves))
             else:
                 ofmsgs.extend(
-                    self._port_delete_flows_state(port, keep_cache=keep_cache)
+                    self._port_delete_flows_state(
+                        port,
+                        keep_cache=keep_cache,
+                        expire_vids=expire_vids_by_port.get(port_num, None),
+                    )
                 )
 
         for vlan in vlans_with_deleted_ports:
@@ -1578,6 +1592,67 @@ class Valve:
                 return True
         return False
 
+    def _changed_port_expire_vids(self, new_dp, changed_ports, changed_vids):
+        """Return the VLAN IDs to expire next hops on, for changed ports.
+
+        A port whose own config did not change is changed only because of its
+        VLANs, or the stack or mirroring around it. Next hops learned on its
+        unchanged VLANs are still reachable through it, so they are kept,
+        unless the VLAN can share FIB flows with a changed VLAN: if their
+        subnets overlap (hosts on both could have the same address, and so
+        share a host route), or if they route the same destination (expiring
+        one gateway deletes the route flow they share). Ports whose own config
+        changed are left out, so next hops on all their VLANs are expired.
+
+        Args:
+            new_dp (DP): new dataplane configuration.
+            changed_ports (set): changed port numbers.
+            changed_vids (set): changed, ACL changed or deleted VLAN IDs.
+        Returns:
+            dict: VLAN IDs to expire next hops on, by port number.
+        """
+        changed_vlans = [
+            dp.vlans[vid]
+            for dp in (self.dp, new_dp)
+            for vid in changed_vids
+            if vid in dp.vlans
+        ]
+        changed_subnets = set()
+        changed_ip_dsts = set()
+        for vlan in changed_vlans:
+            changed_subnets.update(vip.network for vip in vlan.faucet_vips)
+            for ipv in vlan.ipvs():
+                changed_ip_dsts.update(vlan.routes_by_ipv(ipv))
+        expire_vids = set(changed_vids)
+        for vlan in self.dp.vlans.values():
+            if vlan.vid in expire_vids:
+                continue
+            if any(
+                vip.network.overlaps(subnet)
+                for vip in vlan.faucet_vips
+                for subnet in changed_subnets
+            ) or any(
+                ip_dst in changed_ip_dsts
+                for ipv in vlan.ipvs()
+                for ip_dst in vlan.routes_by_ipv(ipv)
+            ):
+                expire_vids.add(vlan.vid)
+        expire_vids_by_port = {}
+        for port_num in changed_ports:
+            port = self.dp.ports.get(port_num, None)
+            new_port = new_dp.ports.get(port_num, None)
+            if port is None or new_port is None:
+                continue
+            if not port.ignore_subconf(new_port, ignore_keys=["description"]):
+                continue
+            new_vids = {vlan.vid for vlan in new_port.vlans()}
+            expire_vids_by_port[port_num] = {
+                vlan.vid
+                for vlan in port.vlans()
+                if vlan.vid in expire_vids or vlan.vid not in new_vids
+            }
+        return expire_vids_by_port
+
     def _apply_config_changes(self, new_dp, changes, valves=None):
         """Apply any detected configuration changes.
 
@@ -1644,7 +1719,14 @@ class Valve:
         if deleted_ports:
             ofmsgs.extend(self.ports_delete(deleted_ports))
         if changed_ports:
-            ofmsgs.extend(self.ports_delete(changed_ports))
+            expire_vids_by_port = self._changed_port_expire_vids(
+                new_dp, changed_ports, changed_vids | deleted_vids | changed_acl_vlans
+            )
+            ofmsgs.extend(
+                self.ports_delete(
+                    changed_ports, expire_vids_by_port=expire_vids_by_port
+                )
+            )
         if deleted_vids:
             deleted_vlans = [self.dp.vlans[vid] for vid in deleted_vids]
             ofmsgs.extend(self.del_vlans(deleted_vlans, new_dp.vlans.values()))
