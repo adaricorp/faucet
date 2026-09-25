@@ -449,12 +449,12 @@ class Valve:
             ofmsgs.extend(self.add_vlan(vlan, cold_start=cold_start))
         return ofmsgs
 
-    def del_vlan(self, vlan, dp_vlans):
+    def del_vlan(self, vlan, dp_vlan_refs):
         """Delete a configured VLAN."""
         self.logger.info("Delete VLAN %s" % vlan)
         ofmsgs = []
         for manager in self._managers:
-            ofmsgs.extend(manager.del_vlan(vlan, dp_vlans))
+            ofmsgs.extend(manager.del_vlan(vlan, dp_vlan_refs[manager]))
         expired_hosts = list(vlan.dyn_host_cache.values())
         for entry in expired_hosts:
             self._update_expired_host(entry, vlan)
@@ -467,8 +467,13 @@ class Valve:
 
     def del_vlans(self, vlans, dp_vlans):
         ofmsgs = []
+        # Gather what each manager reference counts against once, rather
+        # than rescanning every VLAN on the DP for each VLAN deleted.
+        dp_vlan_refs = {
+            manager: manager.dp_vlan_refs(dp_vlans) for manager in self._managers
+        }
         for vlan in vlans:
-            ofmsgs.extend(self.del_vlan(vlan, dp_vlans))
+            ofmsgs.extend(self.del_vlan(vlan, dp_vlan_refs))
         return ofmsgs
 
     def _get_all_configured_port_nos(self):

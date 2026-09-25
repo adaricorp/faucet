@@ -564,13 +564,12 @@ class ValveRouteManager(ValveManagerBase):
                         )
         return ofmsgs
 
-    def _del_faucet_mac(self, faucet_mac, dp_vlans):
-        """Delete flows associated with a given faucet mac"""
-        ofmsgs = []
-        max_prefixlen = 32 if self.IPV == 4 else 128
-
+    def dp_vlan_refs(self, dp_vlans):
+        """Return FAUCET MACs, VIPs and VIP hosts in use by VLANs on the DP."""
         dp_macs = set()
         dp_mac_global_vip_present = {}
+        dp_faucet_vips = set()
+        dp_faucet_vip_hosts = set()
         for dp_vlan in dp_vlans:
             if dp_vlan.faucet_vips_by_ipv(self.IPV):
                 dp_macs.add(dp_vlan.faucet_mac)
@@ -580,6 +579,16 @@ class ValveRouteManager(ValveManagerBase):
                     if not faucet_vip.ip.is_link_local:
                         dp_mac_global_vip_present[dp_vlan.faucet_mac] = True
                         break
+            for faucet_vip in dp_vlan.faucet_vips_by_ipv(self.IPV):
+                dp_faucet_vips.add(faucet_vip)
+                faucet_vip_host = self._host_from_faucet_vip(faucet_vip)
+                dp_faucet_vip_hosts.add(faucet_vip_host)
+        return (dp_macs, dp_mac_global_vip_present, dp_faucet_vips, dp_faucet_vip_hosts)
+
+    def _del_faucet_mac(self, faucet_mac, dp_macs, dp_mac_global_vip_present):
+        """Delete flows associated with a given faucet mac"""
+        ofmsgs = []
+        max_prefixlen = 32 if self.IPV == 4 else 128
 
         if faucet_mac not in dp_macs:
             # FAUCET MAC is no longer used by any VLAN on DP
@@ -676,26 +685,22 @@ class ValveRouteManager(ValveManagerBase):
                     )
         return ofmsgs
 
-    def del_vlan(self, vlan, dp_vlans):
+    def del_vlan(self, vlan, dp_vlan_refs):
         """Delete a VLAN."""
         ofmsgs = []
         if not vlan.faucet_vips_by_ipv(self.IPV):
             return ofmsgs
+        dp_macs, dp_mac_global_vip_present, dp_faucet_vips, dp_faucet_vip_hosts = (
+            dp_vlan_refs
+        )
         ofmsgs.append(self.fib_table.flowdel(match=self.fib_table.match(vlan=vlan)))
-        ofmsgs.extend(self._del_faucet_mac(vlan.faucet_mac, dp_vlans))
+        ofmsgs.extend(
+            self._del_faucet_mac(vlan.faucet_mac, dp_macs, dp_mac_global_vip_present)
+        )
 
         # Expire next hops for this VLAN to remove static routes
         # from FIB of VLANs in same router as this one
         self.expire_vlan_nexthops(vlan)
-
-        dp_faucet_vips = set()
-        dp_faucet_vip_hosts = set()
-        if len(vlan.faucet_vips_by_ipv(self.IPV)) >= 1 and self.global_routing:
-            for dp_vlan in dp_vlans:
-                for faucet_vip in dp_vlan.faucet_vips_by_ipv(self.IPV):
-                    dp_faucet_vips.add(faucet_vip)
-                    faucet_vip_host = self._host_from_faucet_vip(faucet_vip)
-                    dp_faucet_vip_hosts.add(faucet_vip_host)
 
         for faucet_vip in vlan.faucet_vips_by_ipv(self.IPV):
             ofmsgs.extend(
@@ -1275,17 +1280,13 @@ class ValveIPv4RouteManager(ValveRouteManager):
         )
         return ofmsgs
 
-    def del_vlan(self, vlan, dp_vlans):
+    def del_vlan(self, vlan, dp_vlan_refs):
         """Delete a VLAN."""
-        ofmsgs = super().del_vlan(vlan, dp_vlans)
+        ofmsgs = super().del_vlan(vlan, dp_vlan_refs)
         if not vlan.faucet_vips_by_ipv(self.IPV):
             return ofmsgs
 
-        dp_faucet_vip_hosts = set()
-        for dp_vlan in dp_vlans:
-            for faucet_vip in dp_vlan.faucet_vips_by_ipv(self.IPV):
-                faucet_vip_host = self._host_from_faucet_vip(faucet_vip)
-                dp_faucet_vip_hosts.add(faucet_vip_host)
+        _, _, _, dp_faucet_vip_hosts = dp_vlan_refs
 
         for faucet_vip in vlan.faucet_vips_by_ipv(self.IPV):
             faucet_vip_host = self._host_from_faucet_vip(faucet_vip)
@@ -1516,12 +1517,9 @@ class ValveIPv6RouteManager(ValveRouteManager):
         )
         return ofmsgs
 
-    def del_vlan(self, vlan, dp_vlans):
-        """Delete a VLAN."""
-        ofmsgs = super().del_vlan(vlan, dp_vlans)
-        if not vlan.faucet_vips_by_ipv(self.IPV):
-            return ofmsgs
-
+    def dp_vlan_refs(self, dp_vlans):
+        """Return FAUCET MACs, VIPs, VIP hosts, VIP ND multicast MACs
+        and VIP broadcasts in use by VLANs on the DP."""
         dp_mcast_macs = set()
         dp_faucet_vip_broadcasts = set()
         dp_link_local_present = False
@@ -1538,6 +1536,24 @@ class ValveIPv6RouteManager(ValveRouteManager):
                         faucet_vip.network.broadcast_address
                     )
                     dp_faucet_vip_broadcasts.add(faucet_vip_broadcast)
+        return (
+            super().dp_vlan_refs(dp_vlans),
+            dp_mcast_macs,
+            dp_faucet_vip_broadcasts,
+            dp_link_local_present,
+        )
+
+    def del_vlan(self, vlan, dp_vlan_refs):
+        """Delete a VLAN."""
+        (
+            route_refs,
+            dp_mcast_macs,
+            dp_faucet_vip_broadcasts,
+            dp_link_local_present,
+        ) = dp_vlan_refs
+        ofmsgs = super().del_vlan(vlan, route_refs)
+        if not vlan.faucet_vips_by_ipv(self.IPV):
+            return ofmsgs
 
         if not dp_link_local_present:
             # No link local FAUCET VIPs present on any VLAN on DP
