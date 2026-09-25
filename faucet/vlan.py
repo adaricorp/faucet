@@ -385,6 +385,22 @@ class VLAN(Conf):
         for entry in self.cached_hosts_on_port(port):
             self.expire_cache_host(entry.eth_src)
 
+    def clear_caches(self):
+        """Clear dynamic caches in place.
+
+        Unlike reset_caches(), this also clears them for any other VLAN
+        instance sharing them (see Conf.merge_dyn()).
+        """
+        for cache in (
+            self.dyn_host_cache,
+            self.dyn_host_cache_by_port,
+            self.dyn_host_cache_stats_stale,
+            self.dyn_neigh_cache_by_ipv,
+            self.dyn_unresolved_route_ip_gws,
+            self.dyn_unresolved_host_ip_gws,
+        ):
+            cache.clear()
+
     def expire_cache_hosts(self, now, learn_timeout):
         """Expire stale host entries."""
         expired_hosts = []
