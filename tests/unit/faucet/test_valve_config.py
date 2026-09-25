@@ -21,14 +21,20 @@
 
 
 from functools import partial
+import contextlib
 import copy
 import hashlib
+import ipaddress
+import os
+import random
 import unittest
+from unittest import mock
 import time
 
 from ipaddress import ip_address
 
 from os_ken.lib.packet import arp
+from os_ken.lib.packet import icmpv6
 from os_ken.ofproto import ofproto_v1_3 as ofp
 
 from clib.fakeoftable import CONTROLLER_PORT
@@ -40,6 +46,15 @@ from clib.valve_test_lib import (
     ValveTestBases,
 )
 from faucet import config_parser_util, valve_of, valve_packet
+from faucet.conf import InvalidConfigError
+from faucet.config_parser import dp_parser
+from faucet.valve import Valve
+from faucet.valve_route import (
+    ValveIPv4RouteManager,
+    ValveIPv6RouteManager,
+    ValveRouteManager,
+)
+from faucet.valve_switch_standalone import ValveSwitchManager
 
 
 class ValveIncludeTestCase(ValveTestBases.ValveTestNetwork):
@@ -3387,6 +3402,473 @@ class ValveWarmChangeRoutedVLANResolvingTestCase(ValveWarmRoutedVLANTestBase):
             },
         )
         self.assertTrue(self.routed(4, self.SERVER2_IP, 2, self.SERVER2_MAC))
+
+
+# pylint: disable=protected-access
+# VLAN deletion as it was before dp_vlan_refs(), when every VLAN deleted
+# rescanned all the VLANs on the DP. Kept verbatim, bar calling the base
+# class explicitly, as the reference that the batched scans must match.
+
+
+def _rescan_valve_del_vlan(self, vlan, dp_vlans):
+    """Delete a configured VLAN."""
+    self.logger.info("Delete VLAN %s" % vlan)
+    ofmsgs = []
+    for manager in self._managers:
+        ofmsgs.extend(manager.del_vlan(vlan, dp_vlans))
+    expired_hosts = list(vlan.dyn_host_cache.values())
+    for entry in expired_hosts:
+        self._update_expired_host(entry, vlan)
+    vlan.reset_caches()
+    return ofmsgs
+
+
+def _rescan_valve_del_vlans(self, vlans, dp_vlans):
+    """Delete configured VLANs."""
+    ofmsgs = []
+    for vlan in vlans:
+        ofmsgs.extend(self.del_vlan(vlan, dp_vlans))
+    return ofmsgs
+
+
+def _rescan_switch_del_drop_spoofed_faucet_mac_rules(self, vlan, dp_vlans):
+    """Remove rules to drop spoofed faucet mac"""
+    ofmsgs = []
+    if self.drop_spoofed_faucet_mac:
+        dp_macs = [vlan.faucet_mac for vlan in dp_vlans]
+        if vlan.faucet_mac not in dp_macs:
+            ofmsgs.extend(self.pipeline.remove_filter({"eth_src": vlan.faucet_mac}))
+    return ofmsgs
+
+
+def _rescan_switch_del_vlan(self, vlan, dp_vlans):
+    """Delete a VLAN."""
+    ofmsgs = [
+        self.flood_table.flowdel(match=self.flood_table.match(vlan=vlan)),
+        self.eth_src_table.flowdel(match=self.eth_src_table.match(vlan=vlan)),
+    ]
+    ofmsgs.extend(self.del_drop_spoofed_faucet_mac_rules(vlan, dp_vlans))
+    return ofmsgs
+
+
+def _rescan_route_del_faucet_mac(self, faucet_mac, dp_vlans):
+    """Delete flows associated with a given faucet mac"""
+    ofmsgs = []
+    max_prefixlen = 32 if self.IPV == 4 else 128
+
+    dp_macs = set()
+    dp_mac_global_vip_present = {}
+    for dp_vlan in dp_vlans:
+        if dp_vlan.faucet_vips_by_ipv(self.IPV):
+            dp_macs.add(dp_vlan.faucet_mac)
+            if dp_vlan.faucet_mac not in dp_mac_global_vip_present:
+                dp_mac_global_vip_present[dp_vlan.faucet_mac] = False
+            for faucet_vip in dp_vlan.faucet_vips_by_ipv(self.IPV):
+                if not faucet_vip.ip.is_link_local:
+                    dp_mac_global_vip_present[dp_vlan.faucet_mac] = True
+                    break
+
+    if faucet_mac not in dp_macs:
+        # FAUCET MAC is no longer used by any VLAN on DP
+        for eth_type in self.CONTROL_ETH_TYPES:
+            ofmsgs.append(
+                self.vip_table.flowdel(
+                    match=self.vip_table.match(eth_dst=faucet_mac, eth_type=eth_type)
+                )
+            )
+    elif not dp_mac_global_vip_present[faucet_mac]:
+        # FAUCET MAC remains active on DP, but only used by link-local VIP
+        ofmsgs.append(
+            self.vip_table.flowdel(
+                match=self.vip_table.match(
+                    eth_dst=faucet_mac,
+                    eth_type=self.ETH_TYPE,
+                    nw_proto=self.ICMP_TYPE,
+                ),
+                priority=self.route_priority + max_prefixlen - 1,
+                strict=True,
+            )
+        )
+        ofmsgs.append(
+            self.vip_table.flowdel(
+                match=self.vip_table.match(
+                    eth_dst=faucet_mac,
+                    eth_type=self.ETH_TYPE,
+                ),
+                priority=self.route_priority + max_prefixlen - 3,
+                strict=True,
+            )
+        )
+
+    if True not in dp_mac_global_vip_present.values():
+        # No global scope VIPs left on DP
+        ofmsgs.append(
+            self.vip_table.flowdel(
+                match=self.vip_table.match(
+                    eth_type=self.ETH_TYPE, nw_proto=self.ICMP_TYPE
+                ),
+                priority=self.route_priority + max_prefixlen - 2,
+                strict=True,
+            )
+        )
+        ofmsgs.append(
+            self.vip_table.flowdel(
+                match=self.vip_table.match(eth_type=self.ETH_TYPE),
+                priority=self.route_priority + max_prefixlen - 4,
+                strict=True,
+            )
+        )
+    return ofmsgs
+
+
+def _rescan_route_del_vlan(self, vlan, dp_vlans):
+    """Delete a VLAN."""
+    ofmsgs = []
+    if not vlan.faucet_vips_by_ipv(self.IPV):
+        return ofmsgs
+    ofmsgs.append(self.fib_table.flowdel(match=self.fib_table.match(vlan=vlan)))
+    ofmsgs.extend(self._del_faucet_mac(vlan.faucet_mac, dp_vlans))
+
+    # Expire next hops for this VLAN to remove static routes
+    # from FIB of VLANs in same router as this one
+    self.expire_vlan_nexthops(vlan)
+
+    dp_faucet_vips = set()
+    dp_faucet_vip_hosts = set()
+    if len(vlan.faucet_vips_by_ipv(self.IPV)) >= 1 and self.global_routing:
+        for dp_vlan in dp_vlans:
+            for faucet_vip in dp_vlan.faucet_vips_by_ipv(self.IPV):
+                dp_faucet_vips.add(faucet_vip)
+                faucet_vip_host = self._host_from_faucet_vip(faucet_vip)
+                dp_faucet_vip_hosts.add(faucet_vip_host)
+
+    for faucet_vip in vlan.faucet_vips_by_ipv(self.IPV):
+        ofmsgs.extend(
+            self._del_faucet_vip(vlan, faucet_vip, dp_faucet_vip_hosts, dp_faucet_vips)
+        )
+    return ofmsgs
+
+
+def _rescan_ipv4_route_del_vlan(self, vlan, dp_vlans):
+    """Delete a VLAN."""
+    ofmsgs = _rescan_route_del_vlan(self, vlan, dp_vlans)
+    if not vlan.faucet_vips_by_ipv(self.IPV):
+        return ofmsgs
+
+    dp_faucet_vip_hosts = set()
+    for dp_vlan in dp_vlans:
+        for faucet_vip in dp_vlan.faucet_vips_by_ipv(self.IPV):
+            faucet_vip_host = self._host_from_faucet_vip(faucet_vip)
+            dp_faucet_vip_hosts.add(faucet_vip_host)
+
+    for faucet_vip in vlan.faucet_vips_by_ipv(self.IPV):
+        faucet_vip_host = self._host_from_faucet_vip(faucet_vip)
+        if faucet_vip_host not in dp_faucet_vip_hosts:
+            # Remove ARP for FAUCET VIP flow
+            ofmsgs.append(
+                self.vip_table.flowdel(
+                    match=self.vip_table.match(
+                        eth_type=valve_of.ether.ETH_TYPE_ARP,
+                        eth_dst=valve_of.mac.BROADCAST_STR,
+                        nw_dst=faucet_vip_host,
+                    ),
+                )
+            )
+    return ofmsgs
+
+
+def _rescan_ipv6_route_del_vlan(self, vlan, dp_vlans):
+    """Delete a VLAN."""
+    ofmsgs = _rescan_route_del_vlan(self, vlan, dp_vlans)
+    if not vlan.faucet_vips_by_ipv(self.IPV):
+        return ofmsgs
+
+    dp_mcast_macs = set()
+    dp_faucet_vip_broadcasts = set()
+    dp_link_local_present = False
+    for dp_vlan in dp_vlans:
+        for faucet_vip in dp_vlan.faucet_vips_by_ipv(self.IPV):
+            if faucet_vip.is_link_local:
+                dp_link_local_present = True
+            faucet_vip_host_nd_mcast = valve_packet.ipv6_link_eth_mcast(
+                valve_packet.ipv6_solicited_node_from_ucast(faucet_vip.ip)
+            )
+            dp_mcast_macs.add(faucet_vip_host_nd_mcast)
+            if self.global_routing:
+                faucet_vip_broadcast = ipaddress.IPv6Interface(
+                    faucet_vip.network.broadcast_address
+                )
+                dp_faucet_vip_broadcasts.add(faucet_vip_broadcast)
+
+    if not dp_link_local_present:
+        # No link local FAUCET VIPs present on any VLAN on DP
+        ofmsgs.append(
+            self.vip_table.flowdel(
+                match=self.vip_table.match(
+                    eth_type=self.ETH_TYPE,
+                    eth_dst=valve_packet.IPV6_ALL_ROUTERS_MCAST,
+                    nw_proto=valve_of.inet.IPPROTO_ICMPV6,
+                    icmpv6_type=icmpv6.ND_ROUTER_SOLICIT,
+                ),
+            )
+        )
+
+    for faucet_vip in vlan.faucet_vips_by_ipv(self.IPV):
+        faucet_vip_host_nd_mcast = valve_packet.ipv6_link_eth_mcast(
+            valve_packet.ipv6_solicited_node_from_ucast(faucet_vip.ip)
+        )
+        if faucet_vip_host_nd_mcast not in dp_mcast_macs:
+            # Remove IPv6 NS for FAUCET VIP flow
+            ofmsgs.append(
+                self.vip_table.flowdel(
+                    match=self.vip_table.match(
+                        eth_type=self.ETH_TYPE,
+                        eth_dst=faucet_vip_host_nd_mcast,
+                        nw_proto=valve_of.inet.IPPROTO_ICMPV6,
+                        icmpv6_type=icmpv6.ND_NEIGHBOR_SOLICIT,
+                    ),
+                )
+            )
+        if self.global_routing:
+            faucet_vip_broadcast = ipaddress.IPv6Interface(
+                faucet_vip.network.broadcast_address
+            )
+            if faucet_vip_broadcast not in dp_faucet_vip_broadcasts:
+                # FAUCET VIP broadcast route no longer in use on DP
+                ofmsgs.append(
+                    self.fib_table.flowdel(
+                        match=self._route_match(self.global_vlan, faucet_vip_broadcast),
+                    )
+                )
+    return ofmsgs
+
+
+# pylint: enable=protected-access
+
+
+def _rescan_per_vlan():
+    """Patch VLAN deletion back to rescanning the DP for every VLAN."""
+    stack = contextlib.ExitStack()
+    stack.enter_context(
+        mock.patch.multiple(
+            Valve, del_vlan=_rescan_valve_del_vlan, del_vlans=_rescan_valve_del_vlans
+        )
+    )
+    stack.enter_context(
+        mock.patch.multiple(
+            ValveSwitchManager,
+            del_vlan=_rescan_switch_del_vlan,
+            del_drop_spoofed_faucet_mac_rules=_rescan_switch_del_drop_spoofed_faucet_mac_rules,
+        )
+    )
+    stack.enter_context(
+        mock.patch.object(
+            ValveRouteManager, "_del_faucet_mac", _rescan_route_del_faucet_mac
+        )
+    )
+    stack.enter_context(
+        mock.patch.object(
+            ValveIPv4RouteManager, "del_vlan", _rescan_ipv4_route_del_vlan
+        )
+    )
+    stack.enter_context(
+        mock.patch.object(
+            ValveIPv6RouteManager, "del_vlan", _rescan_ipv6_route_del_vlan
+        )
+    )
+    return stack
+
+
+class ValveDeleteVLANRefsTestCase(ValveTestBases.ValveTestNetwork):
+    """Test gathering the DP's VLAN references once for a batch of VLAN
+    deletions deletes the same flows as rescanning the DP for every VLAN."""
+
+    REQUIRE_TFM = False
+    SAMPLES = 100
+
+    FAUCET_MACS = (None, "0e:00:00:00:00:01", "0e:00:00:00:00:02")
+    VIPS = (
+        (None, "10.0.1.254/24", "10.0.1.254/25", "10.0.2.254/24"),
+        (None, "fc00::1:254/112", "fc00::1:254/120", "fc01::1:254/112"),
+        (None, "fe80::c00:ff:fe00:1/64", "fe80::c00:ff:fe00:2/64"),
+    )
+
+    CONFIG = """
+dps:
+    s1:
+        dp_id: 1
+        hardware: 'Open vSwitch'
+        interfaces:
+            p1:
+                number: 1
+                native_vlan: 0x100
+"""
+
+    def setUp(self):
+        """Setup basic port and vlan config"""
+        self.setup_valves(self.CONFIG)
+
+    def _random_config(self, rng):
+        """Return a config with VLANs that share FAUCET MACs and VIPs."""
+        vlans = {}
+        for i in range(rng.randint(1, 6)):
+            vlan = {"vid": 0x100 + i}
+            faucet_mac = rng.choice(self.FAUCET_MACS)
+            if faucet_mac:
+                vlan["faucet_mac"] = faucet_mac
+            faucet_vips = [rng.choice(vips) for vips in self.VIPS]
+            vlan["faucet_vips"] = [vip for vip in faucet_vips if vip]
+            vlans["v%u" % i] = vlan
+        dp_config = {
+            "dp_id": self.DP_ID,
+            "hardware": "Open vSwitch",
+            "drop_spoofed_faucet_mac": rng.choice((True, False)),
+            "proactive_learn_v4": rng.choice((True, False)),
+            "interfaces": {"p1": {"number": 1, "tagged_vlans": list(vlans)}},
+        }
+        routers = {}
+        for i in range(rng.randint(0, 2)):
+            router_vlans = rng.sample(
+                list(vlans), rng.randint(min(2, len(vlans)), len(vlans))
+            )
+            routers["r%u" % i] = {"vlans": router_vlans}
+        if len(routers) == 1 and rng.choice((True, False)):
+            dp_config["global_vlan"] = 0x300
+        config = {"vlans": vlans, "dps": {"s1": dp_config}}
+        if routers:
+            config["routers"] = routers
+        return config_parser_util.yaml_dump(config)
+
+    def _parse_dp(self, config):
+        """Return the DP in config, or None if config is not valid."""
+        config_file = os.path.join(self.tmpdir, "parse.yaml")
+        with open(config_file, "w", encoding="utf-8") as config_fh:
+            config_fh.write(config)
+        try:
+            _, _, dps, _ = dp_parser(config_file, self.LOGNAME)
+        except InvalidConfigError:
+            return None
+        return dps[0]
+
+    def test_del_vlans_refs(self):
+        """Test deleting random VLANs against random DP VLANs."""
+        rng = random.Random(1)
+        compared = 0
+        referenced = 0
+        for _ in range(self.SAMPLES):
+            old_config = self._random_config(rng)
+            new_dp = self._parse_dp(self._random_config(rng))
+            if new_dp is None or self._parse_dp(old_config) is None:
+                continue
+            self.update_config(old_config, reload_type=None)
+            valve = self.valves_manager.valves[self.DP_ID]
+            old_vlans = list(valve.dp.vlans.values())
+            vlans = rng.sample(old_vlans, rng.randint(1, len(old_vlans)))
+            with _rescan_per_vlan():
+                expected = [
+                    str(ofmsg)
+                    for ofmsg in valve.del_vlans(vlans, new_dp.vlans.values())
+                ]
+                unreferenced = {str(ofmsg) for ofmsg in valve.del_vlans(vlans, [])}
+            ofmsgs = [
+                str(ofmsg) for ofmsg in valve.del_vlans(vlans, new_dp.vlans.values())
+            ]
+            self.assertEqual(expected, ofmsgs)
+            compared += 1
+            if unreferenced - set(expected):
+                referenced += 1
+        self.assertGreater(compared, self.SAMPLES // 3)
+        self.assertGreater(referenced, 0)
+
+
+class _ScannedVLANs(list):
+    """VLANs that count how many times they are scanned."""
+
+    scans = 0
+
+    def __iter__(self):
+        self.scans += 1
+        return super().__iter__()
+
+
+class ValveWarmStartManyRoutedVLANsTestCase(ValveTestBases.ValveTestNetwork):
+    """Test warm starting many routed VLANs does work linear in their number."""
+
+    REQUIRE_TFM = False
+    VLANS = 64
+
+    VLANS_CONFIG = "".join(
+        """
+    v%u:
+        vid: %u
+        faucet_vips: ["10.0.%u.254/24", "fc00::%x:254/112", "fe80::c00:ff:fe00:1/64"]
+"""
+        % (i, 0x100 + i, i, i)
+        for i in range(VLANS)
+    )
+    TAGGED_VLANS = ", ".join("v%u" % i for i in range(VLANS))
+
+    CONFIG = """
+vlans:%s
+dps:
+    s1:
+        dp_id: 1
+        hardware: 'Open vSwitch'
+        interfaces:
+            p1:
+                number: 1
+                tagged_vlans: [%s]
+""" % (
+        VLANS_CONFIG,
+        TAGGED_VLANS,
+    )
+
+    MORE_CONFIG = (
+        CONFIG
+        + """
+            p2:
+                number: 2
+                tagged_vlans: [%s]
+"""
+        % TAGGED_VLANS
+    )
+
+    def setUp(self):
+        """Setup basic port and vlan config"""
+        self.setup_valves(self.CONFIG)
+
+    def test_add_trunk_port(self):
+        """Test adding a port that carries every VLAN, which changes them all."""
+        # pylint: disable=protected-access
+        del_vlans = Valve.del_vlans
+        host_from_faucet_vip = ValveRouteManager._host_from_faucet_vip
+        batches = []
+        vip_hosts = []
+
+        def scanned_del_vlans(valve, vlans, dp_vlans):
+            dp_vlans = _ScannedVLANs(dp_vlans)
+            batches.append((vlans, dp_vlans))
+            return del_vlans(valve, vlans, dp_vlans)
+
+        def counted_host_from_faucet_vip(route_manager, faucet_vip):
+            vip_hosts.append(faucet_vip)
+            return host_from_faucet_vip(route_manager, faucet_vip)
+
+        with mock.patch.object(
+            Valve, "del_vlans", scanned_del_vlans
+        ), mock.patch.object(
+            ValveRouteManager, "_host_from_faucet_vip", counted_host_from_faucet_vip
+        ):
+            self.update_config(self.MORE_CONFIG, reload_type="warm")
+
+        self.assertEqual(1, len(batches))
+        vlans, dp_vlans = batches[0]
+        self.assertEqual(self.VLANS, len(vlans))
+        # The DP's VLANs are scanned a few times for the whole batch,
+        # not once or more for every VLAN deleted, so work on their VIPs
+        # grows with the number of VLANs rather than its square.
+        self.assertLess(dp_vlans.scans, self.VLANS // 4)
+        self.assertLessEqual(len(vip_hosts), 10 * self.VLANS)
 
 
 if __name__ == "__main__":

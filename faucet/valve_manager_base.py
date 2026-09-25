@@ -33,7 +33,15 @@ class ValveManagerBase:
         """install flows in response to a new port"""
         return []
 
-    def del_vlan(self, vlan, dp_vlans):
+    def dp_vlan_refs(self, dp_vlans):
+        """return what del_vlan() needs to know about the VLANs on the DP.
+
+        Called once for a batch of VLAN removals, so a manager that reference
+        counts flows shared between VLANs can scan the DP once per batch
+        rather than once per VLAN removed."""
+        return dp_vlans
+
+    def del_vlan(self, vlan, dp_vlan_refs):
         """delete flows in response to a VLAN removal"""
         return []
 
