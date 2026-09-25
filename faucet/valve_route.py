@@ -347,11 +347,13 @@ class ValveRouteManager(ValveManagerBase):
         ]
         return self._expire_nexthops(now, vlan, dead_nexthops)
 
-    def expire_port_nexthops(self, port):
-        """Expire all hosts on a port"""
+    def expire_port_nexthops(self, port, vids=None):
+        """Expire all hosts on a port (only on VLANs in vids, if specified)"""
         ofmsgs = []
         now = time.time()
         for vlan in port.vlans():
+            if vids is not None and vlan.vid not in vids:
+                continue
             nexthop_cache = self._vlan_nexthop_cache(vlan)
             dead_nexthops = [
                 (ip_gw, nexthop_cache_entry)
