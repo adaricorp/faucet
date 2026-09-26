@@ -689,13 +689,14 @@ class ValveRouteManager(ValveManagerBase):
 
     def del_vlan(self, vlan, dp_vlan_refs):
         """Delete a VLAN."""
-        ofmsgs = []
+        # A VLAN without a VIP of this IP version still has FIB flows if it
+        # is routed with a VLAN that has one.
+        ofmsgs = [self.fib_table.flowdel(match=self.fib_table.match(vlan=vlan))]
         if not vlan.faucet_vips_by_ipv(self.IPV):
             return ofmsgs
         dp_macs, dp_mac_global_vip_present, dp_faucet_vips, dp_faucet_vip_hosts = (
             dp_vlan_refs
         )
-        ofmsgs.append(self.fib_table.flowdel(match=self.fib_table.match(vlan=vlan)))
         ofmsgs.extend(
             self._del_faucet_mac(vlan.faucet_mac, dp_macs, dp_mac_global_vip_present)
         )
