@@ -753,6 +753,207 @@ class ValveRouteManager(ValveManagerBase):
                     )
         return ofmsgs
 
+    @staticmethod
+    def routed_peers(routers):
+        """Return the VLANs each VLAN routes with.
+
+        Args:
+            routers (dict): routers by name.
+        Returns:
+            dict: {vid: set of the VIDs it shares a router with}, for each VLAN
+                that shares a router with another.
+        """
+        peers = defaultdict(set)
+        for router in routers.values():
+            vids = {vlan.vid for vlan in router.vlans}
+            if len(vids) > 1:
+                for vid in vids:
+                    peers[vid].update(vids)
+        for vid, vids in peers.items():
+            vids.discard(vid)
+        return dict(peers)
+
+    def _peer_fib_keys(self, peer):
+        """Return every destination a VLAN can have installed on its peers' FIB.
+
+        Its connected subnets, as _add_faucet_fib_to_vip() installs them, and
+        every destination in its route table, hosts learned on it included,
+        whatever state the next hop is in: a flow installed while the next hop
+        was resolved, or as a blackhole while it resolves, stays until deleted.
+
+        Args:
+            peer (VLAN): VLAN the flows come from.
+        Returns:
+            dict: {ip_network: nw_dst the flow matches}.
+        """
+        keys = {}
+        if self.proactive_learn:
+            for faucet_vip in peer.faucet_vips_by_ipv(self.IPV):
+                if not faucet_vip.ip.is_link_local:
+                    keys[faucet_vip.network] = faucet_vip
+        for ip_dst in self._vlan_routes(peer):
+            keys[ip_dst] = ip_dst
+        return keys
+
+    def _peer_fib_entries(self, peer, keys=None):
+        """Return the FIB entries a VLAN installs on the VLANs it routes with.
+
+        Its connected subnets, as _add_faucet_fib_to_vip() installs them, and
+        its routes via resolved next hops, as _add_resolved_route() does. A
+        route via a next hop not yet resolved is left out, as a cold start
+        installs it only once resolved.
+
+        Args:
+            peer (VLAN): VLAN the entries come from.
+            keys (set): only return these destinations, if given.
+        Returns:
+            dict: {ip_network: (nw_dst to match, eth_dst)}, where eth_dst is
+                the next hop of a route, or None for a connected subnet.
+        """
+        entries = {}
+        if self.proactive_learn:
+            for faucet_vip in peer.faucet_vips_by_ipv(self.IPV):
+                if faucet_vip.ip.is_link_local:
+                    continue
+                if keys is None or faucet_vip.network in keys:
+                    entries[faucet_vip.network] = (faucet_vip, None)
+        routes = self._vlan_routes(peer)
+        if keys is None:
+            ip_dsts = list(routes)
+        elif len(routes) < len(keys):
+            ip_dsts = [ip_dst for ip_dst in routes if ip_dst in keys]
+        else:
+            ip_dsts = [ip_dst for ip_dst in keys if ip_dst in routes]
+        for ip_dst in ip_dsts:
+            eth_dst = self._cached_nexthop_eth_dst(peer, routes[ip_dst])
+            if eth_dst is not None:
+                entries[ip_dst] = (ip_dst, eth_dst)
+        return entries
+
+    def _peer_fib_flowmod(self, vlan, peer, nw_dst, eth_dst):
+        """Return the flowmod for one entry of _peer_fib_entries() on vlan."""
+        if eth_dst is None:
+            return self.fib_table.flowmod(
+                self._route_match(vlan, nw_dst),
+                priority=self.route_priority + nw_dst.network.prefixlen,
+                inst=(self.fib_table.goto(self.vip_table),),
+            )
+        return self.fib_table.flowmod(
+            self._route_match(vlan, nw_dst),
+            priority=self._route_priority(nw_dst),
+            inst=self.pipeline.accept_to_l2_forwarding(
+                actions=self._nexthop_actions(eth_dst, peer)
+            ),
+        )
+
+    def withdraw_lost_peers(self, vlans, new_peers):
+        """Return deletes for what each VLAN has from the VLANs it stops routing with.
+
+        Called on the running config, before a warm start deletes any port or
+        VLAN, which expires the hosts and next hops learned on them. Every
+        destination the lost peer can have installed (see _peer_fib_keys())
+        gets a delete, in both directions, whether or not the VLAN has a VIP
+        of this IP version; replay_gained_peers() sends it unless the VLAN
+        still has the destination from elsewhere. The next hop caches are not
+        read, so a flow is deleted whatever state its next hop is in; a strict
+        delete of a flow not installed does nothing.
+
+        Args:
+            vlans (dict): the running config's VLANs by VID.
+            new_peers (dict): routed_peers() of the new config.
+        Returns:
+            dict: {vid: {ip_network: flow delete}}.
+        """
+        withdrawals = defaultdict(dict)
+        peer_keys = {}
+        for vid, peers in self.routed_peers(self.routers).items():
+            for peer_vid in peers - new_peers.get(vid, set()):
+                if peer_vid not in peer_keys:
+                    peer_keys[peer_vid] = self._peer_fib_keys(vlans[peer_vid])
+                for key, nw_dst in peer_keys[peer_vid].items():
+                    withdrawals[vid][key] = self.fib_table.flowdel(
+                        self._route_match(vlans[vid], nw_dst),
+                        priority=self.route_priority + key.prefixlen,
+                        strict=True,
+                    )
+        return withdrawals
+
+    def _peer_fib_winners(self, vlans, vid, peer_vids, kept_vids, keys):
+        """Return the entry a VLAN's FIB has for each destination, and its VLAN.
+
+        A VLAN has entries from itself and from each VLAN it routes with (see
+        _peer_fib_entries()). As on a cold start, where _add_resolved_route()
+        overwrites the connected subnets add_vlan() installs as next hops
+        resolve, a route via a resolved next hop wins over a connected subnet.
+        Between two of a kind, where a cold start's choice depends on which
+        next hop resolves last, the VLAN itself and the VLANs it kept routing
+        with win over those it gains, so a route in use stays where it is,
+        and then the lowest VID wins.
+
+        Args:
+            vlans (dict): VLANs by VID; a VLAN not in it provides nothing.
+            vid (int): VID of the VLAN.
+            peer_vids (set): VIDs of the VLANs it routes with.
+            kept_vids (set): VIDs of those it routed with before, too.
+            keys (set): the destinations to look up.
+        Returns:
+            dict: {ip_network: (VLAN the entry is from, nw_dst, eth_dst)}, for
+                each destination that one of them provides.
+        """
+        winners = {}
+        kept = sorted(vlans.keys() & (kept_vids | {vid}))
+        gained = sorted(vlans.keys() & (peer_vids - kept_vids - {vid}))
+        for peer_vid in kept + gained:
+            peer = vlans[peer_vid]
+            for key, (nw_dst, eth_dst) in self._peer_fib_entries(peer, keys).items():
+                if key not in winners or (
+                    eth_dst is not None and winners[key][2] is None
+                ):
+                    winners[key] = (peer, nw_dst, eth_dst)
+        return winners
+
+    def replay_gained_peers(self, vlans, old_peers, withdrawals):
+        """Return flows for what each VLAN gets from the VLANs it starts routing with.
+
+        Called on the new config, once a warm start has added and changed its
+        VLANs. Each destination a VLAN gets from a peer it gains (see
+        _peer_fib_entries()), or had withdrawn by withdraw_lost_peers(), is
+        looked up again over the VLAN itself and every VLAN it now routes
+        with (see _peer_fib_winners()). The winner's entry is added, and a
+        withdrawn destination that none of them provides is deleted; nothing
+        else is sent. So a destination moving from one router to another (a
+        default route moving between uplinks) is only ever added: an add
+        replaces the flow with the same match and priority in place.
+
+        Args:
+            vlans (dict): the new config's VLANs by VID.
+            old_peers (dict): routed_peers() of the running config.
+            withdrawals (dict): withdraw_lost_peers() of the running config.
+        Returns:
+            list: OpenFlow messages.
+        """
+        new_peers = self.routed_peers(self.routers)
+        gained_entries = {}
+        ofmsgs = []
+        for vid in sorted(new_peers.keys() | withdrawals.keys()):
+            withdrawn = withdrawals.get(vid, {})
+            peer_vids = new_peers.get(vid, set())
+            kept_vids = peer_vids & old_peers.get(vid, set())
+            keys = set(withdrawn)
+            for peer_vid in peer_vids - kept_vids:
+                if peer_vid not in gained_entries:
+                    gained_entries[peer_vid] = self._peer_fib_entries(vlans[peer_vid])
+                keys.update(gained_entries[peer_vid])
+            if not keys:
+                continue
+            winners = self._peer_fib_winners(vlans, vid, peer_vids, kept_vids, keys)
+            for key in keys:
+                if key in winners:
+                    ofmsgs.append(self._peer_fib_flowmod(vlans[vid], *winners[key]))
+                else:
+                    ofmsgs.append(withdrawn[key])
+        return ofmsgs
+
     def _update_nexthop_cache(self, now, vlan, eth_src, port, ip_gw):
         """Add information to the nexthop cache and return the new object"""
         nexthop = NextHop(eth_src, port, now)
