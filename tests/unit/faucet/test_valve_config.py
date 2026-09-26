@@ -4225,5 +4225,229 @@ dps:
         self._relearn_hosts()
 
 
+class ValveTrunkReceiveOnlyHostTestCase(ValveTestBases.ValveTestNetwork):
+    """Test hosts on a trunk that only answer faucet, once their port flaps."""
+
+    REQUIRE_TFM = False
+
+    CONFIG = """
+vlans:
+  vlan1:
+    vid: 0x100
+    faucet_vips: ["10.10.0.254/24", "fc10::254/64"]
+  vlan2:
+    vid: 0x200
+    faucet_vips: ["10.20.0.254/24", "fc20::254/64"]
+  vlan3:
+    vid: 0x300
+    faucet_vips: ["10.30.0.254/24", "fc30::254/64"]
+routers:
+  router-1:
+    vlans: [vlan1, vlan2, vlan3]
+dps:
+  s1:
+    dp_id: 1
+    hardware: "Open vSwitch"
+    global_vlan: %u
+    ignore_learn_ins: 0
+    interfaces:
+      1:
+        tagged_vlans: [vlan1, vlan2]
+      2:
+        native_vlan: vlan3
+      3:
+        native_vlan: vlan1
+"""
+    GLOBAL_VLAN = 0
+
+    # MAC and addresses of the host on each VLAN of the trunk (port 1),
+    # which sends faucet nothing but replies once routed.
+    HOSTS = {
+        0x100: ("00:00:00:01:00:01", {4: "10.10.0.1", 6: "fc10::1"}),
+        0x200: ("00:00:00:02:00:01", {4: "10.20.0.1", 6: "fc20::1"}),
+    }
+    # MAC and addresses of a host on vlan3 (port 2), which routes to them.
+    SRC_HOST = ("00:00:00:03:00:01", {4: "10.30.0.1", 6: "fc30::1"})
+
+    def setUp(self):
+        """Setup the routed VLANs, and route the hosts."""
+        self.setup_valves(self.CONFIG % self.GLOBAL_VLAN)
+        hosts = [(1, vid, host) for vid, host in self.HOSTS.items()]
+        for port, vid, (mac, host_ips) in hosts + [(2, 0x300, self.SRC_HOST)]:
+            self.l3_learn_host(
+                port,
+                vid,
+                mac,
+                [ip_address(host_ip) for host_ip in host_ips.values()],
+                [vip.ip for vip in self._vlan(vid).faucet_vips],
+            )
+        for vid in self.HOSTS:
+            for ipv in (4, 6):
+                self.assertTrue(self._routed(vid, ipv))
+
+    def _vlan(self, vid):
+        """Return a VLAN."""
+        return self.valves_manager.valves[self.DP_ID].dp.vlans[vid]
+
+    def _routed(self, vid, ipv, port=1):
+        """Return True if vlan3 routes to the host on a VLAN, out of port."""
+        eth_dst, host_ips = self.HOSTS[vid]
+        eth_src, src_ips = self.SRC_HOST
+        match = {
+            "in_port": 2,
+            "vlan_vid": 0,
+            "eth_type": 0x800 if ipv == 4 else 0x86DD,
+            "eth_src": eth_src,
+            "eth_dst": self._vlan(0x300).faucet_mac,
+            "ipv%u_src" % ipv: src_ips[ipv],
+            "ipv%u_dst" % ipv: host_ips[ipv],
+        }
+        outputs = self.network.tables[self.DP_ID].get_port_outputs(match)
+        return any(pkt["eth_dst"] == eth_dst for pkt in outputs.get(port, []))
+
+    def _host_route(self, vid, ipv):
+        """Return the gateway of the RIB route to the host on a VLAN, if any."""
+        host_ip = self.HOSTS[vid][1][ipv]
+        routes = self._vlan(vid).routes_by_ipv(ipv)
+        return routes.get(ipaddress.ip_network(host_ip), None)
+
+    @staticmethod
+    def _requested(ofmsgs):
+        """Return the IP addresses ofmsgs send an ARP request or an NS for."""
+        requested = set()
+        for pkt_out in ValveTestBases.packet_outs_from_flows(ofmsgs):
+            pkt = valve_packet.parse_packet_in_pkt(bytes(pkt_out.data), None)[0]
+            arp_pkt = pkt.get_protocol(arp.arp)
+            if arp_pkt and arp_pkt.opcode == arp.ARP_REQUEST:
+                requested.add(arp_pkt.dst_ip)
+            icmpv6_pkt = pkt.get_protocol(icmpv6.icmpv6)
+            if icmpv6_pkt and icmpv6_pkt.type_ == icmpv6.ND_NEIGHBOR_SOLICIT:
+                requested.add(icmpv6_pkt.data.dst)
+        return requested
+
+    def _resolvers(self, secs=5):
+        """Run faucet's resolvers, and return what they send."""
+        valve = self.valves_manager.valves[self.DP_ID]
+        now = self.mock_time(secs)
+        ofmsgs = valve.resolve_gateways(now, None).get(valve, [])
+        ofmsgs.extend(valve.state_expire(now, None).get(valve, []))
+        self.apply_ofmsgs(ofmsgs)
+        return ofmsgs
+
+    def _reply(self, port, vid, ipv):
+        """Reply from the host on a VLAN to faucet, by ARP or by ND."""
+        eth_src, host_ips = self.HOSTS[vid]
+        vlan = self._vlan(vid)
+        host_ip = host_ips[ipv]
+        vip = str(vlan.vip_map(ip_address(host_ip)).ip)
+        match = {"eth_src": eth_src, "eth_dst": vlan.faucet_mac}
+        if ipv == 4:
+            match.update(
+                {
+                    "eth_type": 0x806,
+                    "arp_code": arp.ARP_REPLY,
+                    "arp_source_ip": host_ip,
+                    "arp_target_ip": vip,
+                }
+            )
+        else:
+            match.update(
+                {"ipv6_src": host_ip, "ipv6_dst": vip, "neighbor_advert_ip": host_ip}
+            )
+        return self.rcv_packet(port, vid, match)[self.DP_ID]
+
+    def _answer(self, ipv, ofmsgs, ports):
+        """Reply to faucet's requests in ofmsgs, from the hosts on VLANs in ports."""
+        requested = self._requested(ofmsgs)
+        for vid, port in ports.items():
+            if self.HOSTS[vid][1][ipv] in requested:
+                self._answer(ipv, self._reply(port, vid, ipv), ports)
+
+    def _resolve(self, ipv, ports, cycles=3, secs=5):
+        """Run faucet's resolvers, with the hosts on VLANs in ports replying."""
+        for _ in range(cycles):
+            self._answer(ipv, self._resolvers(secs), ports)
+
+    def _flap(self, ipv):
+        """Take the trunk down and up, which expires the hosts on it."""
+        self.set_port_down(1)
+        for vid in self.HOSTS:
+            self.assertFalse(self._routed(vid, ipv))
+            self.assertIsNone(self._host_route(vid, ipv))
+        self.set_port_up(1)
+
+    def _test_port_flap(self, ipv):
+        """Test hosts on a trunk are routed when they reply, after a flap."""
+        self._flap(ipv)
+        self._resolve(ipv, {0x100: 1, 0x200: 1})
+        for vid in self.HOSTS:
+            self.assertTrue(self._routed(vid, ipv), msg="VLAN %u" % vid)
+
+    def _test_dead_host(self, ipv):
+        """Test hosts that stop replying, or never reply, lose their routes."""
+        self._flap(ipv)
+        # Only the host on vlan1 replies after the flap.
+        self._resolve(ipv, {0x100: 1})
+        self.assertTrue(self._routed(0x100, ipv))
+        self.assertFalse(self._routed(0x200, ipv))
+        self.assertIsNone(self._host_route(0x200, ipv))
+        # Then no host replies, for longer than faucet retries a host.
+        dp = self.valves_manager.valves[self.DP_ID].dp
+        self._resolve(
+            ipv,
+            {},
+            cycles=dp.max_host_fib_retry_count + 2,
+            secs=dp.max_resolve_backoff_time * 2,
+        )
+        for vid in self.HOSTS:
+            self.assertFalse(self._routed(vid, ipv), msg="VLAN %u" % vid)
+            self.assertIsNone(self._host_route(vid, ipv), msg="VLAN %u" % vid)
+
+    def _test_moved_host(self, ipv):
+        """Test a host that moved to an up port is routed on its first reply."""
+        self.set_port_down(1)
+        self._resolve(ipv, {}, cycles=12)
+        # The host on vlan1 is on port 3 now, and hears faucet's next request.
+        host_ip = self.HOSTS[0x100][1][ipv]
+        for _ in range(20):
+            if host_ip in self._requested(self._resolvers()):
+                break
+        else:
+            self.fail("%s not resolved" % host_ip)
+        self.assertFalse(self._routed(0x100, ipv, port=3))
+        self._reply(3, 0x100, ipv)
+        self.assertTrue(self._routed(0x100, ipv, port=3))
+
+    def test_port_flap_ipv4(self):
+        """Test IPv4 hosts on a trunk are routed when they reply, after a flap."""
+        self._test_port_flap(4)
+
+    def test_port_flap_ipv6(self):
+        """Test IPv6 hosts on a trunk are routed when they reply, after a flap."""
+        self._test_port_flap(6)
+
+    def test_dead_host_ipv4(self):
+        """Test IPv4 hosts on a trunk that do not reply lose their routes."""
+        self._test_dead_host(4)
+
+    def test_dead_host_ipv6(self):
+        """Test IPv6 hosts on a trunk that do not reply lose their routes."""
+        self._test_dead_host(6)
+
+    def test_moved_host_ipv4(self):
+        """Test an IPv4 host that moved to an up port is routed when it replies."""
+        self._test_moved_host(4)
+
+    def test_moved_host_ipv6(self):
+        """Test an IPv6 host that moved to an up port is routed when it replies."""
+        self._test_moved_host(6)
+
+
+class ValveTrunkReceiveOnlyHostGlobalTestCase(ValveTrunkReceiveOnlyHostTestCase):
+    """Test hosts on a trunk that only answer faucet, with global routing."""
+
+    GLOBAL_VLAN = 0x800
+
+
 if __name__ == "__main__":
     unittest.main()  # pytype: disable=module-attr
