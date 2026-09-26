@@ -1283,6 +1283,28 @@ class ValveIPv4RouteManager(ValveRouteManager):
                 )
         return ofmsgs
 
+    def _add_host_fib_route_from_reply(self, now, pkt_meta):
+        """Add a host FIB route given an ARP reply that changed no routes.
+
+        An ARP request for a VIP adds the host's route, and so does an IPv6
+        advert that changes no routes, as Valve.router_rcv_packet adds it from
+        the advert's IP header and then runs the resolvers once more. An ARP
+        reply has no IP header, so do both here, or a host that only replies,
+        such as one whose route was expired with its port, is not routed again.
+        """
+        ofmsgs = []
+        vlan = pkt_meta.vlan
+        src_ip = pkt_meta.l3_src
+        if vlan.ip_in_vip_subnet(src_ip) and self._stateful_gw(vlan, src_ip):
+            ofmsgs.extend(self._add_host_fib_route(vlan, src_ip, blackhole=False))
+            ofmsgs.extend(
+                self._update_nexthop(now, vlan, pkt_meta.port, pkt_meta.eth_src, src_ip)
+            )
+        if ofmsgs:
+            ofmsgs.extend(self.resolve_gateways(vlan, now, resolve_all=False))
+            ofmsgs.extend(self.resolve_expire_hosts(vlan, now, resolve_all=False))
+        return ofmsgs
+
     def _control_plane_arp_handler(self, now, pkt_meta):
         """Handle ARP packets destined for the router"""
         ofmsgs = []
@@ -1303,6 +1325,8 @@ class ValveIPv4RouteManager(ValveRouteManager):
         elif opcode == arp.ARP_REPLY:
             if pkt_meta.eth_dst == pkt_meta.vlan.faucet_mac:
                 ofmsgs.extend(self._gw_advert(pkt_meta, pkt_meta.l3_src, now))
+                if not ofmsgs:
+                    ofmsgs.extend(self._add_host_fib_route_from_reply(now, pkt_meta))
         self.notify_learn(pkt_meta)
         return ofmsgs
 
