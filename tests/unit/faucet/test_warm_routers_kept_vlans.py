@@ -25,7 +25,10 @@ from os_ken.ofproto import ofproto_v1_3 as ofp
 from faucet import valve_of
 from faucet.valve import Valve
 
-from tests.unit.faucet.test_valve_config import ValveWarmRoutersTestBase
+from tests.unit.faucet.test_valve_config import (
+    ValveWarmRoutersNetworkTestBase,
+    ValveWarmRoutersTestBase,
+)
 
 
 class ValveWarmRoutersKeptVLANsTestBase(ValveWarmRoutersTestBase):
@@ -108,6 +111,28 @@ class ValveWarmRoutersFailoverKeptVLANsTestCase(ValveWarmRoutersKeptVLANsTestBas
                     self.learn(port)
                 self.assert_no_vlan_deleted(self.config(uplinks, pairings))
                 self.assert_routing(uplinks, pairings)
+
+
+class ValveWarmRoutersNetworkKeptVLANsTestCase(
+    ValveWarmRoutersNetworkTestBase, ValveWarmRoutersKeptVLANsTestBase
+):
+    """Test adding or removing a client VLAN deletes no other VLAN."""
+
+    def test_add_network_deletes_no_vlan(self):
+        """Test adding a client VLAN with its routers deletes no VLAN.
+
+        The uplink and the servers it routes with keep their hosts and next
+        hops, so the clients already on them stay routed.
+        """
+        self.assert_no_vlan_deleted(self.config(self.WITH_CLIENTS4))
+        self.learn(7)
+        self.assert_routing(self.WITH_CLIENTS4)
+
+    def test_remove_network_deletes_no_other_vlan(self):
+        """Test removing a client VLAN with its routers deletes only that VLAN."""
+        self.restart(self.config(self.WITH_CLIENTS4))
+        self.assert_no_vlan_deleted(self.config(), deleted_vids=(0x600,))
+        self.assert_routing()
 
 
 if __name__ == "__main__":
