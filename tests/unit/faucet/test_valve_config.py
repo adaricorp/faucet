@@ -30,6 +30,7 @@ import random
 import unittest
 from unittest import mock
 import time
+from types import SimpleNamespace
 
 from ipaddress import ip_address
 
@@ -48,6 +49,7 @@ from clib.valve_test_lib import (
 from faucet import config_parser_util, valve_of, valve_packet
 from faucet.conf import InvalidConfigError
 from faucet.config_parser import dp_parser
+from faucet.dp import DP
 from faucet.valve import Valve
 from faucet.valve_route import (
     ValveIPv4RouteManager,
@@ -3434,6 +3436,864 @@ class ValveWarmChangeRoutedVLANResolvingTestCase(ValveWarmRoutedVLANTestBase):
             },
         )
         self.assertTrue(self.routed(4, self.SERVER2_IP, 2, self.SERVER2_MAC))
+
+
+class ValveWarmRoutersTestBase(ValveTestBases.ValveTestNetwork):
+    """Warm start a change to the routers, without relearning any hosts.
+
+    Two uplinks, a server VLAN and three client VLANs, each client routed
+    with the servers and with one uplink by a router per pair, as a site
+    picks an uplink per client VLAN: failing a client over to the other
+    uplink changes one router's VLANs. Uses Open vSwitch, so that adding a
+    VLAN does not change the pipeline.
+    """
+
+    REQUIRE_TFM = False
+
+    CONFIG = """
+vlans:
+    uplink1:
+        vid: 0x100
+        faucet_vips: ["10.0.0.254/24", "fc00::254/64"]
+        routes:
+            - route:
+                ip_dst: 0.0.0.0/0
+                ip_gw: 10.0.0.1
+            - route:
+                ip_dst: ::/0
+                ip_gw: fc00::1
+    uplink2:
+        vid: 0x101
+        faucet_vips: ["10.1.0.254/24", "fc01::254/64"]
+        routes:
+            - route:
+                ip_dst: 0.0.0.0/0
+                ip_gw: 10.1.0.1
+            - route:
+                ip_dst: ::/0
+                ip_gw: fc01::1
+    servers:
+        vid: 0x200
+        faucet_vips: ["10.2.0.254/24", "fc02::254/64"]
+    clients1:
+        vid: 0x300
+        faucet_vips: ["10.11.0.254/24", "fc11::254/64"]
+    clients2:
+        vid: 0x400
+        faucet_vips: ["10.12.0.254/24", "fc12::254/64"]
+    clients3:
+        vid: 0x500
+        faucet_vips: ["10.13.0.254/24", "fc13::254/64"]
+%(routers)s
+dps:
+    s1:
+        dp_id: 1
+        hardware: "Open vSwitch"
+        ignore_learn_ins: 0
+        global_vlan: %(global_vlan)u
+        interfaces:
+            1:
+                native_vlan: uplink1
+            2:
+                native_vlan: servers
+            3:
+                native_vlan: clients1
+            4:
+                native_vlan: clients2
+            5:
+                native_vlan: uplink2
+            6:
+                native_vlan: clients3
+"""
+
+    # Client VLAN -> uplink VLAN; None for no uplink.
+    UPLINKS = {"clients1": "uplink1", "clients2": "uplink1", "clients3": "uplink2"}
+    PAIRINGS = ()
+    GLOBAL_VLAN = 0
+
+    # MAC, IPv4 and IPv6 address of the host learned on each port. The
+    # uplinks' hosts are their gateways.
+    HOSTS = {
+        1: ("00:00:00:01:00:01", "10.0.0.1", "fc00::1"),
+        2: ("00:00:00:02:00:01", "10.2.0.1", "fc02::1"),
+        3: ("00:00:00:03:00:01", "10.11.0.1", "fc11::1"),
+        4: ("00:00:00:04:00:01", "10.12.0.1", "fc12::1"),
+        5: ("00:00:00:05:00:01", "10.1.0.1", "fc01::1"),
+        6: ("00:00:00:06:00:01", "10.13.0.1", "fc13::1"),
+    }
+    LEARN_PORTS = (1, 2, 3, 4, 5, 6)
+    PORT = {
+        "uplink1": 1,
+        "servers": 2,
+        "clients1": 3,
+        "clients2": 4,
+        "uplink2": 5,
+        "clients3": 6,
+    }
+    INTERNET = ("192.0.2.1", "2001:db8::1")
+
+    def config(self, uplinks=None, pairings=None, extra_routers=""):
+        """Return the config with each client VLAN on the given uplink."""
+        if uplinks is None:
+            uplinks = self.UPLINKS
+        if pairings is None:
+            pairings = self.PAIRINGS
+        routers = []
+        for client, uplink in uplinks.items():
+            routers.append(
+                "    %s-servers:\n        vlans: [servers, %s]" % (client, client)
+            )
+            if uplink:
+                routers.append(
+                    "    %s-uplink:\n        vlans: [%s, %s]" % (client, uplink, client)
+                )
+        for vlan_a, vlan_b in pairings:
+            routers.append(
+                "    %s-%s:\n        vlans: [%s, %s]" % (vlan_a, vlan_b, vlan_a, vlan_b)
+            )
+        routers_conf = "routers:\n" + "\n".join(routers) + extra_routers
+        return self.CONFIG % {"routers": routers_conf, "global_vlan": self.GLOBAL_VLAN}
+
+    def learn(self, port):
+        """Learn the host on a port."""
+        dp = self.valves_manager.valves[self.DP_ID].dp
+        mac, ipv4, ipv6 = self.HOSTS[port]
+        vlan = dp.ports[port].native_vlan
+        self.l3_learn_host(
+            port,
+            vlan.vid,
+            mac,
+            [ip_address(ipv4), ip_address(ipv6)],
+            [vip.ip for vip in vlan.faucet_vips],
+        )
+
+    def setUp(self):
+        """Setup the routed VLANs and learn a host on each."""
+        self.setup_valves(self.config())
+        for port in self.LEARN_PORTS:
+            self.learn(port)
+
+    def route_managers(self):
+        """Return the valve's route managers."""
+        # pylint: disable=protected-access
+        return self.valves_manager.valves[self.DP_ID]._route_manager_by_ipv.values()
+
+    def routed(self, in_port, ip_dst, out_port, eth_dst=None):
+        """Return True if the host on in_port is routed to ip_dst via out_port."""
+        eth_src, ipv4, ipv6 = self.HOSTS[in_port]
+        ipv = ip_address(ip_dst).version
+        match = {
+            "in_port": in_port,
+            "vlan_vid": 0,
+            "eth_type": 0x800 if ipv == 4 else 0x86DD,
+            "eth_src": eth_src,
+            "eth_dst": FAUCET_MAC,
+            "ipv%u_src" % ipv: ipv4 if ipv == 4 else ipv6,
+            "ipv%u_dst" % ipv: ip_dst,
+        }
+        if eth_dst is None:
+            eth_dst = self.HOSTS[out_port][0]
+        outputs = self.network.tables[self.DP_ID].get_port_outputs(match)
+        return any(pkt["eth_dst"] == eth_dst for pkt in outputs.get(out_port, []))
+
+    def reachable_from(self, in_port):
+        """Return {(ip_dst, out_port)} the host on in_port is routed to."""
+        found = set()
+        for out_port, (_, ipv4, ipv6) in self.HOSTS.items():
+            if out_port == in_port:
+                continue
+            for ip_dst in (ipv4, ipv6):
+                if self.routed(in_port, ip_dst, out_port):
+                    found.add((ip_dst, out_port))
+        for ip_dst in self.INTERNET:
+            for uplink in ("uplink1", "uplink2"):
+                if self.routed(in_port, ip_dst, self.PORT[uplink]):
+                    found.add((ip_dst, self.PORT[uplink]))
+        return found
+
+    @staticmethod
+    def routed_with(vlan, uplinks, pairings):
+        """Return the names of the VLANs vlan routes with, itself included."""
+        routed = {vlan}
+        routers = [["servers", client] for client in uplinks]
+        routers += [[uplink, client] for client, uplink in uplinks.items() if uplink]
+        routers += [list(pairing) for pairing in pairings]
+        for members in routers:
+            if vlan in members:
+                routed.update(members)
+        return routed
+
+    def expected_from(self, in_port, uplinks, pairings):
+        """Return what reachable_from() must be for these routers."""
+        vlan = {port: name for name, port in self.PORT.items()}[in_port]
+        expected = set()
+        for other in self.routed_with(vlan, uplinks, pairings):
+            port = self.PORT[other]
+            if other != vlan:
+                expected.update((ip_dst, port) for ip_dst in self.HOSTS[port][1:])
+            if other.startswith("uplink"):
+                # An uplink's own hosts are routed via its default route too.
+                expected.update((ip_dst, port) for ip_dst in self.INTERNET)
+        return expected
+
+    def fib_entry(self, vid, ip_dst):
+        """Return the FIB flow a packet on vid to ip_dst matches, if any."""
+        dp = self.valves_manager.valves[self.DP_ID].dp
+        ipv = ip_address(ip_dst).version
+        table = self.network.tables[self.DP_ID]
+        table.sort_tables()
+        return table.single_table_lookup(
+            {
+                "vlan_vid": vid | ofp.OFPVID_PRESENT,
+                "eth_type": 0x800 if ipv == 4 else 0x86DD,
+                "ipv%u_dst" % ipv: str(ip_dst),
+            },
+            dp.tables["ipv%u_fib" % ipv].table_id,
+        )
+
+    def assert_routing(self, uplinks=None, pairings=None):
+        """Assert every host reaches exactly what the routers allow, no more.
+
+        Also, that each VLAN has a connected route to an unlearned address in
+        another VLAN's subnet exactly when it routes with a VLAN on that
+        subnet, so that one it no longer routes with follows the default
+        route, if any, rather than being resolved.
+        """
+        if uplinks is None:
+            uplinks = self.UPLINKS
+        if pairings is None:
+            pairings = self.PAIRINGS
+        for port in self.HOSTS:
+            self.assertEqual(
+                self.expected_from(port, uplinks, pairings),
+                self.reachable_from(port),
+                msg="routing from port %u" % port,
+            )
+        dp = self.valves_manager.valves[self.DP_ID].dp
+        vlans = {name: dp.ports[port].native_vlan for name, port in self.PORT.items()}
+        route_priority = {
+            route_manager.IPV: route_manager.route_priority
+            for route_manager in self.route_managers()
+        }
+        for name, vlan in vlans.items():
+            connected = [
+                vip.network
+                for routed in self.routed_with(name, uplinks, pairings)
+                for vip in vlans[routed].faucet_vips
+            ]
+            for other in vlans.values():
+                if other == vlan:
+                    continue
+                for vip in other.faucet_vips:
+                    ip_dst = vip.network.network_address + 200
+                    entry = self.fib_entry(vlan.vid, ip_dst)
+                    self.assertEqual(
+                        any(ip_dst in network for network in connected),
+                        entry is not None
+                        and entry.priority
+                        == route_priority[ip_dst.version] + vip.network.prefixlen,
+                        msg="%s to %s" % (name, ip_dst),
+                    )
+
+    def update_routers(self, uplinks, pairings=None, reload_type="warm"):
+        """Reload with new routers, and return the IPv4 FIB flowmods sent."""
+        all_ofmsgs = self.update_config(
+            self.config(uplinks, pairings), reload_type=reload_type
+        )
+        fib = self.valves_manager.valves[self.DP_ID].dp.tables["ipv4_fib"].table_id
+        return [
+            ofmsg
+            for ofmsg in all_ofmsgs.get(self.DP_ID) or []
+            if valve_of.is_flowmod(ofmsg) and ofmsg.table_id == fib
+        ]
+
+
+class ValveWarmRoutersFailoverTestCase(ValveWarmRoutersTestBase):
+    """Test moving client VLANs to the other uplink is a warm start."""
+
+    MOVED = dict(ValveWarmRoutersTestBase.UPLINKS, clients1="uplink2")
+
+    def default_route_commands(self, ofmsgs, vid):
+        """Return the commands of the flowmods for the default routes on vid."""
+        dp = self.valves_manager.valves[self.DP_ID].dp
+        fibs = {dp.tables[fib].table_id for fib in ("ipv4_fib", "ipv6_fib")}
+        defaults = {("0.0.0.0", "0.0.0.0"), ("::", "::")}
+        commands = []
+        for ofmsg in ofmsgs:
+            if not valve_of.is_flowmod(ofmsg) or ofmsg.table_id not in fibs:
+                continue
+            match = dict(ofmsg.match.items())
+            if match.get("vlan_vid") != vid | ofp.OFPVID_PRESENT:
+                continue
+            if match.get("ipv4_dst", match.get("ipv6_dst")) in defaults:
+                commands.append(ofmsg.command)
+        return commands
+
+    def test_failover(self):
+        """Test a client VLAN moved to another uplink routes only via it."""
+        self.assert_routing()
+        fib_ofmsgs = self.update_routers(self.MOVED)
+        self.assert_routing(self.MOVED)
+        # clients1 swaps its default route, the uplinks' VIP and host routes
+        # (each once), and each uplink gains or loses clients1's: nothing more.
+        self.assertEqual(9, len(fib_ofmsgs))
+        self.update_routers(self.UPLINKS)
+        self.assert_routing()
+
+    def test_failover_all(self):
+        """Test every client VLAN moving uplink at once."""
+        moved = {client: "uplink2" for client in self.UPLINKS}
+        self.update_routers(moved)
+        self.assert_routing(moved)
+        self.update_routers(self.UPLINKS)
+        self.assert_routing()
+
+    def test_failover_unresolved_gateway(self):
+        """Test moving to an uplink whose gateway is unresolved leaves no route."""
+        dp = self.valves_manager.valves[self.DP_ID].dp
+        for route_manager in self.route_managers():
+            self.apply_ofmsgs(route_manager.expire_vlan_nexthops(dp.vlans[0x101]))
+        self.update_routers(self.MOVED)
+        for ip_dst in self.INTERNET:
+            for uplink in ("uplink1", "uplink2"):
+                self.assertFalse(self.routed(3, ip_dst, self.PORT[uplink]))
+        # Once the gateway resolves, as on a cold start.
+        self.learn(5)
+        self.assert_routing(self.MOVED)
+
+    def test_failover_resolving_gateway(self):
+        """Test a moved VLAN keeps no route via the old gateway while it resolves.
+
+        A next hop being resolved again keeps its flows, so they are withdrawn
+        by route, whatever the next hop cache says.
+        """
+        dp = self.valves_manager.valves[self.DP_ID].dp
+        now = self.mock_time()
+        for route_manager in self.route_managers():
+            # pylint: disable=protected-access
+            self.apply_ofmsgs(route_manager.expire_vlan_nexthops(dp.vlans[0x101]))
+            for ip_gw in list(route_manager._vlan_nexthop_cache(dp.vlans[0x100])):
+                route_manager._update_nexthop_cache(
+                    now, dp.vlans[0x100], None, None, ip_gw
+                )
+        self.update_routers(self.MOVED)
+        for ip_dst in self.INTERNET + self.HOSTS[1][1:]:
+            for uplink in ("uplink1", "uplink2"):
+                self.assertFalse(
+                    self.routed(3, ip_dst, self.PORT[uplink]),
+                    msg="port 3 to %s via %s" % (ip_dst, uplink),
+                )
+        for ip_dst in self.HOSTS[3][1:]:
+            self.assertFalse(self.routed(1, ip_dst, 3), msg="port 1 to %s" % ip_dst)
+        self.learn(1)
+        self.learn(5)
+        self.assert_routing(self.MOVED)
+
+    def uplink1_fib_priority(self, ip_dst):
+        """Return the priority of the IPv4 FIB flow ip_dst matches on uplink1."""
+        return self.fib_entry(0x100, ip_dst).priority
+
+    def resolve_from_uplink1(self, ip_dst):
+        """Route a packet from uplink1's host to an unresolved host, to resolve it."""
+        mac, ipv4, _ = self.HOSTS[1]
+        self.rcv_packet(
+            1,
+            0x100,
+            {
+                "eth_src": mac,
+                "eth_dst": FAUCET_MAC,
+                "ipv4_src": ipv4,
+                "ipv4_dst": ip_dst,
+                "echo_request_data": self.ICMP_PAYLOAD,
+            },
+        )
+        # Dropped while it resolves, rather than sent via the default route.
+        self.assertGreater(
+            self.uplink1_fib_priority(ip_dst),
+            self.uplink1_fib_priority(self.INTERNET[0]),
+        )
+
+    def test_failover_resolving_host(self):
+        """Test a moved VLAN's host still being resolved is not dropped on the old uplink.
+
+        Its flows are installed while it resolves, and are withdrawn by route,
+        whatever the next hop cache says.
+        """
+        self.resolve_from_uplink1("10.11.0.99")
+        self.update_routers(self.MOVED)
+        self.assertEqual(
+            self.uplink1_fib_priority(self.INTERNET[0]),
+            self.uplink1_fib_priority("10.11.0.99"),
+        )
+        self.assert_routing(self.MOVED)
+
+    def test_failover_keeps_other_resolving_host(self):
+        """Test a VLAN the old uplink still routes with keeps its host being resolved.
+
+        Only what the moved VLAN put on the old uplink is withdrawn.
+        """
+        self.resolve_from_uplink1("10.11.0.99")
+        resolving = self.uplink1_fib_priority("10.11.0.99")
+        moved = dict(self.UPLINKS, clients2="uplink2")
+        self.update_routers(moved)
+        self.assertEqual(resolving, self.uplink1_fib_priority("10.11.0.99"))
+        self.assert_routing(moved)
+
+    def test_failover_changed_vlan(self):
+        """Test a moved VLAN that also changes leaves no host routes on the old uplink.
+
+        Neither its learned host nor one being resolved is left routed on the
+        old uplink, whichever path deletes them.
+        """
+        self.resolve_from_uplink1("10.11.0.99")
+        config = self.config(self.MOVED).replace(
+            "        vid: 0x300\n", "        vid: 0x300\n        max_hosts: 255\n"
+        )
+        self.update_config(config, reload_type="warm")
+        # Only the default route is left for them on uplink1.
+        for ip_dst in (self.HOSTS[3][1], "10.11.0.99"):
+            self.assertEqual(
+                self.uplink1_fib_priority(self.INTERNET[0]),
+                self.uplink1_fib_priority(ip_dst),
+                msg=ip_dst,
+            )
+        for ip_dst in self.HOSTS[3][1:]:
+            self.assertFalse(self.routed(1, ip_dst, 3), msg="port 1 to %s" % ip_dst)
+        # The changed VLAN's host is learned again, as on a cold start.
+        self.learn(3)
+        self.assert_routing(self.MOVED)
+
+    def test_failover_replaces_default_route(self):
+        """Test a moved VLAN's default routes are replaced, never deleted.
+
+        Deletes are sent before adds, so deleting a default route would leave
+        the VLAN without one until its replacement is added.
+        """
+        with mock.patch.object(
+            valve_of, "valve_flowreorder", wraps=valve_of.valve_flowreorder
+        ) as flowreorder:
+            sent = self.update_config(self.config(self.MOVED), reload_type="warm")
+        # What the reload asked for, and what reached the switch.
+        for ofmsgs in (flowreorder.call_args_list[0].args[0], sent[self.DP_ID]):
+            self.assertEqual(
+                [ofp.OFPFC_ADD, ofp.OFPFC_ADD],
+                self.default_route_commands(ofmsgs, 0x300),
+            )
+        for ip_dst in self.INTERNET:
+            self.assertTrue(self.routed(3, ip_dst, 5), msg=ip_dst)
+
+    def test_no_uplink(self):
+        """Test a client VLAN losing, then regaining, its uplink."""
+        none = dict(self.UPLINKS, clients1=None)
+        self.update_routers(none)
+        self.assert_routing(none)
+        self.update_routers(self.UPLINKS)
+        self.assert_routing()
+
+    def route_via_both_uplinks(self):
+        """Route clients1 with uplink2 too, as well as with uplink1."""
+        self.update_config(
+            self.config(
+                extra_routers="\n    clients1-uplink2:\n        vlans: [uplink2, clients1]"
+            ),
+            reload_type="warm",
+        )
+        for ip_dst in self.INTERNET:
+            self.assertTrue(
+                self.routed(3, ip_dst, 1) or self.routed(3, ip_dst, 5), msg=ip_dst
+            )
+
+    def test_both_uplinks_drop_second(self):
+        """Test a VLAN routed with both uplinks keeps a default route when one goes.
+
+        The default route it had from both is withdrawn with the one it drops,
+        and added again from the one it keeps.
+        """
+        self.route_via_both_uplinks()
+        self.update_routers(self.UPLINKS)
+        self.assert_routing()
+
+    def test_both_uplinks_drop_first(self):
+        """Test a VLAN routed with both uplinks that drops the first keeps the second."""
+        self.route_via_both_uplinks()
+        self.update_routers(self.MOVED)
+        self.assert_routing(self.MOVED)
+
+    def test_second_uplink_keeps_default_route(self):
+        """Test a VLAN that gains a second uplink keeps its default route via the first.
+
+        Either uplink's default route is one a cold start could end with, so
+        the one in use stays, though the gained uplink has the lower VID.
+        """
+        self.update_config(
+            self.config(
+                extra_routers="\n    clients3-uplink1:\n        vlans: [uplink1, clients3]"
+            ),
+            reload_type="warm",
+        )
+        for ip_dst in self.INTERNET:
+            self.assertTrue(self.routed(6, ip_dst, 5), msg=ip_dst)
+            self.assertFalse(self.routed(6, ip_dst, 1), msg=ip_dst)
+
+
+class ValveWarmRoutersUnresolvedTestCase(ValveWarmRoutersTestBase):
+    """Test failing over to an uplink whose gateway was never resolved."""
+
+    LEARN_PORTS = (1, 2, 3, 4, 6)
+
+    def test_failover_unresolved(self):
+        """Test clients1 has no default route until uplink2's gateway resolves."""
+        moved = dict(self.UPLINKS, clients1="uplink2")
+        self.update_routers(moved)
+        # Not via the old uplink's gateway, and not via anything else.
+        for ip_dst in self.INTERNET:
+            for uplink in ("uplink1", "uplink2"):
+                self.assertFalse(
+                    self.routed(3, ip_dst, self.PORT[uplink]),
+                    msg="port 3 to %s via %s" % (ip_dst, uplink),
+                )
+        self.learn(5)
+        self.assert_routing(moved)
+
+
+class ValveWarmRoutersPairingTestCase(ValveWarmRoutersTestBase):
+    """Test adding and removing a router between two client VLANs."""
+
+    def test_pairing(self):
+        """Test a pairing router routes the pair both ways, and removal stops it."""
+        pairings = (("clients1", "clients2"),)
+        self.update_routers(self.UPLINKS, pairings)
+        self.assert_routing(self.UPLINKS, pairings)
+        self.update_routers(self.UPLINKS, ())
+        self.assert_routing(self.UPLINKS, ())
+
+    def test_uplink_pairing(self):
+        """Test a router between the uplinks leaves each its own default route.
+
+        Adding it gives each the other's default route, which does not replace
+        its own; removing it withdraws the other's, which each still has from
+        its own route table.
+        """
+        self.update_routers(self.UPLINKS, (("uplink1", "uplink2"),))
+        for port, other in ((1, 5), (5, 1)):
+            for ip_dst in self.INTERNET:
+                self.assertTrue(self.routed(port, ip_dst, port), msg=ip_dst)
+                self.assertFalse(self.routed(port, ip_dst, other), msg=ip_dst)
+        self.update_routers(self.UPLINKS, ())
+        self.assert_routing()
+
+
+class ValveWarmRoutersSharedSubnetTestCase(ValveWarmRoutersTestBase):
+    """Test a routers change with two client VLANs sharing a subnet.
+
+    clients1 and clients3 share no router, so may have the same subnets, and
+    the servers route with both.
+    """
+
+    CONFIG = ValveWarmRoutersTestBase.CONFIG.replace(
+        '"10.13.0.254/24", "fc13::254/64"', '"10.11.0.253/24", "fc11::253/64"'
+    )
+    HOSTS = {
+        **ValveWarmRoutersTestBase.HOSTS,
+        6: ("00:00:00:06:00:01", "10.11.0.3", "fc11::3"),
+    }
+
+    def test_remove_router_to_shared_subnet(self):
+        """Test the servers keep the shared subnets routed via the other VLAN."""
+        config = self.config().replace(
+            "    clients1-servers:\n        vlans: [servers, clients1]\n", ""
+        )
+        self.update_config(config, reload_type="warm")
+        for unlearned, connected in (
+            ("10.11.0.99", "10.2.0.99"),
+            ("fc11::99", "fc02::99"),
+        ):
+            shared, own = (
+                self.fib_entry(0x200, ip_dst) for ip_dst in (unlearned, connected)
+            )
+            # The shared subnet is still connected, as the servers' own is.
+            self.assertIsNotNone(shared, msg=unlearned)
+            self.assertEqual(own.priority, shared.priority, msg=unlearned)
+        for ip_dst in self.HOSTS[6][1:]:
+            self.assertTrue(self.routed(2, ip_dst, 6), msg=ip_dst)
+        for ip_dst in self.HOSTS[3][1:]:
+            self.assertFalse(self.routed(2, ip_dst, 3), msg=ip_dst)
+        for ip_dst in self.HOSTS[2][1:]:
+            self.assertFalse(self.routed(3, ip_dst, 2), msg=ip_dst)
+
+
+class ValveWarmRoutersRouteTestBase(ValveWarmRoutersTestBase):
+    """Warm start a VLAN with a route and a connected subnet to one prefix.
+
+    A cold start installs the connected subnets of the VLANs a VLAN routes
+    with, then overwrites them with the routes to the same prefixes as their
+    next hops resolve, so a warm start must end on the route too, wherever
+    it comes from.
+    """
+
+    # VLAN -> next hop of its route to clients2's subnet.
+    ROUTES = {}
+
+    def config(self, uplinks=None, pairings=None, extra_routers=""):
+        """Return the config, with the routes to clients2's subnet."""
+        config = super().config(uplinks, pairings, extra_routers)
+        for vlan, ip_gw in self.ROUTES.items():
+            config = config.replace(
+                "    %s:\n" % vlan,
+                "    %s:\n        routes:\n            - route:\n"
+                "                ip_dst: 10.12.0.0/24\n"
+                "                ip_gw: %s\n" % (vlan, ip_gw),
+                1,
+            )
+        return config
+
+    def fibs(self):
+        """Return the flows in the FIB tables."""
+        dp = self.valves_manager.valves[self.DP_ID].dp
+        table = self.network.tables[self.DP_ID]
+        return {
+            fib: sorted(str(flow) for flow in table.tables[dp.tables[fib].table_id])
+            for fib in ("ipv4_fib", "ipv6_fib")
+        }
+
+    def assert_cold_start_route(self, uplinks, pairings, vid, gw_port):
+        """Assert a warm start routes clients2's subnet on vid as a cold start does.
+
+        That is, via the host on gw_port, with the same FIBs as a cold start
+        of the same routers once the same hosts are learned.
+        """
+        config = self.config(uplinks, pairings)
+        self.update_config(config, reload_type="warm")
+        self.assertIn(
+            "set_eth_dst %s" % self.HOSTS[gw_port][0],
+            str(self.fib_entry(vid, "10.12.0.99")),
+        )
+        warm = self.fibs()
+        self.teardown_valves()
+        self.network = None
+        self.setup_valves(config)
+        for port in self.LEARN_PORTS:
+            self.learn(port)
+        self.assertEqual(self.fibs(), warm)
+
+
+class ValveWarmRoutersRouteOverConnectedTestCase(ValveWarmRoutersRouteTestBase):
+    """Test a connected subnet gained does not replace a route to it.
+
+    clients3 routes clients2's subnet via its own host, and clients2, which
+    has the lower VID, starts in no router.
+    """
+
+    UPLINKS = {"clients1": "uplink1", "clients3": "uplink2"}
+    ROUTES = {"clients3": "10.13.0.1"}
+
+    def test_own_route(self):
+        """Test clients3 keeps its own route when it gains clients2."""
+        self.assert_cold_start_route(
+            self.UPLINKS, (("clients2", "clients3"),), 0x500, 6
+        )
+
+    def test_kept_route(self):
+        """Test uplink2 keeps clients3's route when it gains clients2."""
+        self.assert_cold_start_route(self.UPLINKS, (("uplink2", "clients2"),), 0x101, 6)
+
+
+class ValveWarmRoutersRouteReaddTestCase(ValveWarmRoutersRouteTestBase):
+    """Test a withdrawn route is added again from a route, not a connected subnet.
+
+    clients1 routes with the servers, and with clients2 and clients3 by a
+    router each, and the servers and clients3 both route clients2's subnet.
+    """
+
+    UPLINKS = {"clients1": None, "clients3": "uplink2"}
+    PAIRINGS = (("clients1", "clients2"), ("clients1", "clients3"))
+    ROUTES = {"servers": "10.2.0.1", "clients3": "10.13.0.1"}
+
+    def test_lost_route(self):
+        """Test clients1 losing the servers' route gets clients3's."""
+        self.assert_cold_start_route({"clients3": "uplink2"}, self.PAIRINGS, 0x300, 6)
+
+
+class ValveWarmRoutersRenameTestCase(ValveWarmRoutersTestBase):
+    """Test a routers change that changes no pair of VLANs changes nothing."""
+
+    def assert_no_reload(self, config):
+        """Assert loading the config restarts nothing and sends no flows."""
+        reloads = [
+            "faucet_config_reload_%s_total" % reload_type
+            for reload_type in ("cold", "warm")
+        ]
+        before = [self.get_prom(reload_var) for reload_var in reloads]
+        ofmsgs = self.update_config(config, reload_type=None, reload_expected=False)
+        self.assertEqual(before, [self.get_prom(reload_var) for reload_var in reloads])
+        self.assertFalse(ofmsgs[self.DP_ID])
+        self.assert_routing()
+
+    def test_rename(self):
+        """Test renaming a router."""
+        self.assert_no_reload(
+            self.config().replace("clients1-uplink:", "clients1-internet:")
+        )
+
+    def test_reorder(self):
+        """Test reordering the routers, and the VLANs of a router."""
+        uplinks = dict(reversed(list(self.UPLINKS.items())))
+        self.assert_no_reload(
+            self.config(uplinks).replace(
+                "vlans: [uplink1, clients1]", "vlans: [clients1, uplink1]"
+            )
+        )
+
+
+class ValveRoutersColdTestCase(ValveWarmRoutersTestBase):
+    """Test the routers changes that still cold start."""
+
+    LEARN_PORTS = ()
+
+    def test_first_and_last_router(self):
+        """Test removing every router, or adding the first, is a cold start."""
+        config = self.config()
+        no_routers = config.split("routers:")[0] + "dps:" + config.split("dps:")[1]
+        self.update_config(no_routers, reload_type="cold")
+        self.update_config(config, reload_type="cold")
+
+    def test_bgp(self):
+        """Test any routers change while there is a BGP router is a cold start.
+
+        Adding a BGP router, adding another router while there is one, and
+        deleting it.
+        """
+        bgp = """
+    bgp:
+        bgp:
+            as: 1
+            connect_mode: passive
+            neighbor_as: 2
+            routerid: "1.1.1.1"
+            port: 9179
+            server_addresses: ["127.0.0.1"]
+            neighbor_addresses: ["127.0.0.1"]
+            vlan: servers"""
+        pairings = (("clients1", "clients2"),)
+        self.update_config(self.config(extra_routers=bgp), reload_type="cold")
+        self.update_config(
+            self.config(pairings=pairings, extra_routers=bgp), reload_type="cold"
+        )
+        self.update_config(self.config(pairings=pairings), reload_type="cold")
+
+    def test_vlan_added_and_deleted(self):
+        """Test a routers change that adds or deletes a VLAN is a cold start."""
+        new_vlan = """
+    clients4:
+        vid: 0x600
+        faucet_vips: ["10.14.0.254/24", "fc14::254/64"]
+"""
+        config = self.config(dict(self.UPLINKS, clients4="uplink1"))
+        config = config.replace("\nrouters:", new_vlan + "routers:")
+        self.update_config(config, reload_type="cold")
+        self.update_config(self.config(), reload_type="cold")
+
+
+class ValveRoutersGlobalVLANTestCase(ValveWarmRoutersTestBase):
+    """Test a routers change with a global VLAN is a cold start."""
+
+    GLOBAL_VLAN = 4000
+    LEARN_PORTS = ()
+
+    def test_global_vlan(self):
+        """Test moving a client VLAN to the other uplink is a cold start."""
+        self.update_routers(dict(self.UPLINKS, clients1="uplink2"), reload_type="cold")
+
+
+class ValveRoutersChangeTestCase(unittest.TestCase):
+    """Test which VLANs a routers change affects, and which changes cold start."""
+
+    class Router:
+        """A router of VLANs by VID."""
+
+        def __init__(self, *vids, bgp=False):
+            self.vlans = [SimpleNamespace(vid=vid) for vid in vids]
+            self.bgp = bgp
+
+        def bgp_as(self):
+            """Return the BGP AS, if any."""
+            return 1 if self.bgp else None
+
+        def bgp_vlan(self):
+            """Return the BGP VLAN, if any."""
+            return self.vlans[0] if self.bgp else None
+
+    def changed(self, old, new):
+        """Return the VIDs whose routed peers change from old to new routers."""
+        old_peers, new_peers = (
+            ValveRouteManager.routed_peers(
+                {name: self.Router(*vids) for name, vids in routers.items()}
+            )
+            for routers in (old, new)
+        )
+        return {
+            vid
+            for vid in set(old_peers) | set(new_peers)
+            if old_peers.get(vid) != new_peers.get(vid)
+        }
+
+    def test_member_swap(self):
+        """Test a member swap affects the client and both uplinks."""
+        self.assertEqual(
+            {1, 2, 3},
+            self.changed({"c-up": (1, 3), "u": (1, 9)}, {"c-up": (2, 3), "u": (1, 9)}),
+        )
+
+    def test_same_unions(self):
+        """Test renaming, reordering and splitting routers into the same unions."""
+        self.assertEqual(set(), self.changed({"a": (1, 2)}, {"b": (2, 1)}))
+        self.assertEqual(
+            set(),
+            self.changed({"a": (1, 2, 3)}, {"a": (1, 2), "b": (2, 3), "c": (1, 3)}),
+        )
+
+    def test_single_vlan_router(self):
+        """Test a router naming one VLAN routes nothing."""
+        self.assertEqual(set(), self.changed({}, {"a": (1,)}))
+        self.assertEqual({}, ValveRouteManager.routed_peers({"a": self.Router(1)}))
+
+    def test_cold_start(self):
+        """Test only a change to which VLANs route with which is warm."""
+        uplink = self.Router(1, 9)
+        routers = {"uplink": uplink, "client": self.Router(2, 9)}
+        moved = {"uplink": uplink, "client": self.Router(2, 8)}
+        bgp = {"uplink": uplink, "client": self.Router(2, 8, bgp=True)}
+        vids = (1, 2, 8, 9)
+
+        def cold_start(
+            new_routers, global_vlan=0, stack=None, new_vids=vids, old_routers=None
+        ):
+            dps = []
+            for dp_routers, dp_global_vlan, dp_stack, dp_vids in (
+                (old_routers or routers, 0, None, vids),
+                (new_routers, global_vlan, stack, new_vids),
+            ):
+                dp = DP.__new__(DP)
+                dp.routers = dp_routers
+                dp.global_vlan = dp_global_vlan
+                dp.stack = dp_stack
+                dp.vlans = dict.fromkeys(dp_vids)
+                dps.append(dp)
+            # pylint: disable=protected-access
+            return dps[0]._router_change_needs_cold_start(mock.Mock(), dps[1])
+
+        self.assertFalse(cold_start(moved))
+        self.assertTrue(cold_start({}))
+        self.assertTrue(cold_start(moved, global_vlan=4000))
+        self.assertTrue(cold_start(moved, stack=object()))
+        # A BGP router added, deleted, or there while another router is added.
+        self.assertTrue(cold_start(bgp))
+        self.assertTrue(cold_start(moved, old_routers=bgp))
+        self.assertTrue(
+            cold_start(dict(bgp, pairing=self.Router(1, 2)), old_routers=bgp)
+        )
+        self.assertTrue(cold_start(moved, new_vids=vids + (10,)))
+        self.assertTrue(cold_start(moved, new_vids=vids[1:]))
 
 
 # pylint: disable=protected-access
