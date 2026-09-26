@@ -217,6 +217,36 @@ dps:
         self._reload(edit)
         self._verify_after()
 
+    def test_router_added_with_new_vlan(self):
+        """A router added that pairs v100 with a new VLAN."""
+
+        def edit(config):
+            config["vlans"]["v300"] = {"vid": 0x300, "faucet_vips": ["10.0.3.254/24"]}
+            config["routers"]["r2"] = {"vlans": ["v100", "v300"]}
+            config["dps"]["s1"]["interfaces"]["p5"] = {
+                "number": 5,
+                "native_vlan": "v300",
+            }
+
+        self._reload(edit)
+        self._verify_after()
+
+    def test_vlan_moved_between_routers(self):
+        """v100 and v200 stop sharing a router, each paired with a new VLAN."""
+
+        def edit(config):
+            config["vlans"]["v300"] = {"vid": 0x300, "faucet_vips": ["10.0.3.254/24"]}
+            config["routers"]["r1"] = {"vlans": ["v100", "v300"]}
+            config["routers"]["r2"] = {"vlans": ["v200", "v300"]}
+            config["dps"]["s1"]["interfaces"]["p5"] = {
+                "number": 5,
+                "native_vlan": "v300",
+            }
+
+        self._reload(edit)
+        self.extra_hosts = ((5, 0x300, "10.0.3.5"),)
+        self._verify_after(changed_vids=())
+
 
 class ValveWarmDot1xTestBase(ValveTestBases.ValveTestNetwork):
     """Port 3 is moved by 802.1X to DOT1X_VLAN, and has a host learned there.

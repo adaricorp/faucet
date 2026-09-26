@@ -1690,7 +1690,9 @@ class Valve:
             % (len(gained), len(lost), ", ".join(vids))
         )
         withdrawals = {
-            ipv: route_manager.withdraw_lost_peers(self.dp.vlans, new_peers)
+            ipv: route_manager.withdraw_lost_peers(
+                self.dp.vlans, new_peers, new_dp.vlans.keys()
+            )
             for ipv, route_manager in self._route_manager_by_ipv.items()
         }
         return (old_peers, withdrawals)
