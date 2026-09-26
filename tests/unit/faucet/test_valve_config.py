@@ -4102,5 +4102,128 @@ dps:
         self.assertFalse(self._routed(0x300, "10.99.0.1", self.P1_V100_MAC))
 
 
+class ValveChangeVLANHairpinTestCase(ValveTestBases.ValveTestNetwork):
+    """Test hosts learned on a hairpin port when the VLANs of the port change."""
+
+    # A VLAN change can only be a warm start if the pipeline need not be resized.
+    REQUIRE_TFM = False
+
+    CONFIG = """
+vlans:
+    vlan100:
+        vid: %(vlan100_vid)u
+    vlan200:
+        vid: %(vlan200_vid)u
+dps:
+    s1:
+        dp_id: 1
+        hardware: "Open vSwitch"
+        interfaces:
+            1:
+                native_vlan: %(native_vlan)s
+                tagged_vlans: [%(tagged_vlan)s]
+                hairpin_unicast: true
+            2:
+                native_vlan: vlan100
+            3:
+                native_vlan: vlan200
+"""
+
+    # An untagged host, and a host on the tagged VLAN, both on port 1.
+    UNTAGGED_MAC = "00:00:00:01:00:01"
+    TAGGED_MAC = "00:00:00:01:00:02"
+
+    def config(
+        self,
+        vlan100_vid=0x100,
+        vlan200_vid=0x200,
+        native_vlan="vlan100",
+        tagged_vlan="vlan200",
+    ):
+        """Return the config, optionally with VIDs or port 1's VLANs changed."""
+        return self.CONFIG % {
+            "vlan100_vid": vlan100_vid,
+            "vlan200_vid": vlan200_vid,
+            "native_vlan": native_vlan,
+            "tagged_vlan": tagged_vlan,
+        }
+
+    def setUp(self):
+        """Setup a hairpin port with a host learned on each of its VLANs."""
+        self.setup_valves(self.config())
+        self._learn_host(0x100, self.UNTAGGED_MAC)
+        self._learn_host(0x200, self.TAGGED_MAC)
+
+    def _learn_host(self, vid, eth_src):
+        """Learn a host on port 1."""
+        self.rcv_packet(
+            1,
+            vid,
+            {
+                "eth_src": eth_src,
+                "eth_dst": self.UNKNOWN_MAC,
+                "ipv4_src": "10.0.0.1",
+                "ipv4_dst": "10.0.0.2",
+            },
+        )
+
+    def _vid_flows(self, vid):
+        """Return the flows matching a VID, as strings."""
+        table = self.network.tables[self.DP_ID]
+        table.sort_tables()
+        return [
+            str(flow)
+            for flow_table in table.tables
+            for flow in flow_table
+            if flow.match_values.get("vlan_vid")
+            == flow.match_to_bits("vlan_vid", vid | ofp.OFPVID_PRESENT)
+        ]
+
+    def _hairpinned(self, vid, eth_src, eth_dst):
+        """Return True if a frame tagged vid on port 1 is output back to port 1."""
+        return self.network.tables[self.DP_ID].is_output(
+            {
+                "in_port": 1,
+                "vlan_vid": vid | ofp.OFPVID_PRESENT,
+                "eth_src": eth_src,
+                "eth_dst": eth_dst,
+                "eth_type": 0x800,
+                "ipv4_src": "10.0.0.1",
+                "ipv4_dst": "10.0.0.2",
+            },
+            port=1,
+        )
+
+    def _relearn_hosts(self):
+        """Relearn the hosts, with the untagged host on VID 0x200 and the tagged
+        host on VID 0x100, and check frames on VID 0x100 are hairpinned only
+        to the tagged host."""
+        self._learn_host(0x200, self.UNTAGGED_MAC)
+        self._learn_host(0x100, self.TAGGED_MAC)
+        self.assertTrue(self._hairpinned(0x100, self.UNKNOWN_MAC, self.TAGGED_MAC))
+        self.assertFalse(self._hairpinned(0x100, self.TAGGED_MAC, self.UNTAGGED_MAC))
+
+    def test_change_vid(self):
+        """Test changing the VID of a hairpin port's VLAN leaves no old VID flows."""
+        self.assertTrue(self._vid_flows(0x200))
+        self.update_config(self.config(vlan200_vid=0x300), reload_type="warm")
+        self.assertEqual([], self._vid_flows(0x200))
+
+    def test_swap_vids(self):
+        """Test swapping the VIDs of the native and tagged VLANs of a hairpin port."""
+        self.update_config(
+            self.config(vlan100_vid=0x200, vlan200_vid=0x100), reload_type="warm"
+        )
+        self._relearn_hosts()
+
+    def test_move_native_vlan(self):
+        """Test making the tagged VLAN of a hairpin port native, and vice versa."""
+        self.update_config(
+            self.config(native_vlan="vlan200", tagged_vlan="vlan100"),
+            reload_type="warm",
+        )
+        self._relearn_hosts()
+
+
 if __name__ == "__main__":
     unittest.main()  # pytype: disable=module-attr
