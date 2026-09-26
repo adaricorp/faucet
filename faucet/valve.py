@@ -1653,6 +1653,71 @@ class Valve:
             }
         return expire_vids_by_port
 
+    def _routers_change(self, new_dp):
+        """Return how new_dp changes which VLANs route with which, if it does.
+
+        What each VLAN has from the VLANs it stops routing with is read now,
+        from the running config, before a warm start deletes any port or VLAN
+        and so expires the hosts and next hops learned on them.
+
+        Args:
+            new_dp (DP): new dataplane configuration.
+        Returns:
+            tuple: routed_peers() of the running config, and its
+                withdraw_lost_peers() by IP version; or None if the routers
+                do not change which VLANs route with which.
+        """
+        if new_dp.routers == self.dp.routers:
+            return None
+        old_peers = valve_route.ValveRouteManager.routed_peers(self.dp.routers)
+        new_peers = valve_route.ValveRouteManager.routed_peers(new_dp.routers)
+        if old_peers == new_peers:
+            return None
+        gained = {
+            vid for vid, peers in new_peers.items() if peers - old_peers.get(vid, set())
+        }
+        lost = {
+            vid for vid, peers in old_peers.items() if peers - new_peers.get(vid, set())
+        }
+        vids = [str(vid) for vid in sorted(gained | lost)]
+        if len(vids) > 5:
+            vids[5:] = ["..."]
+        self.logger.info(
+            "routed VLAN pairs changed: %u VLANs gained peers, %u lost peers (VIDs %s)"
+            % (len(gained), len(lost), ", ".join(vids))
+        )
+        withdrawals = {
+            ipv: route_manager.withdraw_lost_peers(self.dp.vlans, new_peers)
+            for ipv, route_manager in self._route_manager_by_ipv.items()
+        }
+        return (old_peers, withdrawals)
+
+    def _replay_gained_peers(self, routers_change):
+        """Return flows for what each VLAN gets from the VLANs it starts routing with.
+
+        Args:
+            routers_change (tuple): _routers_change() of the running config.
+        Returns:
+            list: OpenFlow messages.
+        """
+        ofmsgs = []
+        if routers_change is None:
+            return ofmsgs
+        old_peers, withdrawals = routers_change
+        for ipv, route_manager in self._route_manager_by_ipv.items():
+            ofmsgs.extend(
+                route_manager.replay_gained_peers(
+                    self.dp.vlans, old_peers, withdrawals.pop(ipv, {})
+                )
+            )
+        # A FIB table is added or removed only with the pipeline, which cold
+        # starts, but should an IP version stop being routed, all of its
+        # withdrawals are deleted.
+        for withdrawn in withdrawals.values():
+            for vid_withdrawn in withdrawn.values():
+                ofmsgs.extend(vid_withdrawn.values())
+        return ofmsgs
+
     def _apply_config_changes(self, new_dp, changes, valves=None):
         """Apply any detected configuration changes.
 
@@ -1711,11 +1776,19 @@ class Valve:
             self.dp_init(new_dp, valves)
             return restart_type, ofmsgs
 
+        # A routers change is applied pair by pair below, and is a change only
+        # if it changes which VLANs route with which.
+        router_changes = (added_routers, deleted_routers, changed_routers)
         restart_type = None
         for change in changes:
-            if change:
+            if change and all(change is not routers for routers in router_changes):
                 restart_type = "warm"
                 break
+
+        # A change to which VLANs route with which is applied pair by pair.
+        routers_change = self._routers_change(new_dp)
+        if routers_change is not None:
+            restart_type = "warm"
 
         # Nothing changed, nothing to check.
         if restart_type is None:
@@ -1749,36 +1822,6 @@ class Valve:
         if self.acl_manager:
             if deleted_meters:
                 ofmsgs.extend(self.acl_manager.del_meters(deleted_meters))
-
-        global_routing = False
-        for route_manager in self._route_manager_by_ipv.values():
-            if route_manager.global_routing:
-                global_routing = True
-
-        if not global_routing:
-            changed_router_vids = set()
-            for deleted_router in deleted_routers:
-                changed_router_vids.update(
-                    vlan.vid for vlan in self.dp.routers[deleted_router].vlans
-                )
-            for added_router in added_routers:
-                changed_router_vids.update(
-                    vlan.vid for vlan in new_dp.routers[added_router].vlans
-                )
-            for changed_router in changed_routers:
-                changed_router_vids.update(
-                    vlan.vid for vlan in self.dp.routers[changed_router].vlans
-                )
-                changed_router_vids.update(
-                    vlan.vid for vlan in new_dp.routers[changed_router].vlans
-                )
-            added_deleted_changed_vids = added_vids.union(deleted_vids).union(
-                changed_vids
-            )
-            for vid in changed_router_vids:
-                if vid in added_deleted_changed_vids:
-                    continue
-                changed_vids.add(vid)
 
         if changed_vids:
             changed_vlans = [self.dp.vlans[vid] for vid in changed_vids]
@@ -1823,6 +1866,7 @@ class Valve:
             vlan = self.dp.vlans[vid]
             for route_manager in self._route_manager_by_ipv.values():
                 ofmsgs.extend(route_manager.add_routed_vlan_routes(vlan))
+        ofmsgs.extend(self._replay_gained_peers(routers_change))
         if self.stack_manager:
             ofmsgs.extend(self.stack_manager.add_tunnel_acls())
         return restart_type, ofmsgs

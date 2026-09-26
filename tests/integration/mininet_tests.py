@@ -3779,11 +3779,13 @@ class FaucetRouterConfigReloadTest(FaucetConfigReloadTestBase):
                 "vlans": [100, 200],
             }
         }
+        # The first router changes the actions of every route, so it is a
+        # cold start.
         self.reload_conf(
             conf,
             self.faucet_config_path,
             restart=True,
-            cold_start=False,
+            cold_start=True,
             change_expected=True,
         )
 
