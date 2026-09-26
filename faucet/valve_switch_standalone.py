@@ -644,11 +644,16 @@ class ValveSwitchManager(ValveManagerBase):  # pylint: disable=too-many-public-m
         ofmsgs.append(
             self.eth_src_table.flowdel(self.eth_src_table.match(in_port=port.number))
         )
-        for table in (self.eth_dst_table, self.eth_dst_hairpin_table):
-            if table:
-                # per OF 1.3.5 B.6.23, the OFA will match flows
-                # that have an action targeting this port.
-                ofmsgs.append(table.flowdel(out_port=port.number))
+        # per OF 1.3.5 B.6.23, the OFA will match flows
+        # that have an action targeting this port.
+        ofmsgs.append(self.eth_dst_table.flowdel(out_port=port.number))
+        if self.eth_dst_hairpin_table:
+            # Hairpin flows output to IN_PORT, which out_port does not match.
+            ofmsgs.append(
+                self.eth_dst_hairpin_table.flowdel(
+                    self.eth_dst_hairpin_table.match(in_port=port.number)
+                )
+            )
         return ofmsgs
 
     def del_port(self, port):
