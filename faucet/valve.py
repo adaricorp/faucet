@@ -499,10 +499,13 @@ class Valve:
         }
         discovered_up_port_nos = discovered_up_port_nos.union(always_up_port_nos)
 
-        all_configured_port_nos = self._get_all_configured_port_nos()
+        # Record whether every configured port is up, even one that is not
+        # added because it has no VLAN: a warm start that gives it a VLAN
+        # adds it only if it is known to be up.
         port_status, all_up_port_nos = self._get_ports_status(
-            discovered_up_port_nos, all_configured_port_nos
+            discovered_up_port_nos, self.dp.ports.keys()
         )
+        all_up_port_nos &= self._get_all_configured_port_nos()
 
         for port_no, status in port_status.items():
             self._set_port_status(port_no, status, now)
@@ -1823,15 +1826,17 @@ class Valve:
         if self.acl_manager:
             if added_meters:
                 ofmsgs.extend(self.acl_manager.add_meters(added_meters))
+        if added_ports or changed_ports:
+            # As on a cold start, add only the ports on a VLAN, and stack,
+            # output only and coprocessor ports: not a port with no VLAN.
+            up_port_nos = self.dp.dyn_up_port_nos.intersection(
+                self._get_all_configured_port_nos()
+            )
         if added_ports:
-            all_up_port_nos = [
-                port for port in added_ports if port in self.dp.dyn_up_port_nos
-            ]
+            all_up_port_nos = [port for port in added_ports if port in up_port_nos]
             ofmsgs.extend(self.ports_add(all_up_port_nos))
         if changed_ports:
-            all_up_port_nos = [
-                port for port in changed_ports if port in self.dp.dyn_up_port_nos
-            ]
+            all_up_port_nos = [port for port in changed_ports if port in up_port_nos]
             ofmsgs.extend(self.ports_add(all_up_port_nos))
         if self.acl_manager:
             if changed_acl_ports:
