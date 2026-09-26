@@ -3345,6 +3345,38 @@ class ValveWarmChangeRoutedVLANVIDTestCase(ValveWarmRoutedVLANTestBase):
         self.assert_routed_via_other_vlans(3)
 
 
+class ValveWarmChangeIPv4RoutedVLANVIDTestCase(ValveWarmRoutedVLANTestBase):
+    """Test changing the VID of a routed VLAN with no IPv6 VIP."""
+
+    CONFIG = ValveWarmRoutedVLANTestBase.CONFIG.replace(', "fc11::254/64"', "")
+
+    def vid_flows(self, vid, table_id=None):
+        """Return the flows that match a VID, in one table or in all of them."""
+        vlan_vid = vid | ofp.OFPVID_PRESENT
+        tables = self.network.tables[self.DP_ID].tables
+        if table_id is not None:
+            tables = [tables[table_id]]
+        return [
+            str(flow)
+            for table in tables
+            for flow in table
+            if flow.match_values.get("vlan_vid")
+            == flow.match_to_bits("vlan_vid", vlan_vid)
+        ]
+
+    def test_change_vid(self):
+        """Test the IPv6 routes of the other VLANs are deleted from the old VID."""
+        ipv6_fib = self.valves_manager.valves[self.DP_ID].dp.tables["ipv6_fib"]
+        self.assertTrue(self.vid_flows(0x300, ipv6_fib.table_id))
+        self.update_config(self.config(clients1_vid=0x500), reload_type="warm")
+        self.assertEqual([], self.vid_flows(0x300))
+        for ip_dst, out_port in ((self.INTERNET[0], 1), (self.HOSTS[2][1], 2)):
+            self.assertTrue(
+                self.routed(3, ip_dst, out_port),
+                msg="port 3 to %s not routed" % ip_dst,
+            )
+
+
 class ValveWarmChangeUplinkVLANTestCase(ValveWarmRoutedVLANTestBase):
     """Test changing the uplink VLAN."""
 
@@ -3407,7 +3439,8 @@ class ValveWarmChangeRoutedVLANResolvingTestCase(ValveWarmRoutedVLANTestBase):
 # pylint: disable=protected-access
 # VLAN deletion as it was before dp_vlan_refs(), when every VLAN deleted
 # rescanned all the VLANs on the DP. Kept verbatim, bar calling the base
-# class explicitly, as the reference that the batched scans must match.
+# class explicitly and deleting FIB flows whatever the VLAN's VIPs, as the
+# reference that the batched scans must match.
 
 
 def _rescan_valve_del_vlan(self, vlan, dp_vlans):
@@ -3523,10 +3556,9 @@ def _rescan_route_del_faucet_mac(self, faucet_mac, dp_vlans):
 
 def _rescan_route_del_vlan(self, vlan, dp_vlans):
     """Delete a VLAN."""
-    ofmsgs = []
+    ofmsgs = [self.fib_table.flowdel(match=self.fib_table.match(vlan=vlan))]
     if not vlan.faucet_vips_by_ipv(self.IPV):
         return ofmsgs
-    ofmsgs.append(self.fib_table.flowdel(match=self.fib_table.match(vlan=vlan)))
     ofmsgs.extend(self._del_faucet_mac(vlan.faucet_mac, dp_vlans))
 
     # Expire next hops for this VLAN to remove static routes
