@@ -5509,5 +5509,242 @@ class ValveTrunkReceiveOnlyHostGlobalTestCase(ValveTrunkReceiveOnlyHostTestCase)
     GLOBAL_VLAN = 0x800
 
 
+class ValveWarmPortOnlyVLANTestCase(ValveTestBases.ValveTestNetwork):
+    """Test a warm start that gives a port its only VLAN, or takes it away.
+
+    A cold start adds only the ports on a VLAN, and stack, output only and
+    coprocessor ports, so it installs no flows for a port with no VLAN. A
+    warm start must end with the flows a cold start of its config installs.
+    Port 1 has an ACL, so that there is a port ACL table, and its VLAN is
+    routed, so that there is an IPv4 FIB table whatever the other VLANs.
+    """
+
+    # A VLAN change can only be a warm start if the pipeline need not be resized.
+    REQUIRE_TFM = False
+
+    CONFIG = """
+acls:
+    allow:
+        - rule:
+            actions:
+                allow: 1
+vlans:
+    office:
+        vid: 0x100
+        faucet_vips: ["10.1.0.254/24"]
+dps:
+    s1:
+        dp_id: 1
+        hardware: "Open vSwitch"
+        interfaces:
+            1:
+                native_vlan: office
+                acls_in: [allow]
+            2:
+                description: access
+            3:
+                description: trunk
+            4:
+                native_vlan: office
+"""
+
+    # The VLANs given to ports 2 to 4, each configured only while a port has it.
+    VLANS = {
+        "routed": {"vid": 0x200, "faucet_vips": ["10.0.0.254/24"]},
+        "l2only": {"vid": 0x300},
+    }
+
+    maxDiff = None
+
+    def setUp(self):
+        """Setup ports 2 and 3 with no VLAN."""
+        self.setup_valves(self.config())
+
+    def config(
+        self,
+        access_vlan=None,
+        trunk_vlan=None,
+        other_vlan=None,
+        port5=False,
+        always_up=False,
+    ):
+        """Return the config, with port 2 native, port 3 tagged or port 4
+        also tagged on a VLAN, and port 2 up whatever its link if always_up;
+        or with a port 5, with no VLAN if port5 is True, else native on it."""
+        config = config_parser_util.yaml_load(self.CONFIG)
+        interfaces = config["dps"]["s1"]["interfaces"]
+        if port5:
+            interfaces[5] = {"description": "added"}
+        if always_up:
+            interfaces[2]["opstatus_reconf"] = False
+        for port, native, vlan in (
+            (2, True, access_vlan),
+            (3, False, trunk_vlan),
+            (4, False, other_vlan),
+            (5, True, None if port5 is True else port5),
+        ):
+            if vlan:
+                if native:
+                    interfaces[port]["native_vlan"] = vlan
+                else:
+                    interfaces[port]["tagged_vlans"] = [vlan]
+                config["vlans"][vlan] = dict(self.VLANS[vlan])
+        return config_parser_util.yaml_dump(config)
+
+    def restart(self, config):
+        """Cold start a new faucet and switch with the config."""
+        self.teardown_valves()
+        self.network = None
+        self.setup_valves(config)
+
+    def flows(self):
+        """Return every flow on the switch, in a canonical order."""
+        table = self.network.tables[self.DP_ID]
+        table.sort_tables()
+        return str(table)
+
+    def assert_warm_start(self, *configs, up_ports=()):
+        """Assert each of a run of warm starts from the first config installs
+        what a cold start of its config does, with up_ports up but not in the
+        first config."""
+        self.restart(configs[0])
+        for port in up_ports:
+            self.set_port_up(port)
+        warm = []
+        for config in configs[1:]:
+            self.update_config(config, reload_type="warm")
+            warm.append(self.flows())
+        for config, flows in zip(configs[1:], warm):
+            self.restart(config)
+            self.assertEqual(self.flows(), flows)
+
+    def test_access_port_loses_vlan(self):
+        """Test an access port whose VLAN is deleted has no flows."""
+        for vlan in self.VLANS:
+            with self.subTest(vlan=vlan):
+                self.assert_warm_start(self.config(access_vlan=vlan), self.config())
+
+    def test_access_port_gains_vlan(self):
+        """Test an access port given a VLAN that is added is added."""
+        for vlan in self.VLANS:
+            with self.subTest(vlan=vlan):
+                self.assert_warm_start(self.config(), self.config(access_vlan=vlan))
+
+    def test_trunk_port_loses_vlan(self):
+        """Test a trunk whose only tagged VLAN is deleted has no flows."""
+        for vlan in self.VLANS:
+            with self.subTest(vlan=vlan):
+                self.assert_warm_start(self.config(trunk_vlan=vlan), self.config())
+
+    def test_trunk_port_gains_vlan(self):
+        """Test a trunk given a VLAN to tag that is added is added."""
+        for vlan in self.VLANS:
+            with self.subTest(vlan=vlan):
+                self.assert_warm_start(self.config(), self.config(trunk_vlan=vlan))
+
+    def test_port_leaves_vlan(self):
+        """Test a port leaving a VLAN that another port keeps has no flows."""
+        for vlan in self.VLANS:
+            with self.subTest(vlan=vlan):
+                self.assert_warm_start(
+                    self.config(access_vlan=vlan, other_vlan=vlan),
+                    self.config(other_vlan=vlan),
+                )
+
+    def test_port_joins_vlan(self):
+        """Test a port with no VLAN joining another port's VLAN is added."""
+        for vlan in self.VLANS:
+            with self.subTest(vlan=vlan):
+                self.assert_warm_start(
+                    self.config(other_vlan=vlan),
+                    self.config(access_vlan=vlan, other_vlan=vlan),
+                )
+
+    def test_port_added_with_no_vlan(self):
+        """Test a port that is up, added with no VLAN, has no flows."""
+        self.assert_warm_start(self.config(), self.config(port5=True), up_ports=(5,))
+
+    def test_access_port_loses_and_regains_vlan(self):
+        """Test an access port whose VLAN is deleted, added back and deleted
+        again, so it is still known to be up with no VLAN."""
+        for vlan in self.VLANS:
+            with self.subTest(vlan=vlan):
+                self.assert_warm_start(
+                    self.config(access_vlan=vlan),
+                    self.config(),
+                    self.config(access_vlan=vlan),
+                    self.config(),
+                )
+
+    def test_trunk_port_loses_and_regains_vlan(self):
+        """Test a trunk whose only tagged VLAN is deleted, added back and
+        deleted again."""
+        for vlan in self.VLANS:
+            with self.subTest(vlan=vlan):
+                self.assert_warm_start(
+                    self.config(trunk_vlan=vlan),
+                    self.config(),
+                    self.config(trunk_vlan=vlan),
+                    self.config(),
+                )
+
+    def test_port_leaves_and_rejoins_vlan(self):
+        """Test a port leaving a VLAN that another port keeps, and joining it again."""
+        for vlan in self.VLANS:
+            with self.subTest(vlan=vlan):
+                self.assert_warm_start(
+                    self.config(access_vlan=vlan, other_vlan=vlan),
+                    self.config(other_vlan=vlan),
+                    self.config(access_vlan=vlan, other_vlan=vlan),
+                )
+
+    def test_port_added_with_no_vlan_then_given_one(self):
+        """Test a port that is up, added with no VLAN, given one, and left
+        with none again."""
+        for vlan in self.VLANS:
+            with self.subTest(vlan=vlan):
+                self.assert_warm_start(
+                    self.config(),
+                    self.config(port5=True),
+                    self.config(port5=vlan),
+                    self.config(port5=True),
+                    up_ports=(5,),
+                )
+
+    def test_always_up_port_gains_vlan(self):
+        """Test a port with no VLAN that is up whatever its link is added when
+        given a VLAN, though its link was down when the switch connected.
+
+        As a switch connects, its port description reply records whether
+        each port is up, so only the cold start records this one.
+        """
+        up_ports = {1, 3, 4}
+        for vlan in self.VLANS:
+            with self.subTest(vlan=vlan):
+                self.restart(self.config(always_up=True))
+                valve = self.valves_manager.valves[self.DP_ID]
+                valve.datapath_disconnect(self.mock_time())
+                valve.port_desc_stats_reply_handler(
+                    [
+                        SimpleNamespace(
+                            port_no=port,
+                            state=0 if port in up_ports else ofp.OFPPS_LINK_DOWN,
+                        )
+                        for port in (1, 2, 3, 4)
+                    ],
+                    [],
+                    self.mock_time(),
+                )
+                self.apply_ofmsgs(
+                    valve.switch_features(None)
+                    + valve.datapath_connect(self.mock_time(), up_ports)
+                )
+                config = self.config(access_vlan=vlan, always_up=True)
+                self.update_config(config, reload_type="warm")
+                warm = self.flows()
+                self.restart(config)
+                self.assertEqual(self.flows(), warm)
+
+
 if __name__ == "__main__":
     unittest.main()  # pytype: disable=module-attr
