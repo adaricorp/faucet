@@ -1740,6 +1740,57 @@ class DP(Conf):
 
         return (all_meters_changed, deleted_meters, added_meters, changed_meters)
 
+    def _router_change_needs_cold_start(self, logger, new_dp):
+        """Return True if a change to the routers requires a cold start.
+
+        A router only makes the VLANs it names route with each other, so a
+        change to the routers is otherwise a change to which pairs of VLANs
+        route with each other, and a warm start withdraws and installs the
+        FIB flows of just those pairs (see
+        ValveRouteManager.withdraw_lost_peers()).
+
+        Args:
+            logger (ValveLogger): logger instance.
+            new_dp (DP): new dataplane configuration.
+        Returns:
+            bool: True if the change to the routers requires a cold start.
+        """
+        bgp_routers = sorted(
+            {
+                name
+                for routers in (self.routers, new_dp.routers)
+                for name, router in routers.items()
+                if router.bgp_as() or router.bgp_vlan()
+            }
+        )
+        for cold_start, reason in (
+            # A route's actions set the VLAN only when there are routers.
+            (
+                not self.routers or not new_dp.routers,
+                "DP first router added or last router deleted",
+            ),
+            # A global VLAN routes the VLANs of the only router as one.
+            (
+                self.global_vlan or new_dp.global_vlan,
+                "DP routers changed with a global VLAN",
+            ),
+            (self.stack or new_dp.stack, "DP routers changed on a stack"),
+            # A BGP router has its own speaker state, and a BGP route is stored
+            # on a VLAN chosen by the first router naming the BGP VLAN.
+            (bgp_routers, "DP routers changed with BGP routers %s" % bgp_routers),
+            # Adding or deleting a VLAN often gives a port its only VLAN or takes
+            # it away, which a warm start does not yet handle, so keep that
+            # reload cold as before.
+            (
+                self.vlans.keys() != new_dp.vlans.keys(),
+                "DP routers changed with VLANs added or deleted",
+            ),
+        ):
+            if cold_start:
+                logger.info("%s - requires cold start" % reason)
+                return True
+        return False
+
     def get_config_changes(self, logger, new_dp):
         """Detect any config changes.
 
@@ -1769,7 +1820,9 @@ class DP(Conf):
             and new_dp.stack.root_name != self.stack.root_name
         ):
             logger.info("Stack root change - requires cold start")
-        elif new_dp.routers != self.routers:
+        elif new_dp.routers != self.routers and self._router_change_needs_cold_start(
+            logger, new_dp
+        ):
             logger.info("DP routers config changed - requires cold start")
         elif not self.ignore_subconf(
             new_dp, ignore_keys=["interfaces", "interface_ranges", "routers"]
