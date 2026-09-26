@@ -1725,6 +1725,65 @@ class DP(Conf):
 
         return (all_meters_changed, deleted_meters, added_meters, changed_meters)
 
+    def _router_change_touches_lacp_dot1x_ports(self, logger, new_dp, changed_ports):
+        """Return True if a routers change touches an LACP or 802.1X port.
+
+        A warm start deletes each deleted or changed port while the running
+        config's routers are still in place, and sends every add after every
+        delete. Deleting an LACP port adds its old VLANs back, and with them
+        the connected routes between each and the VLANs it routes with (see
+        Valve.lacp_update()), and deleting an 802.1X port with a VLAN
+        assigned adds its old VLAN flows back (see
+        Valve.del_dot1x_native_vlan()). So in a routers change, what such a
+        port adds back outlives what the change withdraws or deletes: the
+        routes between VLANs that stop routing with each other, and the
+        flows of a deleted VLAN.
+
+        A port counts if it has LACP or 802.1X in either config, and is
+        deleted, added, or changed as _get_port_config_changes() decides (a
+        port whose own config changes, or that carries a VLAN that is added
+        or changes), or carries a VLAN that new_dp deletes or renumbers.
+
+        Args:
+            logger (ValveLogger): logger instance.
+            new_dp (DP): new dataplane configuration.
+            changed_ports (set): changed port numbers.
+        Returns:
+            bool: True if the routers change touches such a port.
+        """
+        touched = []
+        for port_no in sorted(set(self.ports) | set(new_dp.ports)):
+            old_port = self.ports.get(port_no, None)
+            new_port = new_dp.ports.get(port_no, None)
+            if not any(
+                port.lacp or port.dot1x
+                for port in (old_port, new_port)
+                if port is not None
+            ):
+                continue
+            if new_port is None:
+                how = "deleted"
+            elif old_port is None:
+                how = "added"
+            elif port_no in changed_ports:
+                how = "changed"
+            else:
+                vids = sorted(
+                    vlan.vid
+                    for vlan in old_port.vlans()
+                    if vlan.vid not in new_dp.vlans
+                )
+                if not vids:
+                    continue
+                how = "with VLANs %s deleted or renumbered" % vids
+            touched.append("port %u %s" % (port_no, how))
+        if touched:
+            logger.info(
+                "DP routers changed with LACP or 802.1X %s - requires cold start"
+                % ", ".join(touched)
+            )
+        return bool(touched)
+
     def _router_change_needs_cold_start(self, logger, new_dp):
         """Return True if a change to the routers requires a cold start.
 
@@ -1732,7 +1791,10 @@ class DP(Conf):
         change to the routers is otherwise a change to which pairs of VLANs
         route with each other, and a warm start withdraws and installs the
         FIB flows of just those pairs (see
-        ValveRouteManager.withdraw_lost_peers()).
+        ValveRouteManager.withdraw_lost_peers()), including the pairs of a
+        VLAN that the same change adds or deletes. One that touches an LACP
+        or 802.1X port cold starts too, once the port changes are known (see
+        _router_change_touches_lacp_dot1x_ports()).
 
         Args:
             logger (ValveLogger): logger instance.
@@ -1763,13 +1825,6 @@ class DP(Conf):
             # A BGP router has its own speaker state, and a BGP route is stored
             # on a VLAN chosen by the first router naming the BGP VLAN.
             (bgp_routers, "DP routers changed with BGP routers %s" % bgp_routers),
-            # Adding or deleting a VLAN often gives a port its only VLAN or takes
-            # it away, which a warm start does not yet handle, so keep that
-            # reload cold as before.
-            (
-                self.vlans.keys() != new_dp.vlans.keys(),
-                "DP routers changed with VLANs added or deleted",
-            ),
         ):
             if cold_start:
                 logger.info("%s - requires cold start" % reason)
@@ -1842,21 +1897,28 @@ class DP(Conf):
                 changed_acl_vlans,
                 changed_acls,
             )
-            return (
-                deleted_ports,
-                changed_ports,
-                added_ports,
-                changed_acl_ports,
-                added_vlans,
-                deleted_vlans,
-                changed_vlans,
-                changed_acl_vlans,
-                all_ports_changed,
-                all_meters_changed,
-                deleted_meters,
-                added_meters,
-                changed_meters,
-            )
+            if (
+                new_dp.routers == self.routers
+                or not self._router_change_touches_lacp_dot1x_ports(
+                    logger, new_dp, changed_ports
+                )
+            ):
+                return (
+                    deleted_ports,
+                    changed_ports,
+                    added_ports,
+                    changed_acl_ports,
+                    added_vlans,
+                    deleted_vlans,
+                    changed_vlans,
+                    changed_acl_vlans,
+                    all_ports_changed,
+                    all_meters_changed,
+                    deleted_meters,
+                    added_meters,
+                    changed_meters,
+                )
+            logger.info("DP routers config changed - requires cold start")
         # default cold start
         return (
             set(),
