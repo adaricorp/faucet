@@ -892,7 +892,7 @@ class ValveRouteManager(ValveManagerBase):
             ),
         )
 
-    def withdraw_lost_peers(self, vlans, new_peers):
+    def withdraw_lost_peers(self, vlans, new_peers, new_vids):
         """Return deletes for what each VLAN has from the VLANs it stops routing with.
 
         Called on the running config, before a warm start deletes any port or
@@ -904,25 +904,85 @@ class ValveRouteManager(ValveManagerBase):
         read, so a flow is deleted whatever state its next hop is in; a strict
         delete of a flow not installed does nothing.
 
+        Deleting a VLAN deletes its connected subnets from the VLANs it
+        routed with, and not strictly (see _del_faucet_vip()), so every flow
+        they have inside those subnets goes too. So when a lost peer is
+        deleted, every destination inside its connected subnets that a VLAN
+        itself or a VLAN it keeps routing with can install is withdrawn from
+        it too, for replay_gained_peers() to look up again.
+
         Args:
             vlans (dict): the running config's VLANs by VID.
             new_peers (dict): routed_peers() of the new config.
+            new_vids (set): the new config's VIDs.
         Returns:
             dict: {vid: {ip_network: flow delete}}.
         """
         withdrawals = defaultdict(dict)
         peer_keys = {}
+
+        def fib_keys(peer_vid):
+            if peer_vid not in peer_keys:
+                peer_keys[peer_vid] = self._peer_fib_keys(vlans[peer_vid])
+            return peer_keys[peer_vid]
+
         for vid, peers in self.routed_peers(self.routers).items():
-            for peer_vid in peers - new_peers.get(vid, set()):
-                if peer_vid not in peer_keys:
-                    peer_keys[peer_vid] = self._peer_fib_keys(vlans[peer_vid])
-                for key, nw_dst in peer_keys[peer_vid].items():
-                    withdrawals[vid][key] = self.fib_table.flowdel(
-                        self._route_match(vlans[vid], nw_dst),
-                        priority=self.route_priority + key.prefixlen,
-                        strict=True,
+            lost_vids = peers - new_peers.get(vid, set())
+            for peer_vid in lost_vids:
+                for key, nw_dst in fib_keys(peer_vid).items():
+                    withdrawals[vid][key] = self._fib_withdrawal(
+                        vlans[vid], key, nw_dst
                     )
+            if vid not in new_vids:
+                continue
+            deleted_subnets = self._connected_subnets(
+                vlans[peer_vid] for peer_vid in lost_vids - new_vids
+            )
+            if not deleted_subnets:
+                continue
+            for kept_vid in (peers - lost_vids) | {vid}:
+                for key, nw_dst in fib_keys(kept_vid).items():
+                    if key not in withdrawals[vid] and self._inside(
+                        key, deleted_subnets
+                    ):
+                        withdrawals[vid][key] = self._fib_withdrawal(
+                            vlans[vid], key, nw_dst
+                        )
         return withdrawals
+
+    def _fib_withdrawal(self, vlan, key, nw_dst):
+        """Return the strict delete of the FIB flow for a _peer_fib_keys() key."""
+        return self.fib_table.flowdel(
+            self._route_match(vlan, nw_dst),
+            priority=self.route_priority + key.prefixlen,
+            strict=True,
+        )
+
+    def _connected_subnets(self, vlans):
+        """Return the connected subnets that VLANs install on the VLANs they
+        route with (see _add_faucet_fib_to_vip()).
+
+        Args:
+            vlans (iterable): VLANs.
+        Returns:
+            dict: {prefix length: set of ip_network}.
+        """
+        subnets = defaultdict(set)
+        if self.proactive_learn:
+            for vlan in vlans:
+                for faucet_vip in vlan.faucet_vips_by_ipv(self.IPV):
+                    if not faucet_vip.ip.is_link_local:
+                        subnets[faucet_vip.network.prefixlen].add(faucet_vip.network)
+        return subnets
+
+    @staticmethod
+    def _inside(ip_dst, subnets):
+        """Return True if ip_dst is, or is inside, one of _connected_subnets()."""
+        return any(
+            prefixlen <= ip_dst.prefixlen
+            and ip_dst.supernet(new_prefix=prefixlen) in prefixlen_subnets
+            for prefixlen, prefixlen_subnets in subnets.items()
+        )
 
     def _peer_fib_winners(self, vlans, vid, peer_vids, kept_vids, keys):
         """Return the entry a VLAN's FIB has for each destination, and its VLAN.
