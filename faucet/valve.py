@@ -86,6 +86,10 @@ class ValveLogger:
         """Log debug level message."""
         self.logger.debug(self._dpid_prefix(log_msg))
 
+    def debug_enabled(self):
+        """Return True if debug level messages are logged."""
+        return self.logger.isEnabledFor(logging.DEBUG)
+
     def info(self, log_msg):
         """Log info level message."""
         self.logger.info(self._dpid_prefix(log_msg))
