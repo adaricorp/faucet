@@ -44,6 +44,30 @@ class FaucetPortMethodTest(unittest.TestCase):  # pytype: disable=module-attr
         port.native_vlan = None
         self.assertEqual(set(port.vlans()), set(tagged_vlans))
 
+    def test_conf_diff_summary(self):
+        """Test the summary names changed keys and counts only changed list items"""
+        old_port = Port(1, 1, {"tagged_vlans": [101, 102, 103, 104]})
+        new_port = Port(
+            1,
+            1,
+            {
+                "description": "trunk",
+                "acls_in": ["acl1"],
+                "tagged_vlans": [101, 105, 106, 104, 107],
+            },
+        )
+        self.assertEqual(
+            "acls_in (1 added, 0 deleted), description, "
+            "tagged_vlans (3 added, 2 deleted)",
+            old_port.conf_diff_summary(new_port),
+        )
+        self.assertEqual(
+            "acls_in (0 added, 1 deleted), description, "
+            "tagged_vlans (2 added, 3 deleted)",
+            new_port.conf_diff_summary(old_port),
+        )
+        self.assertEqual("", old_port.conf_diff_summary(old_port))
+
 
 class FaucetLACPPortFunctions(unittest.TestCase):  # pytype: disable=module-attr
     """Test port LACP state functions work as expected"""
