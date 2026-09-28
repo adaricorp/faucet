@@ -1426,7 +1426,12 @@ class DP(Conf):
                 else:
                     changed_confs.add(conf_id)
                     if diff:
+                        # A diff shows the whole config, however little changed.
                         logger.info(
+                            "%s %s changed: %s"
+                            % (conf_name, conf_id, old_conf.conf_diff_summary(new_conf))
+                        )
+                        logger.debug(
                             "%s %s changed: %s"
                             % (conf_name, conf_id, old_conf.conf_diff(new_conf))
                         )

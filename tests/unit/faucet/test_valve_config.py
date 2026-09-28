@@ -189,6 +189,67 @@ dps:
         self.update_and_revert_config(self.CONFIG, self.MORE_CONFIG, "cold")
 
 
+class ValveChangeVLANTestCase(ValveTestBases.ValveTestNetwork):
+    """Test changes to config on a VLAN."""
+
+    CONFIG = (
+        """
+vlans:
+  vlan1:
+    vid: 10
+dps:
+    s1:
+%s
+        interfaces:
+            1:
+                native_vlan: vlan1
+"""
+        % DP1_CONFIG
+    )
+
+    ROUTED_CONFIG = (
+        """
+vlans:
+  vlan1:
+    vid: 10
+    faucet_vips: ["10.0.0.254/24"]
+    routes:
+    - route:
+        ip_dst: 10.99.0.0/16
+        ip_gw: 10.0.0.1
+    unicast_flood: False
+dps:
+    s1:
+%s
+        interfaces:
+            1:
+                native_vlan: vlan1
+"""
+        % DP1_CONFIG
+    )
+
+    def setUp(self):
+        """Setup basic port and vlan config"""
+        self.setup_valves(self.CONFIG)
+
+    def test_change_vlan_logging(self):
+        """Test a changed VLAN logs the keys that changed, and its diff only at debug."""
+        with self.assertLogs("faucet.valve", level="DEBUG") as logs:
+            self.update_config(self.ROUTED_CONFIG, reload_type="cold")
+        changes = [line for line in logs.output if "VLAN 10 changed:" in line]
+        self.assertEqual(2, len(changes), changes)
+        self.assertTrue(changes[0].startswith("INFO:"), changes)
+        self.assertTrue(
+            changes[0].endswith(
+                "VLAN 10 changed: faucet_vips (1 added, 0 deleted), "
+                "routes (1 added, 0 deleted), unicast_flood"
+            ),
+            changes,
+        )
+        self.assertTrue(changes[1].startswith("DEBUG:"), changes)
+        self.assertIn('+     "unicast_flood": false', changes[1])
+
+
 class ValveChangePortTestCase(ValveTestBases.ValveTestNetwork):
     """Test changes to config on ports."""
 
@@ -226,9 +287,43 @@ dps:
         % DP1_CONFIG
     )
 
+    TAGGED_CONFIG = (
+        """
+dps:
+    s1:
+%s
+        interfaces:
+            p1:
+                number: 1
+                description: trunk
+                native_vlan: 0x100
+                tagged_vlans: [0x200]
+            p2:
+                number: 2
+                native_vlan: 0x200
+                permanent_learn: True
+"""
+        % DP1_CONFIG
+    )
+
     def setUp(self):
         """Setup basic port and vlan config"""
         self.setup_valves(self.CONFIG)
+
+    def test_change_port_logging(self):
+        """Test a changed port logs the keys that changed, and its diff only at debug."""
+        for config, summary in (
+            (self.TAGGED_CONFIG, "description, tagged_vlans (1 added, 0 deleted)"),
+            (self.CONFIG, "description, tagged_vlans (0 added, 1 deleted)"),
+        ):
+            with self.assertLogs("faucet.valve", level="DEBUG") as logs:
+                self.update_config(config, reload_type="warm")
+            changes = [line for line in logs.output if "port 1 changed:" in line]
+            self.assertEqual(2, len(changes), changes)
+            self.assertTrue(changes[0].startswith("INFO:"), changes)
+            self.assertTrue(changes[0].endswith("port 1 changed: " + summary), changes)
+            self.assertTrue(changes[1].startswith("DEBUG:"), changes)
+            self.assertIn('"description": "trunk"', changes[1])
 
     def test_delete_permanent_learn(self):
         """Test port permanent learn can deconfigured."""
@@ -814,9 +909,57 @@ dps:
         % DP1_CONFIG
     )
 
+    CHANGED_RULES_CONFIG = (
+        """
+acls:
+    acl_same_a:
+        - rule:
+            actions:
+                allow: 0
+        - rule:
+            description: allow the rest
+            actions:
+                allow: 1
+    acl_same_b:
+        - rule:
+            actions:
+                allow: 1
+    acl_diff_c:
+        - rule:
+            actions:
+                allow: 0
+dps:
+    s1:
+%s
+        interfaces:
+            p1:
+                number: 1
+                native_vlan: 0x100
+                acl_in: acl_same_a
+            p2:
+                number: 2
+                native_vlan: 0x200
+"""
+        % DP1_CONFIG
+    )
+
     def setUp(self):
         """Setup basic ACL config"""
         self.setup_valves(self.CONFIG)
+
+    def test_change_acl_rules_logging(self):
+        """Test a changed ACL logs its rule counts, and its diff only at debug."""
+        with self.assertLogs("faucet.valve", level="DEBUG") as logs:
+            self.update_config(self.CHANGED_RULES_CONFIG, reload_type="warm")
+        changes = [line for line in logs.output if "ACL acl_same_a changed:" in line]
+        self.assertEqual(2, len(changes), changes)
+        self.assertTrue(changes[0].startswith("INFO:"), changes)
+        self.assertTrue(
+            changes[0].endswith("ACL acl_same_a changed: rules (2 added, 1 deleted)"),
+            changes,
+        )
+        self.assertTrue(changes[1].startswith("DEBUG:"), changes)
+        self.assertIn('"description": "allow the rest"', changes[1])
 
     def test_change_port_acl(self):
         """Test port ACL can be changed."""
