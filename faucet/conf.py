@@ -216,6 +216,46 @@ class Conf:
             differ.compare(self.to_conf().splitlines(), other.to_conf().splitlines())
         )
 
+    @staticmethod
+    def _list_changes(old_list, new_list):
+        """Return how many items new_list adds to and deletes from old_list.
+
+        A changed or moved item counts as one deleted and one added."""
+        added = 0
+        deleted = 0
+        matcher = difflib.SequenceMatcher(
+            a=[repr(item) for item in old_list],
+            b=[repr(item) for item in new_list],
+            autojunk=False,
+        )
+        for tag, old_start, old_end, new_start, new_end in matcher.get_opcodes():
+            if tag != "equal":
+                deleted += old_end - old_start
+                added += new_end - new_start
+        return added, deleted
+
+    def conf_diff_summary(self, other):
+        """Return the keys that differ between two Confs, as text.
+
+        A list's key also says how many items were added and deleted, so a
+        long list with one item changed takes one line rather than a diff."""
+        changes = []
+        for key in sorted(self.defaults):
+            old_v = self._str_conf(self.orig_conf[key])
+            new_v = self._str_conf(other.orig_conf[key])
+            # Compare as conf_hash() does, so every key it sees differ is named.
+            if repr(old_v) == repr(new_v):
+                continue
+            # An unset list is None.
+            old_items = () if old_v is None else old_v
+            new_items = () if new_v is None else new_v
+            if isinstance(old_items, tuple) and isinstance(new_items, tuple):
+                added, deleted = self._list_changes(old_items, new_items)
+                changes.append("%s (%u added, %u deleted)" % (key, added, deleted))
+            else:
+                changes.append(key)
+        return ", ".join(changes)
+
     def conf_hash(self, subconf=True, ignore_keys=None):
         """Return hash of keys configurably filtering attributes."""
         return hash(

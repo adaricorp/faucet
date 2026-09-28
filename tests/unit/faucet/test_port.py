@@ -1,7 +1,11 @@
 """Unit tests for Port"""
 
+import logging
 import unittest
+from unittest import mock
 
+from faucet.conf import Conf
+from faucet.dp import DP
 from faucet.port import Port
 from faucet.port import (
     LACP_ACTOR_NOTCONFIGURED,
@@ -14,6 +18,7 @@ from faucet.port import (
     LACP_PORT_SELECTED,
     LACP_PORT_STANDBY,
 )
+from faucet.valve import ValveLogger
 
 
 class MockVLAN:  # pylint: disable=too-few-public-methods
@@ -43,6 +48,63 @@ class FaucetPortMethodTest(unittest.TestCase):  # pytype: disable=module-attr
         self.assertEqual(set(port.vlans()), set([native_vlan] + tagged_vlans))
         port.native_vlan = None
         self.assertEqual(set(port.vlans()), set(tagged_vlans))
+
+    def test_conf_diff_summary(self):
+        """Test the summary names changed keys and counts only changed list items"""
+        old_port = Port(1, 1, {"tagged_vlans": [101, 102, 103, 104]})
+        new_port = Port(
+            1,
+            1,
+            {
+                "description": "trunk",
+                "acls_in": ["acl1"],
+                "tagged_vlans": [101, 105, 106, 104, 107],
+            },
+        )
+        self.assertEqual(
+            "acls_in (1 added, 0 deleted), description, "
+            "tagged_vlans (3 added, 2 deleted)",
+            old_port.conf_diff_summary(new_port),
+        )
+        self.assertEqual(
+            "acls_in (0 added, 1 deleted), description, "
+            "tagged_vlans (2 added, 3 deleted)",
+            new_port.conf_diff_summary(old_port),
+        )
+        self.assertEqual("", old_port.conf_diff_summary(old_port))
+
+    def test_conf_changes_diff_only_at_debug(self):
+        """Test a changed port's diff is built only when debug is logged"""
+        old_ports = {1: Port(1, 1, {"tagged_vlans": [101, 102]})}
+        new_ports = {
+            1: Port(1, 1, {"description": "trunk", "tagged_vlans": [101, 102, 103]})
+        }
+        logger = ValveLogger(logging.getLogger("faucet.valve"), 1, "s1")
+        summary = (
+            "INFO:faucet.valve:DPID 1 (0x1) s1 port 1 changed: "
+            "description, tagged_vlans (1 added, 0 deleted)"
+        )
+        conf_diff = Conf.conf_diff
+        diffs = []
+
+        def counted_conf_diff(conf, other):
+            diffs.append(conf)
+            return conf_diff(conf, other)
+
+        with mock.patch.object(Conf, "conf_diff", counted_conf_diff):
+            for level, diffs_built in (("INFO", 0), ("DEBUG", 1)):
+                diffs.clear()
+                with self.assertLogs("faucet.valve", level=level) as logs:
+                    # pylint: disable=protected-access
+                    DP._get_conf_changes(
+                        logger, "port", old_ports, new_ports, diff=True
+                    )
+                changes = [line for line in logs.output if "port 1 changed:" in line]
+                self.assertEqual(summary, changes[0], level)
+                self.assertEqual(diffs_built, len(diffs), level)
+                self.assertEqual(1 + diffs_built, len(changes), changes)
+        self.assertTrue(changes[1].startswith("DEBUG:"), changes)
+        self.assertIn('"description": "trunk"', changes[1])
 
 
 class FaucetLACPPortFunctions(unittest.TestCase):  # pytype: disable=module-attr
