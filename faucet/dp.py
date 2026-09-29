@@ -48,6 +48,9 @@ class DP(Conf):
 
     DEFAULT_LLDP_SEND_INTERVAL = 5
     DEFAULT_LLDP_MAX_PER_INTERVAL = 5
+    # Hardware that can copy one packet field into another, a Nicira
+    # extension action that answering ARP on the switch needs.
+    ARP_RESPONDER_HARDWARE = ("Open vSwitch", "Open vSwitch TFM")
     mutable_attrs = frozenset(["vlans"])
 
     # Values that are set to None will be set using set_defaults
@@ -77,6 +80,8 @@ class DP(Conf):
         # ARP neighbor timeout (seconds)
         "nd_neighbor_timeout": 30,
         # IPv6 ND neighbor timeout (seconds)
+        "arp_responder": False,
+        # If True, the switch also answers ARP for IPv4 VIPs (Open vSwitch only)
         "ofchannel_log": None,
         # OF channel log
         "stack": None,
@@ -171,6 +176,7 @@ class DP(Conf):
         "hardware": str,
         "arp_neighbor_timeout": int,
         "nd_neighbor_timeout": int,
+        "arp_responder": bool,
         "ofchannel_log": str,
         "stack": dict,
         "ignore_learn_ins": int,
@@ -247,6 +253,7 @@ class DP(Conf):
         self.fast_advertise_interval = None
         self.arp_neighbor_timeout = None
         self.nd_neighbor_timeout = None
+        self.arp_responder = None
         self.combinatorial_port_flood = None
         self.configured = False
         self.cookie = None
@@ -387,6 +394,17 @@ class DP(Conf):
         test_config_condition(
             self.combinatorial_port_flood and self.group_table,
             ("combinatorial_port_flood and group_table mutually exclusive"),
+        )
+        test_config_condition(
+            self.arp_responder and self.hardware not in self.ARP_RESPONDER_HARDWARE,
+            (
+                "arp_responder needs Nicira extension actions, so hardware must be "
+                "in %s, not %s" % (list(self.ARP_RESPONDER_HARDWARE), self.hardware)
+            ),
+        )
+        test_config_condition(
+            self.arp_responder and self.dot1x,
+            ("arp_responder and dot1x cannot be configured together"),
         )
         if self.cache_update_guard_time == 0:
             self.cache_update_guard_time = int(self.timeout / 2)
@@ -582,6 +600,18 @@ class DP(Conf):
 
         if self.restricted_bcast_arpnd_ports():
             table_configs["flood"].match_types += (("eth_type", False),)
+
+        # Answering ARP for a VIP on the switch rewrites the request into the
+        # reply, in the VLAN and for untagged ports on the port it came in on.
+        if self.arp_responder and "vip" in table_configs:
+            table = table_configs["vip"]
+            table.match_types += (
+                ("arp_op", False),
+                ("arp_spa", True),
+                ("in_port", False),
+                ("vlan_vid", False),
+            )
+            table.set_fields = ("arp_op", "arp_sha", "arp_spa", "eth_src")
 
         if "egress_acl" in included_tables:
             table_configs["eth_dst"].miss_goto = "egress_acl"
