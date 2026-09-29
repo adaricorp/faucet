@@ -1075,6 +1075,20 @@ vlans:
         self.assertTrue(self._inport_flows(1, ofmsgs))
         self.assertTrue(self._inport_flows(2, ofmsgs))
 
+    def test_ports_before_cold_start(self):
+        """Test ports up before a cold start add their flows with it, not before."""
+        self.disconnect_dp()
+        self.assertFalse(self.valve.dp.dyn_running)
+        ofmsgs = self._update_port_desc([1, 2], [1, 2])
+        self.assertEqual(self.valve.dp.dyn_up_port_nos, {1, 2})
+        self.assertFalse(ValveTestBases.flowmods_from_flows(ofmsgs))
+
+        ofmsgs = self.connect_dp(ports_up=[1, 2])
+        self.assertTrue(self._inport_flows(1, ofmsgs))
+        self.assertTrue(self._inport_flows(2, ofmsgs))
+        self.assertTrue(self.valve.dp.ports[1].dyn_phys_up)
+        self.assertTrue(self.valve.dp.ports[2].dyn_phys_up)
+
 
 if __name__ == "__main__":
     unittest.main()  # pytype: disable=module-attr
