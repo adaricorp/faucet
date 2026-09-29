@@ -654,6 +654,11 @@ class Valve:
         )
         self._set_port_status(port_no, port_status, now)
 
+        # Until datapath_connect() cold starts the DP, adding every port that
+        # is up, flows for one port can only be thrown away, and building
+        # them for a port with many VLANs takes seconds.
+        if not self.dp.dyn_running:
+            return {}
         if not self.dp.port_no_valid(port_no):
             return {}
         port = self.dp.ports[port_no]
