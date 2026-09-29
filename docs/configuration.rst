@@ -105,6 +105,26 @@ string names given to the datapath, or the OFP datapath id.
       - integer
       - 250
       - ARP and neighbour timeout in seconds
+    * - arp_responder
+      - boolean
+      - False
+      - If True, the switch itself answers ARP requests for this datapath's
+        IPv4 faucet_vips, from flows, so hosts on a routed VLAN can still
+        resolve their gateway while Faucet is busy, for example while it
+        reloads a large configuration. A request is answered only if it
+        comes from inside the VIP's subnet, on the VIP's VLAN, and never for
+        a VIP with a /31 prefix: Faucet itself answers no ARP on a
+        point-to-point /31, so such a link behaves as it does with this
+        option off. Only Open vSwitch can do this ("Open vSwitch" and
+        "Open vSwitch TFM" hardware), as the reply is built with Nicira
+        extension actions, and it cannot be used with 802.1X. Each request
+        is still sent to Faucet, which learns the host from it and answers
+        it too, so a host gets two replies to each request, both giving
+        Faucet's MAC. The switch does not apply Faucet's learning limits: a
+        host Faucet will not learn, for example because its port or VLAN
+        has reached max_hosts, still learns the gateway's MAC from the
+        switch, though Faucet still routes no traffic back to it. Changing
+        this option cold starts the datapath.
     * - description
       - string
       - name
