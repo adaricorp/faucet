@@ -47,6 +47,9 @@ class ValvePipeline(ValveManagerBase):
         self.filter_priority = self._FILTER_PRIORITY
         self.select_priority = self._HIGH_PRIORITY
 
+    # Cached by table and actions rather than on the methods below: a cache
+    # on a method keys on self, and would keep every pipeline a reload
+    # replaces alive, with the whole DP it was built for.
     @staticmethod
     @functools.lru_cache(maxsize=1024)
     def _accept_to_table(table, actions):
@@ -55,7 +58,6 @@ class ValvePipeline(ValveManagerBase):
             inst.append(valve_of.apply_actions(actions))
         return tuple(inst)
 
-    @functools.lru_cache(maxsize=1024)
     def accept_to_vlan(self, actions=None):
         """Get instructions to forward packet through the pipeline to
         vlan table.
@@ -66,7 +68,6 @@ class ValvePipeline(ValveManagerBase):
         """
         return self._accept_to_table(self.vlan_table, actions)
 
-    @functools.lru_cache(maxsize=1024)
     def accept_to_classification(self, actions=None):
         """Get instructions to forward packet through the pipeline to
         classification table.
@@ -77,7 +78,6 @@ class ValvePipeline(ValveManagerBase):
         """
         return self._accept_to_table(self.classification_table, actions)
 
-    @functools.lru_cache(maxsize=1024)
     def accept_to_l2_forwarding(self, actions=None):
         """Get instructions to forward packet through the pipeline to l2
         forwarding.
@@ -88,7 +88,6 @@ class ValvePipeline(ValveManagerBase):
         """
         return self._accept_to_table(self.output_table, actions)
 
-    @functools.lru_cache(maxsize=1024)
     def accept_to_egress(self, actions=None):
         """Get instructions to forward packet through the pipeline to egress
         table
