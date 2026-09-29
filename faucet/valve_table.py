@@ -117,6 +117,8 @@ class ValveTable:  # pylint: disable=too-many-arguments,too-many-instance-attrib
         vlan_pcp=None,
         udp_src=None,
         udp_dst=None,
+        arp_op=None,
+        arp_spa=None,
     ):
         """Compose an OpenFlow match rule."""
         match_dict = valve_of.build_match_dict(
@@ -134,6 +136,8 @@ class ValveTable:  # pylint: disable=too-many-arguments,too-many-instance-attrib
             vlan_pcp,
             udp_src,
             udp_dst,
+            arp_op,
+            arp_spa,
         )
         return valve_of.match(match_dict)
 

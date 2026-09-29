@@ -617,6 +617,25 @@ def ct_nat(**kwds):
     return parser.NXActionNAT(**kwds)  # pylint: disable=no-member
 
 
+@functools.lru_cache()
+def copy_field(src_field, dst_field, n_bits):
+    """Return Nicira action to copy one packet field into another.
+
+    OpenFlow 1.3 has no action to copy a field, so only a switch that
+    supports Nicira extensions, such as Open vSwitch, supports this.
+
+    Args:
+        src_field (str): field to copy.
+        dst_field (str): field to copy it into.
+        n_bits (int): width of both fields in bits.
+    Returns:
+        ryu.ofproto.nx_actions.NXActionRegMove: copy field action.
+    """
+    return parser.NXActionRegMove(  # pylint: disable=no-member
+        src_field=src_field, dst_field=dst_field, n_bits=n_bits
+    )
+
+
 @functools.lru_cache(maxsize=1024)
 def output_port(port_num, max_len=0):
     """Return OpenFlow action to output to a port.
@@ -860,6 +879,8 @@ def build_match_dict(
     vlan_pcp=None,
     udp_src=None,
     udp_dst=None,
+    arp_op=None,
+    arp_spa=None,
 ):
     match_dict = {}
     if in_port is not None:
@@ -907,6 +928,10 @@ def build_match_dict(
             match_dict["metadata"] = metadata
     if vlan_pcp is not None:
         match_dict["vlan_pcp"] = vlan_pcp
+    if arp_op is not None:
+        match_dict["arp_op"] = arp_op
+    if arp_spa is not None:
+        match_dict["arp_spa"] = _match_ip_masked(arp_spa)
     return match_dict
 
 
