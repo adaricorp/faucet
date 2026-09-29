@@ -305,6 +305,7 @@ class Valve:
                 self.pipeline,
                 self.dp.routers,
                 self.stack_manager,
+                arp_responder=self.dp.arp_responder,
             )
             self._route_manager_by_ipv[route_manager.IPV] = route_manager
             for vlan in self.dp.vlans.values():
