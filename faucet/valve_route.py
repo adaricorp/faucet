@@ -26,6 +26,7 @@ import time
 import ipaddress
 
 from os_ken.lib.packet import arp, icmp, icmpv6, ipv4, ipv6
+import pytricia
 
 from faucet import valve_of
 from faucet import valve_packet
@@ -114,6 +115,7 @@ class ValveRouteManager(ValveManagerBase):
         "route_priority",
         "routers",
         "routers_by_vid",
+        "vip_maps_by_vid",
         "vip_table",
         "switch_manager",
     ]
@@ -160,6 +162,7 @@ class ValveRouteManager(ValveManagerBase):
         self.route_priority = self._LPM_PRIORITY
         self.routers = routers
         self.routers_by_vid = self._routers_by_vid()
+        self.vip_maps_by_vid = self._vip_maps_by_vid()
         self.active = False
         self.global_routing = self._global_routing()
         self.stack_manager = stack_manager
@@ -410,6 +413,26 @@ class ValveRouteManager(ValveManagerBase):
                         (router_vlan, router)
                     )
         return routers_by_vid
+
+    def _vip_maps_by_vid(self):
+        """Return each VID's map from every VIP subnet its routers route to."""
+        # A VLAN in several routers is routed to the VIP subnets of all of
+        # them (_routed_vlans()), so resolving a destination must look in
+        # all of them too, not only the first. One map per VID, built once:
+        # the most specific subnet wins, as in the FIB, and on the same
+        # subnet the first router, as before.
+        vip_maps_by_vid = {}
+        for vid, vlan_routers in self.routers_by_vid.items():
+            vip_map = pytricia.PyTricia(  # pylint: disable=c-extension-no-member
+                32 if self.IPV == 4 else 128
+            )
+            for _router_vlan, router in vlan_routers:
+                router_vip_map = router.vip_map_by_ipv.get(self.IPV, {})
+                for network in router_vip_map:
+                    if not vip_map.has_key(network):
+                        vip_map[network] = router_vip_map[network]
+            vip_maps_by_vid[vid] = vip_map
+        return vip_maps_by_vid
 
     def _routers_for_vlan(self, vlan):
         """Return the routers that name this VLAN, in configuration order."""
@@ -966,11 +989,13 @@ class ValveRouteManager(ValveManagerBase):
         dst_ip = pkt_meta.l3_dst
         ofmsgs = []
         if self.proactive_learn:
-            router = self._router_for_vlan(vlan)
-            if router is None:
+            # The VLAN a packet arrives on is the current config's, so its VID
+            # finds the routers naming it.
+            vip_map = self.vip_maps_by_vid.get(vlan.vid, None)
+            if vip_map is None:
                 faucet_vip = vlan.vip_map(dst_ip)
             else:
-                vlan, faucet_vip = router.vip_map(dst_ip)
+                vlan, faucet_vip = vip_map.get(dst_ip, (None, None))
             if (
                 vlan
                 and vlan.ip_in_vip_subnet(dst_ip, faucet_vip)
@@ -982,6 +1007,21 @@ class ValveRouteManager(ValveManagerBase):
                     # TODO: avoid relearning L3 source if same L3 source tries
                     # multiple L3 destinations quickly.
                     ofmsgs.extend(self.add_host_fib_route_from_pkt(now, pkt_meta))
+                    cached_eth_dst = self._cached_nexthop_eth_dst(vlan, dst_ip)
+                    if cached_eth_dst is not None:
+                        # A resolved destination reaches us only while no flows
+                        # route to it: not yet, no longer, or never, when it is
+                        # known from an advert alone. Route it, not blackhole it.
+                        host_route = ipaddress.ip_network(dst_ip.exploded)
+                        if self._vlan_routes(vlan).get(host_route, None) == dst_ip:
+                            ofmsgs.extend(
+                                self._add_resolved_route(
+                                    vlan, dst_ip, host_route, cached_eth_dst, False
+                                )
+                            )
+                        else:
+                            ofmsgs.extend(self._add_host_fib_route(vlan, dst_ip))
+                        return ofmsgs
                     resolution_in_progress = (
                         dst_ip in vlan.dyn_host_gws_by_ipv[self.IPV]
                     )
