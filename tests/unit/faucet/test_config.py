@@ -5425,6 +5425,60 @@ dps:
 """
         self.check_config_failure(config, cp.dp_parser)
 
+    def test_arp_responder_hardware(self):
+        """Test ARP responder accepted only on hardware with Nicira actions."""
+        config = """
+vlans:
+    vlan100:
+        vid: 100
+        faucet_vips: ["10.0.0.254/24"]
+dps:
+    sw1:
+        dp_id: 0x1
+        hardware: "%s"
+        arp_responder: %s
+        interfaces:
+            1:
+                native_vlan: vlan100
+"""
+        for hardware in ("Open vSwitch", "Open vSwitch TFM"):
+            with self.subTest(hardware=hardware):
+                self.check_config_success(config % (hardware, True), cp.dp_parser)
+        for hardware in ("Generic", "GenericTFM", "Aruba", "NoviFlow", "ZodiacFX"):
+            with self.subTest(hardware=hardware):
+                self.check_config_failure(config % (hardware, True), cp.dp_parser)
+                self.check_config_success(config % (hardware, False), cp.dp_parser)
+
+    def test_arp_responder_dot1x(self):
+        """Test ARP responder rejected with 802.1X."""
+        config = """
+vlans:
+    office:
+        vid: 100
+        faucet_vips: ["10.0.0.254/24"]
+dps:
+    sw1:
+        dp_id: 0x1
+        arp_responder: True
+        dot1x:
+            nfv_intf: lo
+            nfv_sw_port: 3
+            radius_ip: ::1
+            radius_port: 123
+            radius_secret: SECRET
+        interfaces:
+            1:
+                native_vlan: office
+                dot1x: True
+            3:
+                output_only: True
+"""
+        self.check_config_failure(config, cp.dp_parser)
+        self.check_config_success(
+            config.replace("arp_responder: True", "arp_responder: False"),
+            cp.dp_parser,
+        )
+
     def test_nd_timeout_too_big(self):
         """Test config rejected when timeout is too big."""
         config = """
