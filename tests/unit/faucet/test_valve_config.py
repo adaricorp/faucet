@@ -22,6 +22,8 @@
 
 from functools import partial
 import copy
+import gc
+import weakref
 import hashlib
 import unittest
 import time
@@ -1252,6 +1254,61 @@ dps:
             time.sleep(i)
 
         self.fail("%f: %s" % (total_tt_prop, pstats_text))
+
+
+class ValveReloadReleasesConfigTestCase(ValveTestBases.ValveTestNetwork):
+    """Test a reload does not keep the configuration it replaced alive."""
+
+    REQUIRE_TFM = False
+
+    CONFIG = """
+acls:
+    allow:
+        - rule:
+            actions:
+                allow: 1
+    allow_arp:
+        - rule:
+            eth_type: 0x0806
+            actions:
+                allow: 1
+vlans:
+    v100:
+        vid: 0x100
+        acls_in: [allow_arp]
+        acls_out: [allow_arp]
+dps:
+    s1:
+        dp_id: 1
+        hardware: "Open vSwitch"
+        interfaces:
+            p1:
+                number: 1
+                tagged_vlans: [0x100]
+                acls_in: [allow]
+            p2:
+                number: 2
+                native_vlan: 0x100
+"""
+
+    MORE_CONFIG = CONFIG.replace(
+        "tagged_vlans: [0x100]", "tagged_vlans: [0x100, 0x200]"
+    )
+
+    def setUp(self):
+        """Setup a port with an ACL, carrying a VLAN with ACLs"""
+        self.setup_valves(self.CONFIG)
+
+    def _reload_releases_dp(self, config):
+        old_dp = weakref.ref(self.valves_manager.valves[self.DP_ID].dp)
+        self.update_config(config, reload_type="warm")
+        gc.collect()
+        self.assertIsNone(old_dp())
+
+    def test_warm_start_releases_config(self):
+        """Test adding and removing a VLAN on a port with an ACL."""
+        self._reload_releases_dp(self.MORE_CONFIG)
+        self._reload_releases_dp(self.CONFIG)
 
 
 class ValveTestVLANRef(ValveTestBases.ValveTestNetwork):
