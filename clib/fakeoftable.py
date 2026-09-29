@@ -36,6 +36,12 @@ from os_ken.lib import addrconv
 
 CONTROLLER_PORT = 4294967293
 IN_PORT = 4294967288
+NX_ACTION_REG_MOVE = parser.NXActionRegMove  # pylint: disable=no-member
+OXM_FIELD_BITS = {
+    field.name: field.type.size * 8
+    for field in ofp.oxm_types
+    if hasattr(field.type, "size")
+}
 
 
 class FakeOFTableException(Exception):
@@ -485,6 +491,25 @@ class FakeOFTable:
             sys.stderr.write("%s: %s\n" % (table_id, matching_fte))
         return matching_fte
 
+    @staticmethod
+    def _copy_field(packet_dict, action):
+        """
+        Apply a Nicira move action, which copies one whole header into another
+        Args:
+            packet_dict (dict): A dictionary keyed by header field names with values
+            action: The NXActionRegMove being applied to the packet
+        """
+        if (
+            action.src_ofs
+            or action.dst_ofs
+            or action.n_bits != OXM_FIELD_BITS.get(action.src_field)
+            or action.n_bits != OXM_FIELD_BITS.get(action.dst_field)
+        ):
+            raise FakeOFTableException("unsupported partial move: %s" % action)
+        if action.src_field not in packet_dict:
+            raise FakeOFTableException("move from absent field: %s" % action)
+        packet_dict[action.dst_field] = packet_dict[action.src_field]
+
     def _process_instruction(self, match, instruction):
         """
         Process an instructions actions into an output dictionary
@@ -511,6 +536,9 @@ class FakeOFTable:
             if action.type == ofp.OFPAT_SET_FIELD:
                 # Set field, modify a packet header
                 packet_dict[action.key] = action.value
+            elif isinstance(action, NX_ACTION_REG_MOVE):
+                # Copy one packet header into another
+                self._copy_field(packet_dict, action)
             elif action.type == ofp.OFPAT_PUSH_VLAN:
                 if (
                     "vlan_vid" in packet_dict
@@ -749,6 +777,8 @@ class FakeOFTable:
                         for action in instruction.actions:
                             if action.type == ofp.OFPAT_SET_FIELD:
                                 packet_dict[action.key] = action.value
+                            elif isinstance(action, NX_ACTION_REG_MOVE):
+                                self._copy_field(packet_dict, action)
                     elif instruction.type == ofp.OFPIT_WRITE_METADATA:
                         metadata = packet_dict.get("metadata", 0)
                         mask = instruction.metadata_mask
@@ -1145,6 +1175,9 @@ class FlowMod:
         elif isinstance(action, parser.OFPActionSetField):
             name = "set_{}".format(action.key)
             value = self._pretty_field_str(action.key, action.value)
+        elif isinstance(action, NX_ACTION_REG_MOVE):
+            name = "move"
+            value = "{}->{}".format(action.src_field, action.dst_field)
         else:
             name, attr = actions_names_attrs[type(action).__name__]
             if attr:
