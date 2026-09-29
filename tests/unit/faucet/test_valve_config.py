@@ -39,7 +39,7 @@ from os_ken.lib.packet import icmpv6
 from os_ken.lib.packet import slow
 from os_ken.ofproto import ofproto_v1_3 as ofp
 
-from clib.fakeoftable import CONTROLLER_PORT
+from clib.fakeoftable import CONTROLLER_PORT, IN_PORT, NX_ACTION_REG_MOVE
 from clib.valve_test_lib import (
     BASE_DP1_CONFIG,
     CONFIG,
@@ -47,7 +47,13 @@ from clib.valve_test_lib import (
     FAUCET_MAC,
     ValveTestBases,
 )
-from faucet import config_parser_util, faucet_dot1x, valve_of, valve_packet
+from faucet import (
+    config_parser_util,
+    faucet_dot1x,
+    faucet_pipeline,
+    valve_of,
+    valve_packet,
+)
 from faucet.conf import InvalidConfigError
 from faucet.config_parser import dp_parser
 from faucet.dp import DP
@@ -6188,6 +6194,532 @@ dps:
                 warm = self.flows()
                 self.restart(config)
                 self.assertEqual(self.flows(), warm)
+
+
+class ValveARPResponderTestBase(ValveTestBases.ValveTestNetwork):
+    """Answer ARP for FAUCET VIPs from flows on the switch.
+
+    Ports 1 and 2 are untagged on office, port 3 tags office and guest,
+    port 4 is untagged on guest, and port 5 on lab, which has no VIP.
+    No port has hairpin set. Uses Open vSwitch, which can copy the
+    request's addresses into the reply, so that adding a VLAN does not
+    change the pipeline.
+    """
+
+    REQUIRE_TFM = False
+    HARDWARE = "Open vSwitch"
+
+    CONFIG = """
+vlans:
+    office:
+        vid: 0x100
+        faucet_vips: ["10.0.0.254/24", "fc00::254/64"]
+    guest:
+        vid: 0x200
+        faucet_mac: "0e:00:00:00:02:00"
+        faucet_vips: ["10.2.0.254/24"]
+    lab:
+        vid: 0x300
+dps:
+    s1:
+        dp_id: 1
+        hardware: "%s"
+        arp_responder: True
+        interfaces:
+            1:
+                native_vlan: office
+            2:
+                native_vlan: office
+            3:
+                tagged_vlans: [office, guest]
+            4:
+                native_vlan: guest
+            5:
+                native_vlan: lab
+"""
+
+    HOST_MAC = "00:00:00:01:00:01"
+    GUEST_MAC = "0e:00:00:00:02:00"
+
+    maxDiff = None
+
+    def config(self, vlans=None, interfaces=None, arp_responder=True):
+        """Return the config, with VLANs or interfaces updated or deleted (None)."""
+        config = config_parser_util.yaml_load(self.CONFIG % self.HARDWARE)
+        dp_config = config["dps"]["s1"]
+        if not arp_responder:
+            del dp_config["arp_responder"]
+        for section, updates in (
+            (config["vlans"], vlans),
+            (dp_config["interfaces"], interfaces),
+        ):
+            for key, update in (updates or {}).items():
+                if update is None:
+                    del section[key]
+                else:
+                    section.setdefault(key, {}).update(update)
+        return config_parser_util.yaml_dump(config)
+
+    def setUp(self):
+        """Setup the routed VLANs with the ARP responder on."""
+        self.setup_valves(self.config())
+
+    def restart(self, config):
+        """Cold start a new faucet and switch with the config."""
+        self.teardown_valves()
+        self.network = None
+        self.setup_valves(config)
+
+    @staticmethod
+    def is_responder(flow):
+        """Return True if a flow rewrites an ARP request into its reply."""
+        return any(
+            isinstance(action, NX_ACTION_REG_MOVE)
+            for instruction in flow.instructions
+            if valve_of.is_apply_actions(instruction)
+            for action in instruction.actions
+        )
+
+    def flows(self, responder=True):
+        """Return every flow on the switch in a canonical order, or only those
+        that are not ARP responder flows."""
+        return sorted(
+            (table_id, str(flow))
+            for table_id, flows in enumerate(self.network.tables[self.DP_ID].tables)
+            for flow in flows
+            if responder or not self.is_responder(flow)
+        )
+
+    def responder_flows(self):
+        """Return the ARP responder flows on the switch."""
+        vip_table = self.valves_manager.valves[self.DP_ID].dp.tables["vip"]
+        return [
+            flow
+            for flow in self.network.tables[self.DP_ID].tables[vip_table.table_id]
+            if self.is_responder(flow)
+        ]
+
+    def responder_matches(self, **match):
+        """Return the ARP responder flows that match all the fields given."""
+        return [
+            flow
+            for flow in self.responder_flows()
+            if all(
+                flow.match_values.get(key) == flow.match_to_bits(key, value)
+                for key, value in match.items()
+            )
+        ]
+
+    def arp_request(self, port, vid, sender_ip, target_ip, opcode=arp.ARP_REQUEST):
+        """Return an ARP request received on a port, tagged with vid if not 0."""
+        return {
+            "in_port": port,
+            "vlan_vid": vid | ofp.OFPVID_PRESENT if vid else 0,
+            "eth_src": self.HOST_MAC,
+            "eth_dst": self.BROADCAST_MAC,
+            "eth_type": 0x806,
+            "arp_op": opcode,
+            "arp_sha": self.HOST_MAC,
+            "arp_spa": sender_ip,
+            "arp_tha": "00:00:00:00:00:00",
+            "arp_tpa": target_ip,
+        }
+
+    def outputs(self, request):
+        """Return what the switch sends for a packet, by output port."""
+        return self.network.tables[self.DP_ID].get_port_outputs(request)
+
+    def assert_answered(self, port, vid, sender_ip, faucet_vip, faucet_mac):
+        """Assert the switch answers a request for a VIP back out its port,
+        tagged if the port is tagged on the VLAN, and sends the request itself
+        only to the controller."""
+        dp = self.valves_manager.valves[self.DP_ID].dp
+        tagged = dp.vlans[vid].port_is_tagged(dp.ports[port])
+        request = self.arp_request(port, vid if tagged else 0, sender_ip, faucet_vip)
+        reply = {
+            "in_port": port,
+            "vlan_vid": vid | ofp.OFPVID_PRESENT if tagged else 0,
+            "eth_src": faucet_mac,
+            "eth_dst": self.HOST_MAC,
+            "eth_type": 0x806,
+            "arp_op": arp.ARP_REPLY,
+            "arp_sha": faucet_mac,
+            "arp_spa": faucet_vip,
+            "arp_tha": self.HOST_MAC,
+            "arp_tpa": sender_ip,
+        }
+        self.assertEqual(
+            {
+                CONTROLLER_PORT: [dict(request, vlan_vid=vid | ofp.OFPVID_PRESENT)],
+                IN_PORT: [reply],
+            },
+            self.outputs(request),
+        )
+
+    def assert_all_answered(self, office_sender_ip="10.0.0.1"):
+        """Assert the switch answers for each VIP on each port of its VLAN."""
+        for port, vid, sender_ip, faucet_vip, faucet_mac in (
+            (1, 0x100, office_sender_ip, "10.0.0.254", FAUCET_MAC),
+            (2, 0x100, office_sender_ip, "10.0.0.254", FAUCET_MAC),
+            (3, 0x100, office_sender_ip, "10.0.0.254", FAUCET_MAC),
+            (3, 0x200, "10.2.0.1", "10.2.0.254", self.GUEST_MAC),
+            (4, 0x200, "10.2.0.1", "10.2.0.254", self.GUEST_MAC),
+        ):
+            with self.subTest(port=port, vid=vid):
+                self.assert_answered(port, vid, sender_ip, faucet_vip, faucet_mac)
+
+    def assert_not_answered(self, request):
+        """Assert the switch does not answer a packet itself."""
+        self.assertNotIn(IN_PORT, self.outputs(request))
+
+    def warm_start(self, config):
+        """Warm start to config, and return what is sent to the switch."""
+        return self.update_config(config, reload_type="warm")[self.DP_ID]
+
+    def assert_cold_start_same(self, config):
+        """Assert the switch has what a cold start of config installs."""
+        warm = self.flows()
+        self.restart(config)
+        self.assertEqual(self.flows(), warm)
+
+
+class ValveARPResponderTestCase(ValveARPResponderTestBase):
+    """Test the switch answers ARP for FAUCET VIPs."""
+
+    def test_answered(self):
+        """Test a request for a VIP is answered out the port it came in on,
+        tagged as it came in, though no port has hairpin set."""
+        dp = self.valves_manager.valves[self.DP_ID].dp
+        self.assertNotIn("eth_dst_hairpin", dp.tables)
+        self.assert_all_answered()
+        # A request sent to FAUCET's MAC, as a host checking its entry sends.
+        request = self.arp_request(1, 0, "10.0.0.1", "10.0.0.254")
+        request["eth_dst"] = FAUCET_MAC
+        self.assertEqual(
+            "00:00:00:01:00:01", self.outputs(request)[IN_PORT][0]["eth_dst"]
+        )
+        # The reply goes to the request's Ethernet source, and answers its
+        # sender hardware address, where the two differ.
+        request = self.arp_request(1, 0, "10.0.0.1", "10.0.0.254")
+        request["arp_sha"] = "00:00:00:01:00:02"
+        reply = self.outputs(request)[IN_PORT][0]
+        self.assertEqual(self.HOST_MAC, reply["eth_dst"])
+        self.assertEqual("00:00:00:01:00:02", reply["arp_tha"])
+
+    def test_not_answered(self):
+        """Test the switch leaves a request it cannot answer as it does today."""
+        for port, vid, sender_ip, target_ip, opcode in (
+            # For another host.
+            (1, 0, "10.0.0.1", "10.0.0.2", arp.ARP_REQUEST),
+            # For the VIP of another VLAN, from either VLAN's subnet.
+            (1, 0, "10.0.0.1", "10.2.0.254", arp.ARP_REQUEST),
+            (3, 0x200, "10.2.0.1", "10.0.0.254", arp.ARP_REQUEST),
+            (3, 0x200, "10.0.0.1", "10.0.0.254", arp.ARP_REQUEST),
+            (4, 0, "10.0.0.1", "10.0.0.254", arp.ARP_REQUEST),
+            # From outside the VIP's subnet.
+            (1, 0, "10.2.0.1", "10.0.0.254", arp.ARP_REQUEST),
+            (3, 0x100, "192.0.2.1", "10.0.0.254", arp.ARP_REQUEST),
+            # On a VLAN with no VIP.
+            (5, 0, "10.0.0.1", "10.0.0.254", arp.ARP_REQUEST),
+            # A reply.
+            (1, 0, "10.0.0.1", "10.0.0.254", arp.ARP_REPLY),
+        ):
+            with self.subTest(port=port, sender_ip=sender_ip, target_ip=target_ip):
+                self.assert_not_answered(
+                    self.arp_request(port, vid, sender_ip, target_ip, opcode)
+                )
+        # The controller still gets a request for the VIP from outside the
+        # subnet, and does not answer it either.
+        request = self.arp_request(1, 0, "10.2.0.1", "10.0.0.254")
+        self.assertIn(CONTROLLER_PORT, self.outputs(request))
+
+    def test_controller_copy(self):
+        """Test the controller gets the request with the DP's cookie, so that it
+        still learns the host from it, and answers it too."""
+        valve = self.valves_manager.valves[self.DP_ID]
+        self.assertTrue(valve.dp.strict_packet_in_cookie)
+        flows = self.responder_flows()
+        self.assertEqual(5, len(flows))
+        for flow in flows:
+            self.assertEqual(valve.dp.cookie, flow.cookie)
+            actions = flow.instructions[0].actions
+            self.assertEqual(CONTROLLER_PORT, actions[0].port)
+            self.assertEqual(valve_packet.VLAN_ARP_PKT_SIZE, actions[0].max_len)
+        # The controller's own answer, and the host route it learns.
+        ofmsgs = self.rcv_packet(
+            1,
+            0x100,
+            {
+                "eth_src": self.HOST_MAC,
+                "eth_dst": self.BROADCAST_MAC,
+                "arp_code": arp.ARP_REQUEST,
+                "arp_source_ip": "10.0.0.1",
+                "arp_target_ip": "10.0.0.254",
+            },
+        )[self.DP_ID]
+        self.assertTrue(ValveTestBases.packet_outs_from_flows(ofmsgs))
+        self.assertTrue(
+            valve.dp.vlans[0x100].neigh_cache_by_ipv(4).get(ip_address("10.0.0.1"))
+        )
+
+    def test_serialize(self):
+        """Test the switch is sent flows OpenFlow 1.3 can encode."""
+        responders = [
+            ofmsg
+            for ofmsg in self.cold_start()
+            if valve_of.is_flowaddmod(ofmsg) and self.is_responder(ofmsg)
+        ]
+        self.assertEqual(5, len(responders))
+        for ofmsg in responders:
+            valve_of.verify_flowmod(ofmsg)
+
+    def test_off(self):
+        """Test the ARP responder is off by default, and off installs only
+        what it installed before there was one."""
+        with_responder = self.flows(responder=False)
+        self.restart(self.config(arp_responder=False))
+        dp = self.valves_manager.valves[self.DP_ID].dp
+        self.assertFalse(dp.arp_responder)
+        self.assertEqual(
+            str(faucet_pipeline.VIP_DEFAULT_CONFIG.match_types),
+            str(dp.tables["vip"].table_config.match_types),
+        )
+        self.assertIsNone(dp.tables["vip"].table_config.set_fields)
+        self.assertEqual([], self.responder_flows())
+        self.assertEqual(with_responder, self.flows())
+        self.assert_not_answered(self.arp_request(1, 0, "10.0.0.1", "10.0.0.254"))
+
+    def test_port_down(self):
+        """Test a port that goes down loses its own flows, even if its VLAN
+        changes while it is down, and gets them back when it comes up."""
+        self.assertTrue(self.responder_matches(in_port=1))
+        self.set_port_down(1)
+        self.assertEqual([], self.responder_matches(in_port=1))
+        self.assertTrue(self.responder_matches(in_port=2))
+        self.update_config(
+            self.config(vlans={"office": {"max_hosts": 2}}), reload_type="warm"
+        )
+        self.assertEqual([], self.responder_matches(in_port=1))
+        self.assertTrue(self.responder_matches(in_port=2))
+        self.set_port_up(1)
+        self.assert_all_answered()
+
+    def test_point_to_point(self):
+        """Test a /31 VIP gets no flow, so the far end of a point-to-point
+        link is left to the controller as without the option, while a /30
+        and a /24 VIP on the same VLAN are still answered."""
+        vips = [
+            "10.0.0.254/24",
+            "fc00::254/64",
+            "10.1.0.0/31",
+            "10.1.0.3/31",
+            "10.1.0.5/30",
+        ]
+        handled = {}
+        for arp_responder in (False, True):
+            self.restart(
+                self.config(
+                    vlans={"office": {"faucet_vips": vips}},
+                    arp_responder=arp_responder,
+                )
+            )
+            handled[arp_responder] = []
+            for port, vid in ((1, 0), (3, 0x100)):
+                for sender_ip, faucet_vip in (
+                    ("10.1.0.1", "10.1.0.0"),
+                    ("10.1.0.2", "10.1.0.3"),
+                ):
+                    outputs = self.outputs(
+                        self.arp_request(port, vid, sender_ip, faucet_vip)
+                    )
+                    ofmsgs = self.rcv_packet(
+                        port,
+                        0x100,
+                        {
+                            "eth_src": self.HOST_MAC,
+                            "eth_dst": self.BROADCAST_MAC,
+                            "arp_code": arp.ARP_REQUEST,
+                            "arp_source_ip": sender_ip,
+                            "arp_target_ip": faucet_vip,
+                        },
+                    )[self.DP_ID]
+                    handled[arp_responder].append(
+                        (outputs, [str(ofmsg) for ofmsg in ofmsgs])
+                    )
+                    # FAUCET answers neither address of a /31 itself.
+                    self.assertEqual([CONTROLLER_PORT], list(outputs))
+                    self.assertFalse(ValveTestBases.packet_outs_from_flows(ofmsgs))
+        self.assertEqual(handled[False], handled[True])
+        self.assertEqual([], self.responder_matches(arp_tpa="10.1.0.0"))
+        self.assertEqual([], self.responder_matches(arp_tpa="10.1.0.3"))
+        self.assertEqual(8, len(self.responder_flows()))
+        for port in (1, 2, 3):
+            with self.subTest(port=port):
+                self.assert_answered(port, 0x100, "10.1.0.6", "10.1.0.5", FAUCET_MAC)
+                self.assert_answered(port, 0x100, "10.0.0.1", "10.0.0.254", FAUCET_MAC)
+
+    def test_host_vip(self):
+        """Test a /32 VIP would get no flow either, were the config, which
+        refuses one, to let it through."""
+        valve = self.valves_manager.valves[self.DP_ID]
+        # pylint: disable=protected-access
+        route_manager = valve._route_manager_by_ipv[4]
+        for vip, flows in (("10.1.0.1/30", 3), ("10.1.0.1/32", 0)):
+            with self.subTest(vip=vip):
+                faucet_vip = ipaddress.ip_interface(vip)
+                ofmsgs = route_manager._add_faucet_vip_nd(
+                    valve.dp.vlans[0x100],
+                    route_manager.route_priority + 32,
+                    faucet_vip,
+                    route_manager._host_from_faucet_vip(faucet_vip),
+                )
+                self.assertEqual(
+                    flows, len([ofmsg for ofmsg in ofmsgs if self.is_responder(ofmsg)])
+                )
+
+
+class ValveARPResponderTFMTestCase(ValveARPResponderTestCase):
+    """Test the switch answers ARP for FAUCET VIPs with a TFM pipeline."""
+
+    REQUIRE_TFM = True
+    HARDWARE = "Open vSwitch TFM"
+
+
+class ValveARPResponderReloadTestCase(ValveARPResponderTestBase):
+    """Test warm starts keep the ARP responder flows right."""
+
+    def test_change_other_vlan(self):
+        """Test changing a VLAN leaves the flows of the others alone."""
+        config = self.config(vlans={"lab": {"max_hosts": 2}})
+        reload_ofmsgs = self.warm_start(config)
+        vip_table = self.valves_manager.valves[self.DP_ID].dp.tables["vip"]
+        self.assertEqual(
+            [],
+            [
+                ofmsg
+                for ofmsg in reload_ofmsgs
+                if valve_of.is_flowmod(ofmsg) and ofmsg.table_id == vip_table.table_id
+            ],
+        )
+        self.assert_all_answered()
+        self.assert_cold_start_same(config)
+
+    def test_change_vlan(self):
+        """Test changing a VLAN keeps the flows of the ports it is untagged on."""
+        for vlans, sender_ip in (
+            ({"office": {"max_hosts": 2}}, "10.0.0.1"),
+            # A wider subnet answers more hosts.
+            (
+                {"office": {"faucet_vips": ["10.0.0.254/23", "fc00::254/64"]}},
+                "10.0.1.1",
+            ),
+        ):
+            with self.subTest(vlans=vlans):
+                self.restart(self.config())
+                config = self.config(vlans=vlans)
+                self.warm_start(config)
+                self.assert_all_answered(office_sender_ip=sender_ip)
+                self.assert_cold_start_same(config)
+
+    def test_change_vip(self):
+        """Test changing a VIP answers for the new one, and not the old one."""
+        config = self.config(
+            vlans={"office": {"faucet_vips": ["10.0.0.1/24", "fc00::254/64"]}}
+        )
+        self.warm_start(config)
+        self.assert_not_answered(self.arp_request(1, 0, "10.0.0.2", "10.0.0.254"))
+        self.assert_answered(1, 0x100, "10.0.0.2", "10.0.0.1", FAUCET_MAC)
+        self.assert_cold_start_same(config)
+
+    def test_change_vip_to_point_to_point(self):
+        """Test narrowing a VIP's subnet to a /31 deletes its flows, and
+        widening it again adds them back."""
+        config = self.config(
+            vlans={"office": {"faucet_vips": ["10.0.0.254/31", "fc00::254/64"]}}
+        )
+        self.warm_start(config)
+        self.assertEqual(
+            [], self.responder_matches(vlan_vid=0x100 | ofp.OFPVID_PRESENT)
+        )
+        for port, vid in ((1, 0), (3, 0x100)):
+            with self.subTest(port=port):
+                self.assert_not_answered(
+                    self.arp_request(port, vid, "10.0.0.255", "10.0.0.254")
+                )
+        for port in (3, 4):
+            with self.subTest(port=port):
+                self.assert_answered(
+                    port, 0x200, "10.2.0.1", "10.2.0.254", self.GUEST_MAC
+                )
+        self.assert_cold_start_same(config)
+        self.warm_start(self.config())
+        self.assert_all_answered()
+        self.assert_cold_start_same(self.config())
+
+    def test_delete_vlan(self):
+        """Test deleting a VLAN deletes its flows, and its ports' flows, but
+        not those of another VLAN with the same VIP."""
+        config = self.config(
+            vlans={"guest": None},
+            interfaces={3: {"tagged_vlans": ["office"]}, 4: {"native_vlan": "lab"}},
+        )
+        for guest_vips, port3_vlans in (
+            (["10.2.0.254/24"], ["office", "guest"]),
+            # No port of office is on guest, so nothing adds office's flows
+            # back should deleting guest delete them.
+            (["10.0.0.254/24"], ["office"]),
+        ):
+            with self.subTest(guest_vips=guest_vips):
+                self.restart(
+                    self.config(
+                        vlans={"guest": {"faucet_vips": guest_vips}},
+                        interfaces={3: {"tagged_vlans": port3_vlans}},
+                    )
+                )
+                self.warm_start(config)
+                self.assertEqual(
+                    [], self.responder_matches(vlan_vid=0x200 | ofp.OFPVID_PRESENT)
+                )
+                self.assertEqual([], self.responder_matches(in_port=4))
+                self.assertEqual(3, len(self.responder_flows()))
+                for port in (1, 2, 3):
+                    self.assert_answered(
+                        port, 0x100, "10.0.0.1", "10.0.0.254", FAUCET_MAC
+                    )
+                self.assert_cold_start_same(config)
+
+    def test_toggle(self):
+        """Test turning the option off or on cold starts the datapath."""
+        self.update_config(self.config(arp_responder=False), reload_type="cold")
+        self.assertEqual([], self.responder_flows())
+        self.update_config(self.config(), reload_type="cold")
+        self.assert_all_answered()
+
+    def test_move_port(self):
+        """Test moving a port between VLANs keeps the flows of the ports that
+        stay: both VLANs are deleted and added, but not their other ports."""
+        config = self.config(interfaces={2: {"native_vlan": "guest"}})
+        self.warm_start(config)
+        self.assertEqual(
+            [],
+            self.responder_matches(in_port=2, vlan_vid=0x100 | ofp.OFPVID_PRESENT),
+        )
+        for port, vid, sender_ip, faucet_vip, faucet_mac in (
+            (1, 0x100, "10.0.0.1", "10.0.0.254", FAUCET_MAC),
+            (2, 0x200, "10.2.0.1", "10.2.0.254", self.GUEST_MAC),
+            (4, 0x200, "10.2.0.1", "10.2.0.254", self.GUEST_MAC),
+        ):
+            with self.subTest(port=port):
+                self.assert_answered(port, vid, sender_ip, faucet_vip, faucet_mac)
+        self.assert_cold_start_same(config)
+
+    def test_add_port(self):
+        """Test a port added to a VLAN answers untagged once it is up."""
+        config = self.config(interfaces={6: {"native_vlan": "office"}})
+        self.warm_start(config)
+        self.assertEqual([], self.responder_matches(in_port=6))
+        self.set_port_up(6)
+        self.assert_answered(6, 0x100, "10.0.0.1", "10.0.0.254", FAUCET_MAC)
 
 
 if __name__ == "__main__":
