@@ -18,13 +18,14 @@
 # limitations under the License.
 
 from collections import namedtuple
+from ipaddress import ip_address, ip_network
 
 import copy
 import time
 import unittest
 
 from os_ken.lib import mac
-from os_ken.lib.packet import slow
+from os_ken.lib.packet import arp, icmpv6, slow
 from os_ken.ofproto import ether
 from os_ken.ofproto import ofproto_v1_3 as ofp
 from os_ken.ofproto import ofproto_v1_3_parser as parser
@@ -790,6 +791,355 @@ class ValveL2LearnTestCase(ValveTestBases.ValveTestNetwork):
         self.assertEqual(2.0, self.get_prom("learned_l2_port", labels=learn_labels))
         self.verify_expiry()
         self.assertEqual(0, self.get_prom("learned_l2_port", labels=learn_labels))
+
+
+class ValveGatewayExpiryTestCase(ValveTestBases.ValveTestNetwork):
+    """Test addresses no route uses are resolved only until they are dead."""
+
+    CONFIG = (
+        """
+dps:
+    s1:
+%s
+        interfaces:
+            p1:
+                number: 1
+                native_vlan: v100
+            p2:
+                number: 2
+                native_vlan: v100
+            p3:
+                number: 3
+                tagged_vlans: [v100]
+vlans:
+    v100:
+        vid: 0x100
+        faucet_vips: ["10.0.0.254/24", "fc00::1:254/112"]
+        routes:
+            - route:
+                ip_dst: "10.99.0.0/24"
+                ip_gw: "10.0.0.99"
+            - route:
+                ip_dst: "fc00::99:0/112"
+                ip_gw: "fc00::1:99"
+"""
+        % DP1_CONFIG
+    )
+
+    HOST_MAC = "00:00:00:01:00:01"
+    HOST_IPS = {4: "10.0.0.1", 6: "fc00::1:1"}
+    VIPS = {4: "10.0.0.254", 6: "fc00::1:254"}
+    # The gateway of the configured routes, and one for a route added later.
+    STATIC_GWS = {4: "10.0.0.99", 6: "fc00::1:99"}
+    OTHER_GWS = {4: "10.0.0.98", 6: "fc00::1:98"}
+    ADDED_DSTS = {4: "10.98.0.0/24", 6: "fc00::98:0/112"}
+    TRUNK_PORT = 3
+
+    def setUp(self):
+        """Setup a routed VLAN with a static route."""
+        self.setup_valves(self.CONFIG)
+
+    def _valve(self):
+        """Return the valve."""
+        return self.valves_manager.valves[self.DP_ID]
+
+    def _vlan(self):
+        """Return the routed VLAN."""
+        return self._valve().dp.vlans[0x100]
+
+    @staticmethod
+    def _requested(ofmsgs):
+        """Return the IP addresses ofmsgs send an ARP request or an NS for."""
+        requested = set()
+        for pkt_out in ValveTestBases.packet_outs_from_flows(ofmsgs):
+            pkt = valve_packet.parse_packet_in_pkt(bytes(pkt_out.data), None)[0]
+            arp_pkt = pkt.get_protocol(arp.arp)
+            if arp_pkt and arp_pkt.opcode == arp.ARP_REQUEST:
+                requested.add(ip_address(arp_pkt.dst_ip))
+            icmpv6_pkt = pkt.get_protocol(icmpv6.icmpv6)
+            if icmpv6_pkt and icmpv6_pkt.type_ == icmpv6.ND_NEIGHBOR_SOLICIT:
+                requested.add(ip_address(icmpv6_pkt.data.dst))
+        return requested
+
+    def _resolvers(self, cycles, secs=None):
+        """Run faucet's resolvers every secs, with nothing answering, and
+        return the IP addresses each run requests. By default every entry
+        is due on every run."""
+        valve = self._valve()
+        if secs is None:
+            secs = valve.dp.max_resolve_backoff_time * 2
+        requested = []
+        for _ in range(cycles):
+            now = self.mock_time(secs)
+            ofmsgs = valve.resolve_gateways(now, None).get(valve, [])
+            ofmsgs.extend(valve.state_expire(now, None).get(valve, []))
+            self.apply_ofmsgs(ofmsgs)
+            requested.append(self._requested(ofmsgs))
+        return requested
+
+    def _learn_host(self, ipv, port=1):
+        """Have the host request a VIP, so faucet routes it."""
+        host_ip = self.HOST_IPS[ipv]
+        vip = ip_address(self.VIPS[ipv])
+        match = {"eth_src": self.HOST_MAC}
+        if ipv == 4:
+            match.update(
+                {
+                    "eth_dst": mac.BROADCAST_STR,
+                    "arp_code": arp.ARP_REQUEST,
+                    "arp_source_ip": host_ip,
+                    "arp_target_ip": str(vip),
+                }
+            )
+        else:
+            match.update(
+                {
+                    "eth_dst": valve_packet.ipv6_link_eth_mcast(vip),
+                    "ipv6_src": host_ip,
+                    "ipv6_dst": str(valve_packet.ipv6_solicited_node_from_ucast(vip)),
+                    "neighbor_solicit_ip": str(vip),
+                }
+            )
+        self.rcv_packet(port, 0x100, match)
+        self.assertIn(ip_network(host_ip), self._vlan().routes_by_ipv(ipv))
+
+    def _reply(self, ipv, port):
+        """Have the host answer faucet's request, by ARP or by ND."""
+        host_ip = self.HOST_IPS[ipv]
+        match = {"eth_src": self.HOST_MAC, "eth_dst": self._vlan().faucet_mac}
+        if ipv == 4:
+            match.update(
+                {
+                    "arp_code": arp.ARP_REPLY,
+                    "arp_source_ip": host_ip,
+                    "arp_target_ip": self.VIPS[ipv],
+                }
+            )
+        else:
+            match.update(
+                {
+                    "ipv6_src": host_ip,
+                    "ipv6_dst": self.VIPS[ipv],
+                    "neighbor_advert_ip": host_ip,
+                }
+            )
+        self.rcv_packet(port, 0x100, match)
+
+    def _trunk_down(self, secs):
+        """Take the trunk down for secs, running the resolvers every 2s as
+        faucet does, and return the IP addresses each run requests."""
+        self.set_port_down(self.TRUNK_PORT)
+        return self._resolvers(secs // 2, secs=2)
+
+    def _resolve_until_dead(self, ipv, ip_gw):
+        """Run the resolvers until an address is dead, and return how many
+        runs requested it. Assert it is neither requested nor a neighbour after."""
+        retries = self._valve().dp.max_host_fib_retry_count
+        requested = self._resolvers(retries + 2)
+        self.assertNotIn(ip_network(ip_gw), self._vlan().routes_by_ipv(ipv))
+        after = self._resolvers(retries + 2)
+        self.assertFalse([run for run in after if ip_gw in run])
+        self.assertNotIn(ip_gw, self._vlan().neigh_cache_by_ipv(ipv))
+        return len([run for run in requested if ip_gw in run])
+
+    def _test_dead_host(self, ipv):
+        """Test a host that stops replying is not resolved once it is dead,
+        also once its port flaps."""
+        host_ip = ip_address(self.HOST_IPS[ipv])
+        retries = self._valve().dp.max_host_fib_retry_count
+        self._learn_host(ipv)
+        self.assertEqual(retries, self._resolve_until_dead(ipv, host_ip))
+        # vlan_neighbors counts only the static route's gateway.
+        self.valves_manager.update_metrics(self.mock_time(0))
+        labels = {"vlan": str(0x100), "ipv": str(ipv)}
+        self.assertEqual(1, self.get_prom("vlan_neighbors", labels=labels))
+        # It was expired as dead, not with its port, so its port coming up
+        # again does not request it again.
+        self.set_port_down(1)
+        self.set_port_up(1)
+        after_flap = self._resolvers(retries + 2)
+        self.assertFalse([run for run in after_flap if host_ip in run])
+        self.assertNotIn(host_ip, self._vlan().neigh_cache_by_ipv(ipv))
+
+    def _test_port_down_host(self, ipv):
+        """Test a host whose route was expired with its port is still resolved,
+        until it is dead."""
+        self._learn_host(ipv)
+        self.set_port_down(1)
+        self.set_port_up(1)
+        self.assertNotIn(
+            ip_network(self.HOST_IPS[ipv]), self._vlan().routes_by_ipv(ipv)
+        )
+        self.assertEqual(
+            self._valve().dp.max_host_fib_retry_count,
+            self._resolve_until_dead(ipv, ip_address(self.HOST_IPS[ipv])),
+        )
+
+    def _test_deleted_route_gw(self, ipv):
+        """Test a gateway whose last route is deleted is still resolved,
+        until it is dead."""
+        valve = self._valve()
+        ip_gw = ip_address(self.OTHER_GWS[ipv])
+        ip_dst = ip_network(self.ADDED_DSTS[ipv])
+        self.apply_ofmsgs(valve.add_route(self._vlan(), ip_gw, ip_dst))
+        self.apply_ofmsgs(valve.del_route(self._vlan(), ip_dst))
+        self.assertEqual(
+            valve.dp.max_host_fib_retry_count,
+            self._resolve_until_dead(ipv, ip_gw),
+        )
+
+    def _test_static_route_gw(self, ipv):
+        """Test a gateway a route uses is resolved however long it is silent,
+        also once another route through it is deleted."""
+        valve = self._valve()
+        ip_gw = ip_address(self.STATIC_GWS[ipv])
+        ip_dst = ip_network(self.ADDED_DSTS[ipv])
+        retries = valve.dp.max_host_fib_retry_count
+        self.apply_ofmsgs(valve.add_route(self._vlan(), ip_gw, ip_dst))
+        requested = self._resolvers(retries + 2)
+        self.apply_ofmsgs(valve.del_route(self._vlan(), ip_dst))
+        requested.extend(self._resolvers(retries + 2))
+        self.assertTrue(all(ip_gw in run for run in requested[-retries:]))
+        self.assertIn(ip_gw, self._vlan().neigh_cache_by_ipv(ipv))
+
+    def _test_port_outage(self, ipv, secs):
+        """Test a host on a trunk down for longer than it is resolved is
+        resolved again once the trunk is up, and learned when it answers."""
+        host_ip = ip_address(self.HOST_IPS[ipv])
+        retries = self._valve().dp.max_host_fib_retry_count
+        self._learn_host(ipv, port=self.TRUNK_PORT)
+        down = self._trunk_down(secs)
+        self.assertEqual(retries, len([run for run in down if host_ip in run]))
+        self.assertNotIn(host_ip, self._vlan().neigh_cache_by_ipv(ipv))
+        self.set_port_up(self.TRUNK_PORT)
+        after_up = self._resolvers(2, secs=2)
+        self.assertIn(host_ip, after_up[-1])
+        self._reply(ipv, self.TRUNK_PORT)
+        entry = self._vlan().neigh_cache_by_ipv(ipv)[host_ip]
+        self.assertEqual(self.HOST_MAC, entry.eth_src)
+        if ipv == 6:
+            # An advert routes the host again; an ARP reply is only cached.
+            self.assertIn(ip_network(host_ip), self._vlan().routes_by_ipv(ipv))
+
+    def _test_port_outage_silent_host(self, ipv):
+        """Test a host that does not answer once its trunk is up again is
+        requested as often as any other, and then no more."""
+        host_ip = ip_address(self.HOST_IPS[ipv])
+        self._learn_host(ipv, port=self.TRUNK_PORT)
+        # Long enough to use up most of the host's requests, but not all.
+        self._trunk_down(300)
+        self.set_port_up(self.TRUNK_PORT)
+        self.assertEqual(
+            self._valve().dp.max_host_fib_retry_count,
+            self._resolve_until_dead(ipv, host_ip),
+        )
+
+    def _test_port_outage_moved_host(self, ipv):
+        """Test a host that answers on another port while its trunk is down
+        keeps what was learned there once the trunk is up."""
+        host_ip = ip_address(self.HOST_IPS[ipv])
+        self._learn_host(ipv, port=self.TRUNK_PORT)
+        down = self._trunk_down(4)
+        self.assertIn(host_ip, down[-1])
+        self._reply(ipv, 1)
+        self.set_port_up(self.TRUNK_PORT)
+        nexthop_cache = self._vlan().neigh_cache_by_ipv(ipv)
+        self.assertIn(host_ip, nexthop_cache)
+        self.assertEqual(self.HOST_MAC, nexthop_cache[host_ip].eth_src)
+        self.assertEqual(1, nexthop_cache[host_ip].port.number)
+        if ipv == 6:
+            self.assertIn(ip_network(host_ip), self._vlan().routes_by_ipv(ipv))
+
+    def _test_port_flaps_silent_host(self, ipv):
+        """Test a trunk that goes down again and again resolves a host that
+        never answers again only the first time it is up."""
+        host_ip = ip_address(self.HOST_IPS[ipv])
+        retries = self._valve().dp.max_host_fib_retry_count
+        self._learn_host(ipv, port=self.TRUNK_PORT)
+        requested = []
+        for secs in (600, 10, 10, 1800):
+            requested.extend(self._trunk_down(secs))
+            self.set_port_up(self.TRUNK_PORT)
+            requested.extend(self._resolvers(15, secs=2))
+        requested.extend(self._resolvers(retries + 2))
+        self.assertEqual(2 * retries, len([run for run in requested if host_ip in run]))
+        self.assertNotIn(host_ip, self._vlan().neigh_cache_by_ipv(ipv))
+
+    def test_dead_host_ipv4(self):
+        """Test an IPv4 host that stops replying is not resolved once dead."""
+        self._test_dead_host(4)
+
+    def test_dead_host_ipv6(self):
+        """Test an IPv6 host that stops replying is not resolved once dead."""
+        self._test_dead_host(6)
+
+    def test_port_down_host_ipv4(self):
+        """Test an IPv4 host expired with its port is resolved until dead."""
+        self._test_port_down_host(4)
+
+    def test_port_down_host_ipv6(self):
+        """Test an IPv6 host expired with its port is resolved until dead."""
+        self._test_port_down_host(6)
+
+    def test_deleted_route_gw_ipv4(self):
+        """Test an IPv4 gateway with no routes left is resolved until dead."""
+        self._test_deleted_route_gw(4)
+
+    def test_deleted_route_gw_ipv6(self):
+        """Test an IPv6 gateway with no routes left is resolved until dead."""
+        self._test_deleted_route_gw(6)
+
+    def test_static_route_gw_ipv4(self):
+        """Test an IPv4 gateway a route uses is always resolved."""
+        self._test_static_route_gw(4)
+
+    def test_static_route_gw_ipv6(self):
+        """Test an IPv6 gateway a route uses is always resolved."""
+        self._test_static_route_gw(6)
+
+    def test_port_outage_10m_ipv4(self):
+        """Test an IPv4 host is resolved again after a 10 minute outage."""
+        self._test_port_outage(4, 600)
+
+    def test_port_outage_10m_ipv6(self):
+        """Test an IPv6 host is resolved again after a 10 minute outage."""
+        self._test_port_outage(6, 600)
+
+    def test_port_outage_30m_ipv4(self):
+        """Test an IPv4 host is resolved again after a 30 minute outage."""
+        self._test_port_outage(4, 1800)
+
+    def test_port_outage_30m_ipv6(self):
+        """Test an IPv6 host is resolved again after a 30 minute outage."""
+        self._test_port_outage(6, 1800)
+
+    def test_port_outage_silent_host_ipv4(self):
+        """Test a silent IPv4 host is resolved until dead after an outage."""
+        self._test_port_outage_silent_host(4)
+
+    def test_port_outage_silent_host_ipv6(self):
+        """Test a silent IPv6 host is resolved until dead after an outage."""
+        self._test_port_outage_silent_host(6)
+
+    def test_port_outage_moved_host_ipv4(self):
+        """Test an IPv4 host that answers on another port during an outage
+        keeps its entry."""
+        self._test_port_outage_moved_host(4)
+
+    def test_port_outage_moved_host_ipv6(self):
+        """Test an IPv6 host that answers on another port during an outage
+        keeps its entry and its route."""
+        self._test_port_outage_moved_host(6)
+
+    def test_port_flaps_silent_host_ipv4(self):
+        """Test a silent IPv4 host is resolved again once, however often
+        its port flaps."""
+        self._test_port_flaps_silent_host(4)
+
+    def test_port_flaps_silent_host_ipv6(self):
+        """Test a silent IPv6 host is resolved again once, however often
+        its port flaps."""
+        self._test_port_flaps_silent_host(6)
 
 
 class SoftPipelineTestCase(ValveTestBases.ValveTestNetwork):
