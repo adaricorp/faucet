@@ -184,6 +184,7 @@ class VLAN(Conf):
         self.dyn_gws_by_ipv = collections.defaultdict(dict)
         self.dyn_host_gws_by_ipv = collections.defaultdict(set)
         self.dyn_route_gws_by_ipv = collections.defaultdict(set)
+        self.dyn_port_expired_gws_by_ipv = collections.defaultdict(dict)
         self.reset_caches()
         super().__init__(_id, dp_id, conf)
 
@@ -489,6 +490,25 @@ class VLAN(Conf):
         if not self.dyn_gws_by_ipv[ip_gw.version][ip_gw]:
             del self.dyn_gws_by_ipv[ip_gw.version][ip_gw]
         self._update_gw_types(ip_gw)
+
+    def del_route_gw(self, ip_gw):
+        """Stop resolving an IP gateway, if no route uses it."""
+        if ip_gw not in self.dyn_gws_by_ipv[ip_gw.version]:
+            self.dyn_route_gws_by_ipv[ip_gw.version] -= set([ip_gw])
+
+    def add_route_gw(self, ip_gw):
+        """Resolve an IP gateway again, if no route uses it."""
+        if ip_gw not in self.dyn_gws_by_ipv[ip_gw.version]:
+            self.dyn_route_gws_by_ipv[ip_gw.version].add(ip_gw)
+
+    def add_port_expired_gw(self, port, ip_gw):
+        """Note an IP gateway was expired with its port."""
+        port_gws = self.dyn_port_expired_gws_by_ipv[ip_gw.version]
+        port_gws.setdefault(port.number, set()).add(ip_gw)
+
+    def pop_port_expired_gws(self, port, ipv):
+        """Return, and forget, the IP gateways expired with a port."""
+        return self.dyn_port_expired_gws_by_ipv[ipv].pop(port.number, set())
 
     def ip_dsts_for_ip_gw(self, ip_gw):
         """Return list of IP destinations, for specified gateway."""
