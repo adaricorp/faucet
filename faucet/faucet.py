@@ -374,7 +374,7 @@ class Faucet(OSKenAppBase):
 
     @set_ev_cls(
         ofp_event.EventOFPPortDescStatsReply,  # pylint: disable=no-member
-        CONFIG_DISPATCHER,
+        [CONFIG_DISPATCHER, MAIN_DISPATCHER],
     )
     @kill_on_exception(exc_logname)
     def port_desc_stats_reply_handler(self, ryu_event):
