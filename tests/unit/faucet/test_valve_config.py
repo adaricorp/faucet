@@ -6721,6 +6721,64 @@ class ValveARPResponderReloadTestCase(ValveARPResponderTestBase):
         self.set_port_up(6)
         self.assert_answered(6, 0x100, "10.0.0.1", "10.0.0.254", FAUCET_MAC)
 
+    def config_port_acl(self, interfaces=None):
+        """Return the config, with interfaces updated, and an ACL on port 1."""
+        config = config_parser_util.yaml_load(self.config(interfaces=interfaces))
+        config["acls"] = {"allow": [{"rule": {"actions": {"allow": 1}}}]}
+        config["dps"]["s1"]["interfaces"][1]["acls_in"] = ["allow"]
+        return config_parser_util.yaml_dump(config)
+
+    def replay_warm_start(self, config, port):
+        """Warm start to config, and return what the switch does with an
+        untagged request on port for office's VIP after each message it is
+        sent, as the switch applies them one at a time while packets arrive."""
+        switch = copy.deepcopy(self.network.tables[self.DP_ID])
+        request = self.arp_request(port, 0, "10.0.0.1", "10.0.0.254")
+        replies = []
+        for ofmsg in self.warm_start(config):
+            switch.apply_ofmsgs([ofmsg])
+            replies.append((str(ofmsg), switch.get_port_outputs(request).get(IN_PORT)))
+        return replies
+
+    def assert_never_tagged(self, replies):
+        """Assert no reply to an untagged request went back tagged."""
+        for ofmsg, outputs in replies:
+            for reply in outputs or []:
+                self.assertEqual(0, reply["vlan_vid"], "tagged after %s" % ofmsg)
+
+    def test_reinstall_port(self):
+        """Test a warm start that re-installs a port untagged on a VLAN never
+        answers an untagged request tagged, nor leaves it unanswered, while
+        the switch applies the change: the port's own flow is replaced in
+        place rather than deleted and added back."""
+        for interfaces in (
+            {1: {"tagged_vlans": ["guest"]}},
+            {1: {"tagged_vlans": []}},
+        ):
+            with self.subTest(interfaces=interfaces):
+                replies = self.replay_warm_start(self.config(interfaces=interfaces), 1)
+                self.assert_never_tagged(replies)
+                self.assertEqual(
+                    [], [ofmsg for ofmsg, outputs in replies if not outputs]
+                )
+                self.assert_all_answered()
+                self.assert_cold_start_same(self.config(interfaces=interfaces))
+
+    def test_reinstall_port_with_acl(self):
+        """Test the same with a port ACL, which a warm start deletes and adds
+        back last, so the port is cut for a time: its requests then go
+        unanswered, but never answered tagged."""
+        self.restart(self.config_port_acl())
+        for interfaces in (
+            {1: {"tagged_vlans": ["guest"]}},
+            {1: {"tagged_vlans": []}},
+        ):
+            with self.subTest(interfaces=interfaces):
+                config = self.config_port_acl(interfaces=interfaces)
+                self.assert_never_tagged(self.replay_warm_start(config, 1))
+                self.assert_all_answered()
+                self.assert_cold_start_same(config)
+
 
 if __name__ == "__main__":
     unittest.main()  # pytype: disable=module-attr
