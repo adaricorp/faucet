@@ -1368,12 +1368,12 @@ vlans:
             descs.append(desc)
         return descs
 
-    def _update_port_desc(self, port_nos, port_nos_up=None):
+    def _update_port_desc(self, port_nos, port_nos_up=None, more=False):
         descs = self._build_port_descs(port_nos, port_nos_up)
         ofmsgs_by_valve = self.valve.port_desc_stats_reply_handler(
-            descs, [], time.time()
+            descs, [], time.time(), more=more
         )
-        return ofmsgs_by_valve[self.valve]
+        return ofmsgs_by_valve.get(self.valve, [])
 
     def test_unconfigured_ports(self):
         port_nos = [11, 12]
@@ -1382,6 +1382,83 @@ vlans:
 
         self.assertTrue(self.valve.dp.dyn_up_port_nos == set(port_nos_up))
         self.assertFalse(ofmsgs)
+
+    def test_cold_start_asks_port_desc_after_async(self):
+        """Test a cold start asks for port descriptions after its async config.
+
+        A port that changes state while the datapath connects reports it
+        before the async config allows the report through, so only the
+        second description, taken after it, shows the change.
+        """
+        ofmsgs = self.valve.datapath_connect(time.time(), set())
+        sent = [type(ofmsg) for ofmsg in self.valve.prepare_send_flows(ofmsgs)]
+        self.assertIn(valve_of.parser.OFPPortDescStatsRequest, sent)
+        self.assertLess(
+            sent.index(valve_of.parser.OFPSetAsync),
+            sent.index(valve_of.parser.OFPPortDescStatsRequest),
+        )
+
+    def test_split_reply_judged_whole(self):
+        """Test a reply split across messages is judged only once complete.
+
+        A switch with more ports than fit one message describes them in
+        parts. A port missing from one part is described in another, so
+        no part on its own may take a port down.
+        """
+        port_nos = [1, 2]
+        self.assertTrue(self._update_port_desc(port_nos, port_nos_up=port_nos))
+        self.assertEqual(set(port_nos), self.valve.dp.dyn_up_port_nos)
+
+        # The same ports, split across two parts: nothing changed.
+        self.assertFalse(self._update_port_desc([1], port_nos_up=[1], more=True))
+        self.assertEqual(set(port_nos), self.valve.dp.dyn_up_port_nos)
+        self.assertFalse(self._update_port_desc([2], port_nos_up=[2]))
+        self.assertEqual(set(port_nos), self.valve.dp.dyn_up_port_nos)
+
+        # The same ports in one message: the control.
+        self.assertFalse(self._update_port_desc(port_nos, port_nos_up=port_nos))
+        self.assertEqual(set(port_nos), self.valve.dp.dyn_up_port_nos)
+
+        # A change in the first part is acted on once the last has arrived.
+        self.assertFalse(self._update_port_desc([1], port_nos_up=[], more=True))
+        self.assertEqual(set(port_nos), self.valve.dp.dyn_up_port_nos)
+        ofmsgs = self._update_port_desc([2], port_nos_up=[2])
+        self.assertEqual({2}, self.valve.dp.dyn_up_port_nos)
+        self.assertTrue(self._inport_flows(1, ofmsgs))
+        self.assertFalse(self._inport_flows(2, ofmsgs))
+
+    def test_split_reply_flag_read_from_message(self):
+        """Test a reply part's flag that more parts follow is acted on."""
+        self.assertTrue(self._update_port_desc([1, 2], port_nos_up=[1, 2]))
+        for port_nos, flags in (([1], valve_of.ofp.OFPMPF_REPLY_MORE), ([2], 0)):
+            msg = valve_of.parser.OFPPortDescStatsReply(
+                None, body=self._build_port_descs(port_nos, port_nos), flags=flags
+            )
+            self.valves_manager.port_desc_stats_reply_handler(
+                self.valve, msg, time.time()
+            )
+            self.assertEqual({1, 2}, self.valve.dp.dyn_up_port_nos)
+
+    def test_partial_reply_dropped_on_reconnect(self):
+        """Test the parts of an unfinished reply do not outlive the connection."""
+        self.assertFalse(self._update_port_desc([2], port_nos_up=[2], more=True))
+        self.valve.datapath_disconnect(time.time())
+        self.valve.datapath_connect(time.time(), {1, 2})
+        self.assertEqual({1, 2}, self.valve.dp.dyn_up_port_nos)
+        # A complete reply from the new connection without port 2 takes it
+        # down; the stale part from before must not keep it up.
+        ofmsgs = self._update_port_desc([1], port_nos_up=[1])
+        self.assertEqual({1}, self.valve.dp.dyn_up_port_nos)
+        self.assertTrue(self._inport_flows(2, ofmsgs))
+
+    def test_partial_reply_dropped_on_connect_alone(self):
+        """Test a connection that replaces one never seen to drop also drops
+        the parts of an unfinished reply."""
+        self.assertFalse(self._update_port_desc([2], port_nos_up=[2], more=True))
+        self.valve.datapath_connect(time.time(), {1, 2})
+        ofmsgs = self._update_port_desc([1], port_nos_up=[1])
+        self.assertEqual({1}, self.valve.dp.dyn_up_port_nos)
+        self.assertTrue(self._inport_flows(2, ofmsgs))
 
     def test_configured_ports(self):
         # Note: the _inport_flows() asserts track 'delta's based on
@@ -1438,6 +1515,69 @@ vlans:
         self.assertTrue(self._inport_flows(2, ofmsgs))
         self.assertTrue(self.valve.dp.ports[1].dyn_phys_up)
         self.assertTrue(self.valve.dp.ports[2].dyn_phys_up)
+
+
+class ValvePortDescAlwaysUpTestCase(ValveTestBases.ValveTestNetwork):
+    """Test OFPMP_PORT_DESC reply handling of a port ignoring its status."""
+
+    CONFIG = (
+        """
+dps:
+    s1:
+%s
+        interfaces:
+            p1:
+                number: 1
+                native_vlan: v100
+            p2:
+                number: 2
+                native_vlan: v100
+                opstatus_reconf: false
+vlans:
+    v100:
+        vid: 0x100
+    v200:
+        vid: 0x200
+"""
+        % DP1_CONFIG
+    )
+
+    def setUp(self):
+        """Setup with both ports up."""
+        self.setup_valves(self.CONFIG, ports_up=[1, 2])
+        self.valve = self.valves_manager.valves[self.DP_ID]
+        self.assertEqual({1, 2}, self.valve.dp.dyn_up_port_nos)
+
+    def test_link_down_reply_keeps_port_up(self):
+        """Test a reply showing the port link-down leaves it up.
+
+        The cold start brought the port up regardless of its link, and a
+        later change to the port must find it up to give it flows.
+        """
+        descs = ValvePortDescTestCase._build_port_descs([1, 2], port_nos_up=[1])
+        ofmsgs_by_valve = self.valve.port_desc_stats_reply_handler(
+            descs, [], time.time()
+        )
+        self.assertFalse(ofmsgs_by_valve.get(self.valve, []))
+        self.assertEqual({1, 2}, self.valve.dp.dyn_up_port_nos)
+
+        config = yaml_load(self.CONFIG)
+        port_conf = config["dps"]["s1"]["interfaces"]["p2"]
+        del port_conf["native_vlan"]
+        port_conf["tagged_vlans"] = ["v100", "v200"]
+        self.update_config(yaml_dump(config), reload_type="warm")
+        self.assertTrue(
+            self.network.tables[self.DP_ID].is_output(
+                {
+                    "in_port": 2,
+                    "vlan_vid": 0x100 | valve_of.ofp.OFPVID_PRESENT,
+                    "eth_src": "00:00:00:00:00:02",
+                    "eth_dst": "ff:ff:ff:ff:ff:ff",
+                },
+                port=1,
+            ),
+            "changed port has no flows",
+        )
 
 
 if __name__ == "__main__":
