@@ -80,6 +80,81 @@ class HostCacheEntry:
         return self.__hash__() < other.__hash__()
 
 
+class HostsCounter:  # pylint: disable=too-few-public-methods
+    """Count of the hosts a port has learned on all its VLANs.
+
+    The VLAN host caches it counts keep it up to date, and set count to
+    None when they no longer can (see HostCacheByPort).
+    """
+
+    __slots__ = [
+        "count",
+        "dot1x_native_vlan",
+    ]
+
+    def __init__(self, dot1x_native_vlan):
+        self.count = 0
+        self.dot1x_native_vlan = dot1x_native_vlan
+
+
+class HostCacheByPort(dict):
+    """Host cache entries in sets by port number.
+
+    Also keeps up to date the count of each port that has counted these
+    entries (see Port.hosts_count()), so the sets must change only through
+    add_entry(), remove_entry() and clear().
+    """
+
+    __slots__ = ["counters"]
+
+    def __init__(self):
+        super().__init__()
+        self.counters = {}
+
+    def count_port(self, port_number, counter):
+        """Return number of entries for a port, and keep counter up to date with it."""
+        counted = self.counters.get(port_number, None)
+        if counted is not None and counted[0] is counter:
+            # A port can count the same entries through two VLANs.
+            counted[1] += 1
+        else:
+            if counted is not None:
+                counted[0].count = None
+            self.counters[port_number] = [counter, 1]
+        return len(self.get(port_number, ()))
+
+    def _update_counter(self, port_number, change):
+        counted = self.counters.get(port_number, None)
+        if counted is not None and counted[0].count is not None:
+            counted[0].count += change * counted[1]
+
+    def add_entry(self, entry):
+        """Add a host cache entry."""
+        port_number = entry.port.number
+        if port_number not in self:
+            self[port_number] = set()
+        entries = self[port_number]
+        entries_count = len(entries)
+        entries.add(entry)
+        self._update_counter(port_number, len(entries) - entries_count)
+
+    def remove_entry(self, entry):
+        """Remove a host cache entry."""
+        port_number = entry.port.number
+        self[port_number].remove(entry)
+        self._update_counter(port_number, -1)
+
+    def forget_counters(self):
+        """Stop keeping counts up to date, so their ports count again."""
+        for counter, _ in self.counters.values():
+            counter.count = None
+        self.counters.clear()
+
+    def clear(self):
+        self.forget_counters()
+        super().clear()
+
+
 class VLAN(Conf):
     """Contains state for one VLAN, including its configuration."""
 
@@ -292,8 +367,10 @@ class VLAN(Conf):
 
     def reset_caches(self):
         """Reset dynamic caches."""
+        if self.dyn_host_cache_by_port is not None:
+            self.dyn_host_cache_by_port.forget_counters()
         self.dyn_host_cache = {}
-        self.dyn_host_cache_by_port = {}
+        self.dyn_host_cache_by_port = HostCacheByPort()
         self.dyn_host_cache_stats_stale = {}
         self.dyn_neigh_cache_by_ipv = collections.defaultdict(dict)
         self.dyn_unresolved_route_ip_gws = collections.defaultdict(list)
@@ -323,13 +400,9 @@ class VLAN(Conf):
         if existing_entry is None:
             self.dyn_host_cache_stats_stale[port.number] = True
         else:
-            self.dyn_host_cache_by_port[existing_entry.port.number].remove(
-                existing_entry
-            )
+            self.dyn_host_cache_by_port.remove_entry(existing_entry)
         entry = HostCacheEntry(eth_src, port, cache_time)
-        if port.number not in self.dyn_host_cache_by_port:
-            self.dyn_host_cache_by_port[port.number] = set()
-        self.dyn_host_cache_by_port[port.number].add(entry)
+        self.dyn_host_cache_by_port.add_entry(entry)
         self.dyn_host_cache[eth_src] = entry
 
     def expire_cache_host(self, eth_src):
@@ -337,7 +410,7 @@ class VLAN(Conf):
         entry = self.cached_host(eth_src)
         if entry is not None:
             self.dyn_host_cache_stats_stale[entry.port.number] = True
-            self.dyn_host_cache_by_port[entry.port.number].remove(entry)
+            self.dyn_host_cache_by_port.remove_entry(entry)
             del self.dyn_host_cache[eth_src]
 
     def cached_hosts_on_port(self, port):
@@ -352,6 +425,10 @@ class VLAN(Conf):
         if port.number in self.dyn_host_cache_by_port:
             hosts_count = len(self.dyn_host_cache_by_port[port.number])
         return hosts_count
+
+    def count_hosts_on_port(self, port, counter):
+        """Return count of all hosts learned on a port, and keep counter up to date with it."""
+        return self.dyn_host_cache_by_port.count_port(port.number, counter)
 
     def cached_host(self, eth_src):
         """Return host from cache or None."""
