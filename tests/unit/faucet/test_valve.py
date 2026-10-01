@@ -41,6 +41,7 @@ from clib.valve_test_lib import (
     GROUP_DP1_CONFIG,
     IDLE_DP1_CONFIG,
     ValveTestBases,
+    build_pkt,
 )
 
 from clib.fakeoftable import CONTROLLER_PORT
@@ -464,6 +465,150 @@ vlans:
         self.assertTrue(table.is_output(match, port=1))
         self.assertFalse(table.is_output(match, port=2))
         self.assertFalse(table.is_output(match, port=CONTROLLER_PORT))
+
+
+class ValvePacketInMetricsTestCase(ValveTestBases.ValveTestNetwork):
+    """Test which VLANs' metrics a packet in updates."""
+
+    CONFIG = (
+        """
+dps:
+    s1:
+%s
+        interfaces:
+            p1:
+                number: 1
+                tagged_vlans: [v100, v200]
+            p2:
+                number: 2
+                native_vlan: v100
+            p3:
+                number: 3
+                tagged_vlans: [v100, v200]
+                lacp: 1
+            p4:
+                number: 4
+                native_vlan: v200
+                tagged_vlans: [v100]
+vlans:
+    v100:
+        vid: 0x100
+    v200:
+        vid: 0x200
+"""
+        % DP1_CONFIG
+    )
+
+    def setUp(self):
+        """Setup ports on two VLANs"""
+        self.setup_valves(self.CONFIG)
+        self.activate_all_ports()
+
+    def _packet_in(self, port, vid, match):
+        """Send a packet in as faucet does, without rcv_packet()'s metric_update."""
+        valve = self.valves_manager.valves[self.DP_ID]
+        if vid:
+            match = dict(match, vid=vid)
+        pkt = build_pkt(match)
+        msg = namedtuple(
+            "null_msg",
+            ("match", "in_port", "data", "total_len", "cookie", "reason"),
+        )(
+            {"in_port": port},
+            port,
+            pkt.data,
+            len(pkt.data),
+            valve.dp.cookie,
+            valve_of.ofp.OFPR_ACTION,
+        )
+        self.valves_manager.valve_packet_in(self.mock_time(0), valve, msg)
+
+    def _learn(self, port, vid, eth_src):
+        self._packet_in(
+            port,
+            vid,
+            {
+                "eth_src": eth_src,
+                "eth_dst": self.UNKNOWN_MAC,
+                "ipv4_src": "10.0.0.1",
+                "ipv4_dst": "10.0.0.2",
+            },
+        )
+
+    def _hosts_learned(self, port_name, vid):
+        vlan_labels = {"vlan": str(vid)}
+        port_labels = dict(vlan_labels, port=port_name, port_description=port_name)
+        return (
+            self.get_prom("vlan_hosts_learned", labels=vlan_labels),
+            self.get_prom("port_vlan_hosts_learned", labels=port_labels),
+        )
+
+    def test_packet_in_updates_own_vlan(self):
+        """Test a packet in updates its own VLAN and no other VLAN of its port."""
+        valve = self.valves_manager.valves[self.DP_ID]
+        port = valve.dp.ports[1]
+        # Learned, but not yet in metrics.
+        valve.dp.vlans[0x200].add_cache_host(self.P1_V200_MAC, port, self.mock_time())
+        self._learn(1, 0x100, self.P1_V100_MAC)
+        self.assertEqual((1, 1), self._hosts_learned("p1", 0x100))
+        self.assertEqual((0, 0), self._hosts_learned("p1", 0x200))
+        self._learn(2, 0x100, self.P2_V100_MAC)
+        self.assertEqual((2, 1), self._hosts_learned("p2", 0x100))
+        self.assertEqual((0, 0), self._hosts_learned("p1", 0x200))
+        self.valves_manager.update_metrics(self.mock_time())
+        self.assertEqual((2, 1), self._hosts_learned("p1", 0x100))
+        self.assertEqual((1, 1), self._hosts_learned("p1", 0x200))
+
+    def test_packet_in_tagged_vlan_skips_native_vlan(self):
+        """Test a packet in on a tagged VLAN does not update the port's native VLAN."""
+        valve = self.valves_manager.valves[self.DP_ID]
+        port = valve.dp.ports[4]
+        # Learned, but not yet in metrics.
+        valve.dp.vlans[0x200].add_cache_host(
+            "00:00:00:02:00:04", port, self.mock_time()
+        )
+        self._learn(4, 0x100, "00:00:00:01:00:04")
+        self.assertEqual((1, 1), self._hosts_learned("p4", 0x100))
+        self.assertEqual((0, 0), self._hosts_learned("p4", 0x200))
+
+    def test_packet_in_vlan_not_on_port(self):
+        """Test a packet in on a VLAN its port is not on updates no port metrics."""
+        valve = self.valves_manager.valves[self.DP_ID]
+        port = valve.dp.ports[2]
+        # Learned on the port's own VLAN, but not yet in metrics.
+        valve.dp.vlans[0x100].add_cache_host(self.P2_V100_MAC, port, self.mock_time())
+        self._learn(2, 0x200, self.P2_V200_MAC)
+        self.assertEqual((0, 0), self._hosts_learned("p2", 0x100))
+        port_labels = {
+            "vlan": str(0x200),
+            "port": "p2",
+            "port_description": "p2",
+            "dp_name": self.DP_NAME,
+            "dp_id": "0x%x" % self.DP_ID,
+        }
+        self.assertIsNone(
+            self.registry.get_sample_value("port_vlan_hosts_learned", port_labels)
+        )
+
+    def test_non_vlan_packet_in_updates_all_vlans(self):
+        """Test a packet in with no VLAN (LACP) updates every VLAN of its port."""
+        valve = self.valves_manager.valves[self.DP_ID]
+        port = valve.dp.ports[3]
+        for vid, eth_src in ((0x100, self.P3_V100_MAC), (0x200, self.P3_V200_MAC)):
+            valve.dp.vlans[vid].add_cache_host(eth_src, port, self.mock_time())
+        self._packet_in(
+            3,
+            0,
+            {
+                "actor_system": "0e:00:00:00:00:02",
+                "partner_system": FAUCET_MAC,
+                "eth_dst": slow.SLOW_PROTOCOL_MULTICAST,
+                "eth_src": "0e:00:00:00:00:02",
+                "actor_state_synchronization": 1,
+            },
+        )
+        self.assertEqual((1, 1), self._hosts_learned("p3", 0x100))
+        self.assertEqual((1, 1), self._hosts_learned("p3", 0x200))
 
 
 class ValveLACPTestCase(ValveTestBases.ValveTestNetwork):
