@@ -6979,6 +6979,450 @@ class ValveARPResponderReloadTestCase(ValveARPResponderTestBase):
                 self.assert_all_answered()
                 self.assert_cold_start_same(config)
 
+    # The tests below warm start to a config that does not add a port's flow
+    # back. Each is deleted strictly, by the match and priority it was added
+    # with, so the delete must be built from the config that added it: a flow
+    # left for a VLAN or VIP that is gone, or for a port no longer untagged on
+    # its VLAN, would go on answering, wrongly, until the next cold start.
+
+    # The priority of a VLAN's own flow, which answers tagged ports. The flow
+    # of a port untagged on the VLAN is one above it.
+    VLAN_PRIORITY = 12321
+    PORT_PRIORITY = 12322
+
+    OFFICE = "10.0.0.254/24"
+    GUEST = "10.2.0.254/24"
+
+    # The flows of the setUp() config, as (in_port, VID, VIP).
+    RESPONDERS = (
+        (None, 0x100, OFFICE),
+        (1, 0x100, OFFICE),
+        (2, 0x100, OFFICE),
+        (None, 0x200, GUEST),
+        (4, 0x200, GUEST),
+    )
+
+    def without_ports(self, *ports, responders=RESPONDERS):
+        """Return the flows given, less those of the ports given."""
+        return tuple(flow for flow in responders if flow[0] not in ports)
+
+    def config_ports(self, vlans=None, ports=None):
+        """Return the config with VLANs updated or deleted (None), as config()
+        does, and ports replaced whole or deleted (None), which config() does
+        not do, as it adds to a port's config."""
+        config = config_parser_util.yaml_load(self.config(vlans=vlans))
+        interfaces = config["dps"]["s1"]["interfaces"]
+        for number, port in (ports or {}).items():
+            if port is None:
+                del interfaces[number]
+            else:
+                interfaces[number] = port
+        return config_parser_util.yaml_dump(config)
+
+    def responders(self):
+        """Return each ARP responder flow on the switch, as (priority, in_port
+        or None, VID, VIP, VIP subnet, whether it answers untagged)."""
+        responders = []
+        for flow in self.responder_flows():
+            values = flow.match_values
+            in_port = values["in_port"].int if "in_port" in values else None
+            subnet = ipaddress.ip_network(
+                (
+                    flow.bits_to_str("arp_spa", values["arp_spa"]),
+                    flow.match_masks["arp_spa"].count(1),
+                )
+            )
+            untagged = any(
+                action.type == ofp.OFPAT_POP_VLAN
+                for instruction in flow.instructions
+                if valve_of.is_apply_actions(instruction)
+                for action in instruction.actions
+            )
+            responders.append(
+                (
+                    flow.priority,
+                    in_port,
+                    values["vlan_vid"].int & ~ofp.OFPVID_PRESENT,
+                    flow.bits_to_str("arp_tpa", values["arp_tpa"]),
+                    subnet,
+                    untagged,
+                )
+            )
+        return sorted(responders, key=str)
+
+    def assert_responders(self, expected):
+        """Assert the switch has exactly the ARP responder flows given, as
+        (in_port, VID, VIP): with a port, that port's own flow, which answers
+        untagged; with none, the VLAN's, which answers tagged ports."""
+        flows = []
+        for in_port, vid, vip in expected:
+            vip = ipaddress.ip_interface(vip)
+            priority = self.VLAN_PRIORITY if in_port is None else self.PORT_PRIORITY
+            flows.append(
+                (priority, in_port, vid, str(vip.ip), vip.network, in_port is not None)
+            )
+        self.assertEqual(sorted(flows, key=str), self.responders())
+
+    def warm_start_only(self, config):
+        """Warm start to config, as warm_start() does, which fails unless the
+        count of warm starts goes up by one, and fail if it cold starts."""
+        valve = self.valves_manager.valves[self.DP_ID]
+        coldstart_time = valve.dp.dyn_last_coldstart_time
+        cold = self.get_prom("faucet_config_reload_cold_total")
+        ofmsgs = self.warm_start(config)
+        self.assertEqual(cold, self.get_prom("faucet_config_reload_cold_total"))
+        valve = self.valves_manager.valves[self.DP_ID]
+        self.assertEqual(coldstart_time, valve.dp.dyn_last_coldstart_time)
+        self.assertTrue(ofmsgs)
+        return ofmsgs
+
+    def assert_warm_start(self, config, expected, initial=None, before=RESPONDERS):
+        """Cold start initial, or the setUp() config, warm start to config,
+        and assert the switch has exactly the flows expected."""
+        self.restart(initial or self.config())
+        self.assert_responders(before)
+        self.warm_start_only(config)
+        self.assert_responders(expected)
+
+    def assert_not_answered_office(self, port):
+        """Assert an untagged request on port for office's VIP goes
+        unanswered."""
+        self.assert_not_answered(self.arp_request(port, 0, "10.0.0.1", "10.0.0.254"))
+
+    def test_untagged_to_tagged(self):
+        """Test a port moved from untagged to tagged on its VLAN loses its own
+        flow, though nothing adds it back, and is answered tagged by the
+        VLAN's; and a port moved the other way gains one."""
+        for ports, expected in (
+            ({1: {"tagged_vlans": ["office"]}}, self.without_ports(1)),
+            ({1: {"tagged_vlans": ["office", "guest"]}}, self.without_ports(1)),
+            (
+                {3: {"native_vlan": "office", "tagged_vlans": ["guest"]}},
+                self.RESPONDERS + ((3, 0x100, self.OFFICE),),
+            ),
+        ):
+            with self.subTest(ports=ports):
+                config = self.config_ports(ports=ports)
+                self.assert_warm_start(config, expected)
+                if 1 in ports:
+                    self.assert_not_answered_office(1)
+                    self.assert_answered(1, 0x100, "10.0.0.1", "10.0.0.254", FAUCET_MAC)
+                else:
+                    self.assert_answered(3, 0x100, "10.0.0.1", "10.0.0.254", FAUCET_MAC)
+                self.assert_cold_start_same(config)
+
+    def test_native_vlan_removed(self):
+        """Test a port that loses its native VLAN, to a tagged VLAN, a VLAN
+        with no VIP or no VLAN at all, loses its own flow."""
+        for ports, expected in (
+            ({1: {"tagged_vlans": ["guest"]}}, self.without_ports(1)),
+            ({1: {"native_vlan": "lab"}}, self.without_ports(1)),
+            ({1: {"description": "no VLAN"}}, self.without_ports(1)),
+            ({4: {"native_vlan": "lab"}}, self.without_ports(4)),
+            (
+                {1: {"native_vlan": "lab"}, 2: {"native_vlan": "lab"}},
+                self.without_ports(1, 2),
+            ),
+        ):
+            with self.subTest(ports=ports):
+                config = self.config_ports(ports=ports)
+                self.assert_warm_start(config, expected)
+                for port in ports:
+                    self.assert_not_answered_office(port)
+                    self.assert_not_answered(
+                        self.arp_request(port, 0, "10.2.0.1", "10.2.0.254")
+                    )
+                self.assert_cold_start_same(config)
+
+    def test_native_vlan_changed(self):
+        """Test a port moved to another routed VLAN loses its flow for the
+        VLAN it left, even when both have the same VIP."""
+        same_vip = self.config(vlans={"guest": {"faucet_vips": [self.OFFICE]}})
+        guest = (0x200, "10.2.0.1", "10.2.0.254", self.GUEST_MAC)
+        for vlans, ports, answer, initial, before, expected in (
+            (
+                None,
+                {1: {"native_vlan": "guest"}},
+                guest,
+                None,
+                self.RESPONDERS,
+                self.without_ports(1) + ((1, 0x200, self.GUEST),),
+            ),
+            (
+                None,
+                {1: {"native_vlan": "guest"}, 4: {"native_vlan": "office"}},
+                guest,
+                None,
+                self.RESPONDERS,
+                self.without_ports(1, 4)
+                + ((1, 0x200, self.GUEST), (4, 0x100, self.OFFICE)),
+            ),
+            # To a VLAN added by the same warm start.
+            (
+                {"dmz": {"vid": 0x400, "faucet_vips": ["10.4.0.254/24"]}},
+                {1: {"native_vlan": "dmz"}},
+                (0x400, "10.4.0.1", "10.4.0.254", FAUCET_MAC),
+                None,
+                self.RESPONDERS,
+                self.without_ports(1)
+                + ((None, 0x400, "10.4.0.254/24"), (1, 0x400, "10.4.0.254/24")),
+            ),
+            # Answered by the VLAN it moved to, with that VLAN's MAC.
+            (
+                {"guest": {"faucet_vips": [self.OFFICE]}},
+                {1: {"native_vlan": "guest"}},
+                (0x200, "10.0.0.1", "10.0.0.254", self.GUEST_MAC),
+                same_vip,
+                (
+                    (None, 0x100, self.OFFICE),
+                    (1, 0x100, self.OFFICE),
+                    (2, 0x100, self.OFFICE),
+                    (None, 0x200, self.OFFICE),
+                    (4, 0x200, self.OFFICE),
+                ),
+                (
+                    (None, 0x100, self.OFFICE),
+                    (2, 0x100, self.OFFICE),
+                    (None, 0x200, self.OFFICE),
+                    (1, 0x200, self.OFFICE),
+                    (4, 0x200, self.OFFICE),
+                ),
+            ),
+        ):
+            with self.subTest(vlans=vlans, ports=ports):
+                config = self.config_ports(vlans=vlans, ports=ports)
+                self.assert_warm_start(config, expected, initial, before)
+                self.assert_answered(1, *answer)
+                if initial is None:
+                    self.assert_not_answered_office(1)
+                self.assert_cold_start_same(config)
+
+    def test_vip_changed(self):
+        """Test changing a VLAN's VIP, alone or with a port of the VLAN, leaves
+        no flow for the old VIP, nor for one the switch does not answer."""
+        moved = {1: {"native_vlan": "guest"}}
+        tagged = {1: {"tagged_vlans": ["office"]}}
+        for vip, ports, expected_office in (
+            ("10.0.0.1/24", None, ((None, 1, 2), "10.0.0.1/24")),
+            ("10.0.0.254/23", None, ((None, 1, 2), "10.0.0.254/23")),
+            ("10.0.0.254/25", None, ((None, 1, 2), "10.0.0.254/25")),
+            ("10.0.0.254/31", None, ((), None)),
+            ("10.0.0.1/24", moved, ((None, 2), "10.0.0.1/24")),
+            ("10.0.0.254/31", moved, ((), None)),
+            ("10.0.0.1/24", tagged, ((None, 2), "10.0.0.1/24")),
+        ):
+            with self.subTest(vip=vip, ports=ports):
+                config = self.config_ports(
+                    vlans={"office": {"faucet_vips": [vip, "fc00::254/64"]}},
+                    ports=ports,
+                )
+                office_ports, office_vip = expected_office
+                expected = (
+                    tuple((port, 0x100, office_vip) for port in office_ports)
+                    + self.RESPONDERS[3:]
+                )
+                if ports is moved:
+                    expected += ((1, 0x200, self.GUEST),)
+                self.assert_warm_start(config, expected)
+                if 1 in office_ports and office_vip.startswith("10.0.0.254/"):
+                    # A host in the VIP's subnet, which a /25 no longer has
+                    # 10.0.0.2 in.
+                    sender_ip = next(ipaddress.ip_interface(office_vip).network.hosts())
+                    self.assert_answered(
+                        1, 0x100, str(sender_ip), "10.0.0.254", FAUCET_MAC
+                    )
+                else:
+                    self.assert_not_answered(
+                        self.arp_request(1, 0, "10.0.0.2", "10.0.0.254")
+                    )
+                self.assert_cold_start_same(config)
+
+    def test_vip_host_address_refused(self):
+        """Test a VIP changed to a /32, which the config refuses, leaves the
+        flows as they are, as the running config is kept."""
+        self.update_config(
+            self.config(
+                vlans={"office": {"faucet_vips": ["10.0.0.254/32", "fc00::254/64"]}}
+            ),
+            reload_type=None,
+            error_expected=1,
+        )
+        self.assert_responders(self.RESPONDERS)
+        self.assert_all_answered()
+
+    def test_vid_changed(self):
+        """Test a VLAN's VID changed by a warm start leaves no flow for the
+        old VID, including when two VLANs swap VIDs."""
+        for vlans, expected in (
+            (
+                {"office": {"vid": 0x101}},
+                (
+                    (None, 0x101, self.OFFICE),
+                    (1, 0x101, self.OFFICE),
+                    (2, 0x101, self.OFFICE),
+                    (None, 0x200, self.GUEST),
+                    (4, 0x200, self.GUEST),
+                ),
+            ),
+            (
+                {"guest": {"vid": 0x201}},
+                self.RESPONDERS[:3]
+                + ((None, 0x201, self.GUEST), (4, 0x201, self.GUEST)),
+            ),
+            (
+                {"office": {"vid": 0x200}, "guest": {"vid": 0x100}},
+                (
+                    (None, 0x200, self.OFFICE),
+                    (1, 0x200, self.OFFICE),
+                    (2, 0x200, self.OFFICE),
+                    (None, 0x100, self.GUEST),
+                    (4, 0x100, self.GUEST),
+                ),
+            ),
+        ):
+            with self.subTest(vlans=vlans):
+                config = self.config(vlans=vlans)
+                self.assert_warm_start(config, expected)
+                office_vid = vlans.get("office", {}).get("vid", 0x100)
+                self.assert_answered(
+                    1, office_vid, "10.0.0.1", "10.0.0.254", FAUCET_MAC
+                )
+                self.assert_cold_start_same(config)
+
+    def test_port_deleted(self):
+        """Test a port deleted from the config loses its flows."""
+        for vlans, ports, expected in (
+            (None, {1: None}, self.without_ports(1)),
+            (None, {4: None}, self.without_ports(4)),
+            (None, {1: None, 2: None}, self.without_ports(1, 2)),
+            (
+                {"office": {"faucet_vips": ["10.0.0.1/24", "fc00::254/64"]}},
+                {1: None},
+                (
+                    (None, 0x100, "10.0.0.1/24"),
+                    (2, 0x100, "10.0.0.1/24"),
+                    (None, 0x200, self.GUEST),
+                    (4, 0x200, self.GUEST),
+                ),
+            ),
+        ):
+            with self.subTest(vlans=vlans, ports=ports):
+                config = self.config_ports(vlans=vlans, ports=ports)
+                self.assert_warm_start(config, expected)
+                for port in ports:
+                    self.assert_not_answered_office(port)
+                self.assert_cold_start_same(config)
+
+    def test_second_vip(self):
+        """Test a VLAN that gains a second VIP answers for both on each port,
+        and one that loses one of two answers for the other only."""
+        second = "10.1.0.254/24"
+        point_to_point = "10.1.0.0/31"
+
+        def config(*vips):
+            return self.config(
+                vlans={"office": {"faucet_vips": list(vips) + ["fc00::254/64"]}}
+            )
+
+        def office(vips, ports=(None, 1, 2)):
+            return tuple((port, 0x100, vip) for vip in vips for port in ports)
+
+        guest = self.RESPONDERS[3:]
+        both = office([self.OFFICE, second]) + guest
+        for initial, before, vips, ports, expected in (
+            (None, self.RESPONDERS, [self.OFFICE, second], None, both),
+            (
+                config(self.OFFICE, second),
+                both,
+                [second],
+                None,
+                office([second]) + guest,
+            ),
+            (
+                config(self.OFFICE, second),
+                both,
+                [self.OFFICE],
+                None,
+                office([self.OFFICE]) + guest,
+            ),
+            # Losing one VIP while a port leaves the VLAN.
+            (
+                config(self.OFFICE, second),
+                both,
+                [second],
+                {2: {"native_vlan": "guest"}},
+                office([second], (None, 1)) + guest + ((2, 0x200, self.GUEST),),
+            ),
+            # Losing the one the switch answers, keeping one it does not.
+            (
+                config(self.OFFICE, point_to_point),
+                self.RESPONDERS,
+                [point_to_point],
+                None,
+                guest,
+            ),
+        ):
+            with self.subTest(initial=initial is not None, vips=vips, ports=ports):
+                config_vips = self.config_ports(
+                    vlans={"office": {"faucet_vips": vips + ["fc00::254/64"]}},
+                    ports=ports,
+                )
+                self.assert_warm_start(config_vips, expected, initial, before)
+                self.assert_cold_start_same(config_vips)
+
+    def test_port_down_reconfigured_up(self):
+        """Test a port that goes down, is reconfigured by a warm start while
+        down, and comes back up has only the flows of its new config; and
+        that a port reconfigured while up then going down loses them."""
+        for vlans, ports, expected in (
+            (
+                None,
+                {1: {"native_vlan": "guest"}},
+                self.without_ports(1) + ((1, 0x200, self.GUEST),),
+            ),
+            (None, {1: {"tagged_vlans": ["office"]}}, self.without_ports(1)),
+            (None, {1: {"native_vlan": "lab"}}, self.without_ports(1)),
+            (
+                {"office": {"faucet_vips": ["10.0.0.1/24", "fc00::254/64"]}},
+                None,
+                (
+                    (None, 0x100, "10.0.0.1/24"),
+                    (1, 0x100, "10.0.0.1/24"),
+                    (2, 0x100, "10.0.0.1/24"),
+                )
+                + self.RESPONDERS[3:],
+            ),
+            (
+                {"office": {"faucet_vips": ["10.0.0.1/24", "fc00::254/64"]}},
+                {1: {"native_vlan": "guest"}},
+                (
+                    (None, 0x100, "10.0.0.1/24"),
+                    (2, 0x100, "10.0.0.1/24"),
+                    (1, 0x200, self.GUEST),
+                )
+                + self.RESPONDERS[3:],
+            ),
+        ):
+            config = self.config_ports(vlans=vlans, ports=ports)
+            with self.subTest(vlans=vlans, ports=ports, down="before"):
+                self.restart(self.config())
+                self.set_port_link_down(1)
+                self.assert_responders(self.without_ports(1))
+                self.warm_start_only(config)
+                self.assert_responders(self.without_ports(1, responders=expected))
+                self.set_port_link_up(1)
+                self.assert_responders(expected)
+                self.assert_cold_start_same(config)
+            with self.subTest(vlans=vlans, ports=ports, down="after"):
+                self.restart(self.config())
+                self.warm_start_only(config)
+                self.assert_responders(expected)
+                self.set_port_link_down(1)
+                self.assert_responders(self.without_ports(1, responders=expected))
+                self.set_port_link_up(1)
+                self.assert_responders(expected)
+                self.assert_cold_start_same(config)
+
 
 if __name__ == "__main__":
     unittest.main()  # pytype: disable=module-attr
