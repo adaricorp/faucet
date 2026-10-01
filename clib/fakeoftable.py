@@ -445,6 +445,8 @@ class FakeOFTable:
                     continue
                 if isinstance(ofmsg, parser.OFPDescStatsRequest):
                     continue
+                if isinstance(ofmsg, parser.OFPPortDescStatsRequest):
+                    continue
                 if isinstance(ofmsg, parser.OFPMeterMod):
                     # TODO: handle OFPMeterMod
                     continue
