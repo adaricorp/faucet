@@ -23,6 +23,7 @@
 import ipaddress
 import random
 import unittest
+from unittest import mock
 
 from os_ken.lib.packet import arp, icmpv6
 
@@ -580,6 +581,53 @@ dps:
                         ),
                         "advertised client not routed",
                     )
+
+    def test_resolved_client_readd_quiet(self):
+        """Test packets racing a resolved client's route log no new route,
+        while the route itself is logged as new once."""
+        valve = self.valves_manager.valves[self.DP_ID]
+
+        def _logged(mock_logger, level, text):
+            return [
+                str(call.args[0])
+                for call in getattr(mock_logger, level).call_args_list
+                if text in str(call.args[0])
+            ]
+
+        for client, (_, _, _, client_ips) in self.CLIENTS.items():
+            for ipv in (4, 6):
+                with self.subTest(client=client, ipv=ipv):
+                    from_host = self._from_host(client, ipv)
+                    route_manager = valve._route_manager_by_ipv[ipv]
+                    logger = route_manager.logger
+                    route_manager.logger = mock.Mock(wraps=logger)
+                    try:
+                        self.rcv_packet(1, 0x100, dict(from_host))
+                        self._reply(client, ipv)
+                        new_routes = _logged(
+                            route_manager.logger, "info", client_ips[ipv]
+                        )
+                        route_manager.logger.reset_mock()
+                        for _ in range(3):
+                            self.rcv_packet(1, 0x100, dict(from_host))
+                        raced = _logged(route_manager.logger, "info", client_ips[ipv])
+                        readds = _logged(
+                            route_manager.logger, "debug", "Re-adding route"
+                        )
+                    finally:
+                        route_manager.logger = logger
+                    self.assertEqual(
+                        1,
+                        len(
+                            [line for line in new_routes if "Adding new route" in line]
+                        ),
+                        "the resolved route was not logged as new at INFO: %s"
+                        % new_routes,
+                    )
+                    self.assertFalse(
+                        raced, "a raced packet logged a route at INFO: %s" % raced
+                    )
+                    self.assertTrue(readds, "the re-add was not logged at debug")
 
     def test_resolved_client_route_restored(self):
         """Test a packet reaching faucet for a resolved client whose route's
