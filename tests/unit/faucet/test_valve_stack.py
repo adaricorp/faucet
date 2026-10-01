@@ -23,6 +23,7 @@
 from functools import partial
 import unittest
 import ipaddress
+import random
 
 from os_ken.lib import mac
 from os_ken.ofproto import ofproto_v1_3 as ofp
@@ -593,6 +594,147 @@ dps:
                     port, True, 1, 1, self.get_other_valves(other_valve)
                 )
                 self.assertTrue(port.is_port_selected())
+
+
+class ValveStackHostsCountTestCase(ValveTestBases.ValveTestNetwork):
+    """Test port host counts on a stack, which also learns hosts on stack ports."""
+
+    CONFIG = (
+        """
+dps:
+    s1:
+%s
+        stack:
+            priority: 1
+        interfaces:
+            1:
+                stack:
+                    dp: s2
+                    port: 1
+            2:
+                tagged_vlans: [100, 200]
+                max_hosts: 3
+            3:
+                native_vlan: 100
+                lacp: 1
+            4:
+                native_vlan: 200
+    s2:
+        hardware: 'GenericTFM'
+        dp_id: 0x2
+        interfaces:
+            1:
+                stack:
+                    dp: s1
+                    port: 1
+            2:
+                tagged_vlans: [100, 200]
+                max_hosts: 3
+            3:
+                native_vlan: 100
+                lacp: 1
+            4:
+                native_vlan: 100
+                lacp: 1
+vlans:
+    100:
+        edge_learn_stack_root: False
+    200:
+        edge_learn_stack_root: False
+"""
+        % BASE_DP1_CONFIG
+    )
+
+    def setUp(self):
+        """Setup a stack of two DPs with LACP"""
+        self.setup_valves(self.CONFIG)
+        self.activate_all_ports()
+
+    def apply_ofmsgs(self, ofmsgs, dp_id=None, offset=0, all_offsets=False):
+        """Apply ofmsgs, by default without replaying them at an offset.
+
+        This test checks host counts, not flows, and the replay would take
+        most of its time.
+        """
+        return super().apply_ofmsgs(ofmsgs, dp_id, offset, all_offsets)
+
+    def _check_hosts_counts(self, msg):
+        """Check every port's count against counting its VLANs' host caches."""
+        for valve in self.valves_manager.valves.values():
+            for port in valve.dp.ports.values():
+                vlans_count = sum(
+                    vlan.cached_hosts_count_on_port(port) for vlan in port.vlans()
+                )
+                self.assertEqual(
+                    vlans_count,
+                    port.hosts_count(),
+                    "%s %s %s" % (valve.dp.name, port, msg),
+                )
+
+    def test_hosts_count_matches_vlans(self):
+        """Test port host counts against counting their VLANs, in random changes."""
+        eth_srcs = ["0e:00:00:00:00:%02x" % i for i in range(1, 9)]
+        stack_hosts = 0
+        for seed in range(2):
+            rng = random.Random(seed)
+            for step in range(100):
+                dp_id = rng.choice((0x1, 0x2))
+                valve = self.valves_manager.valves[dp_id]
+                port = valve.dp.ports[rng.choice(tuple(valve.dp.ports))]
+                action = rng.choice(
+                    ("learn",) * 6 + ("time", "expire", "port", "lacp", "cold_start")
+                )
+                if action == "learn":
+                    self.rcv_packet(
+                        port.number,
+                        rng.choice((100, 200)),
+                        {
+                            "eth_src": rng.choice(eth_srcs),
+                            "eth_dst": mac.BROADCAST_STR,
+                            "eth_type": 0x800,
+                            "ipv4_src": "0.0.0.0",
+                            "ipv4_dst": "255.255.255.255",
+                        },
+                        dp_id=dp_id,
+                    )
+                elif action == "time":
+                    self.mock_time(rng.choice((1, valve.dp.timeout // 2 + 1)))
+                elif action == "expire":
+                    self.valves_manager.valve_flow_services(
+                        self.mock_time(rng.choice((1, valve.dp.timeout + 1))),
+                        "state_expire",
+                    )
+                elif action == "port":
+                    for reason, state in (
+                        (ofp.OFPPR_DELETE, ofp.OFPPS_LINK_DOWN),
+                        (ofp.OFPPR_ADD, 0),
+                    ):
+                        ofmsgs = valve.port_status_handler(
+                            port.number, reason, state, [], self.mock_time(0)
+                        )
+                        self.apply_ofmsgs(ofmsgs.get(valve, []), dp_id=dp_id)
+                        self._check_hosts_counts("seed %u step %u port" % (seed, step))
+                elif action == "lacp":
+                    if port.lacp:
+                        self.apply_ofmsgs(
+                            valve.lacp_update(
+                                port,
+                                rng.choice((True, False)),
+                                self.mock_time(0),
+                                other_valves=self.get_other_valves(valve),
+                            ),
+                            dp_id=dp_id,
+                        )
+                else:
+                    self.cold_start(dp_id=dp_id)
+                    self.activate_all_ports()
+                stack_hosts += sum(
+                    len(vlan.cached_hosts_on_port(stack_port))
+                    for stack_port in valve.dp.stack_ports()
+                    for vlan in valve.dp.vlans.values()
+                )
+                self._check_hosts_counts("seed %u step %u %s" % (seed, step, action))
+        self.assertTrue(stack_hosts)
 
 
 class ValveStackRootExtLoopProtectTestCase(ValveTestBases.ValveTestNetwork):

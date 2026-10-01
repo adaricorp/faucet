@@ -21,6 +21,7 @@ from collections import namedtuple
 from ipaddress import ip_address, ip_network
 
 import copy
+import random
 import time
 import unittest
 
@@ -378,6 +379,270 @@ vlans:
             },
         ]
         self.verify_flooding(matches)
+
+
+class ValvePortHostsCountTestCase(ValveTestBases.ValveTestNetwork):
+    """Test a port's count of hosts over all its VLANs, which max_hosts limits."""
+
+    REQUIRE_TFM = False
+
+    CONFIG = """
+dps:
+    s1:
+        dp_id: 1
+        hardware: Open vSwitch
+        ignore_learn_ins: 0
+        interfaces:
+            p1:
+                number: 1
+                tagged_vlans: [v100, v200, v300]
+                max_hosts: 3
+            p2:
+                number: 2
+                native_vlan: v100
+                tagged_vlans: [v200]
+            p3:
+                number: 3
+                native_vlan: v300
+                max_hosts: 4
+            p4:
+                number: 4
+                coprocessor: {strategy: vlan_vid}
+vlans:
+    v100:
+        vid: 0x100
+    v200:
+        vid: 0x200
+    v300:
+        vid: 0x300
+"""
+
+    VIDS = (0x100, 0x200, 0x300)
+
+    def setUp(self):
+        """Setup a trunk with max_hosts, and ports on some of its VLANs"""
+        self.setup_valves(self.CONFIG)
+
+    def apply_ofmsgs(self, ofmsgs, dp_id=None, offset=0, all_offsets=False):
+        """Apply ofmsgs, by default without replaying them at an offset.
+
+        These tests check host counts, not flows, and the replay would take
+        most of their time.
+        """
+        return super().apply_ofmsgs(ofmsgs, dp_id, offset, all_offsets)
+
+    def _config_variants(self):
+        """Return configs that a warm start can change between."""
+        changes = (
+            {},
+            {"p1": {"description": "trunk"}},
+            {"p1": {"tagged_vlans": ["v100", "v200"]}},
+            {"p2": {"tagged_vlans": ["v200", "v300"]}},
+            {"p3": {"max_hosts": 2}},
+            {"v200": {"max_hosts": 100}},
+        )
+        variants = []
+        for change in changes:
+            config = yaml_load(self.CONFIG)
+            for name, conf in change.items():
+                if name in config["vlans"]:
+                    config["vlans"][name].update(conf)
+                else:
+                    config["dps"]["s1"]["interfaces"][name].update(conf)
+            variants.append(yaml_dump(config))
+        return variants
+
+    def _valve(self):
+        return self.valves_manager.valves[self.DP_ID]
+
+    def _learn(self, port_no, vid, eth_src):
+        return self.rcv_packet(
+            port_no,
+            vid,
+            {
+                "eth_src": eth_src,
+                "eth_dst": self.BROADCAST_MAC,
+                "eth_type": ether.ETH_TYPE_IP,
+                "ipv4_src": "0.0.0.0",
+                "ipv4_dst": "255.255.255.255",
+            },
+        )[self.DP_ID]
+
+    def _expire(self, secs):
+        self.valves_manager.valve_flow_services(self.mock_time(secs), "state_expire")
+
+    def _is_ban(self, ofmsgs, port_no):
+        valve = self._valve()
+        eth_src_table = valve.dp.tables["eth_src"]
+        return any(
+            valve_of.is_flowmod(ofmsg)
+            and ofmsg.table_id == eth_src_table.table_id
+            and ofmsg.hard_timeout == valve.dp.learn_ban_timeout
+            and ofmsg.match.get("in_port", None) == port_no
+            and not ofmsg.instructions
+            for ofmsg in ofmsgs
+        )
+
+    def _check_hosts_counts(self, msg):
+        """Check every port's count against counting its VLANs' host caches."""
+        for port in self._valve().dp.ports.values():
+            vlans_count = sum(
+                vlan.cached_hosts_count_on_port(port) for vlan in port.vlans()
+            )
+            self.assertEqual(vlans_count, port.hosts_count(), "%s %s" % (port, msg))
+
+    def test_max_hosts_on_trunk(self):
+        """Test max_hosts bans learning at the count over all the port's VLANs."""
+        valve = self._valve()
+        port = valve.dp.ports[1]
+        learn_timeout = valve.switch_manager.learn_timeout
+        self.assertFalse(self._is_ban(self._learn(1, 0x100, "0e:00:00:00:01:01"), 1))
+        counter = port.hosts_counter
+        self.mock_time(learn_timeout // 2)
+        for vid in (0x200, 0x300):
+            self.assertFalse(self._is_ban(self._learn(1, vid, "0e:00:00:00:01:02"), 1))
+        self.assertEqual(3, port.hosts_count())
+        # A host already learned on the VLAN is not banned.
+        self.assertFalse(self._is_ban(self._learn(1, 0x200, "0e:00:00:00:01:02"), 1))
+        self.assertTrue(self._is_ban(self._learn(1, 0x100, "0e:00:00:00:01:03"), 1))
+        self.assertEqual(1, port.dyn_learn_ban_count)
+        self.assertIsNone(valve.dp.vlans[0x100].cached_host("0e:00:00:00:01:03"))
+        self.assertEqual(3, port.hosts_count())
+        # Only the first host expires, which unbans the port.
+        self._expire(learn_timeout // 2 + 1)
+        self.assertIsNone(valve.dp.vlans[0x100].cached_host("0e:00:00:00:01:01"))
+        self.assertEqual(2, port.hosts_count())
+        self.assertFalse(self._is_ban(self._learn(1, 0x300, "0e:00:00:00:01:03"), 1))
+        self.assertEqual(3, port.hosts_count())
+        self.assertTrue(self._is_ban(self._learn(1, 0x200, "0e:00:00:00:01:04"), 1))
+        self.assertEqual(2, port.dyn_learn_ban_count)
+        # The port counted its VLANs once, and the count was kept since.
+        self.assertIs(counter, port.hosts_counter)
+        self._check_hosts_counts("after bans")
+
+    def test_hosts_count_cache_cleared(self):
+        """Test a port counts again when a VLAN's host cache is cleared in place."""
+        valve = self._valve()
+        port = valve.dp.ports[1]
+        for vid in self.VIDS:
+            self._learn(1, vid, "0e:00:00:00:01:01")
+        self.assertEqual(3, port.hosts_count())
+        vlan = valve.dp.vlans[0x200]
+        vlan.dyn_host_cache.clear()
+        vlan.dyn_host_cache_by_port.clear()
+        self.assertEqual(2, port.hosts_count())
+        self.assertFalse(self._is_ban(self._learn(1, 0x200, "0e:00:00:00:01:02"), 1))
+        self.assertTrue(self._is_ban(self._learn(1, 0x200, "0e:00:00:00:01:03"), 1))
+
+    def test_hosts_count_warm_start(self):
+        """Test a port keeps its count of hosts across a warm start."""
+        variants = self._config_variants()
+        valve = self._valve()
+        learn_timeout = valve.switch_manager.learn_timeout
+        self._learn(1, 0x100, "0e:00:00:00:01:01")
+        self.mock_time(learn_timeout // 2)
+        self._learn(1, 0x200, "0e:00:00:00:01:02")
+        self._learn(1, 0x300, "0e:00:00:00:01:03")
+        self._learn(3, 0x300, "0e:00:00:00:03:01")
+        self.assertTrue(self._is_ban(self._learn(1, 0x100, "0e:00:00:00:01:04"), 1))
+        old_port = valve.dp.ports[1]
+        old_vlans = dict(valve.dp.vlans)
+        self.assertEqual(3, old_port.hosts_count())
+
+        # Only p3 changes, so p1 and the VLANs carry their dyn state over,
+        # and the VLANs' host caches with it. A port's count is not dyn state.
+        self.update_config(variants[4], reload_type="warm")
+        port = valve.dp.ports[1]
+        self.assertIsNot(old_port, port)
+        self.assertEqual(1, port.dyn_learn_ban_count)
+        for vid, vlan in valve.dp.vlans.items():
+            self.assertIs(
+                old_vlans[vid].dyn_host_cache_by_port, vlan.dyn_host_cache_by_port
+            )
+        self.assertIsNone(port.hosts_counter)
+        self.assertEqual(3, port.hosts_count())
+        self.assertIsNone(old_port.hosts_counter.count)
+        self.assertEqual(0, valve.dp.ports[3].hosts_count())
+        self.assertTrue(self._is_ban(self._learn(1, 0x200, "0e:00:00:00:01:04"), 1))
+        # A host learned before the warm start still leaves the new port's count.
+        self._expire(learn_timeout // 2 + 1)
+        self.assertEqual(2, port.hosts_count())
+        self.assertFalse(self._is_ban(self._learn(1, 0x200, "0e:00:00:00:01:04"), 1))
+        self.assertEqual(3, port.hosts_count())
+        self._check_hosts_counts("after a port change")
+
+        # A change to one of its VLANs changes the trunk, which clears its hosts.
+        self.update_config(variants[5], reload_type="warm")
+        port = valve.dp.ports[1]
+        self.assertEqual(0, port.hosts_count())
+        for vid in self.VIDS:
+            self.assertFalse(self._is_ban(self._learn(1, vid, "0e:00:00:00:01:05"), 1))
+        self.assertEqual(3, port.hosts_count())
+        self.assertTrue(self._is_ban(self._learn(1, 0x300, "0e:00:00:00:01:06"), 1))
+        self._check_hosts_counts("after a VLAN change")
+
+    def _random_change(self, rng, variants, seen):
+        """Make one random change to the hosts, ports or config."""
+        valve = self._valve()
+        learn_timeout = valve.switch_manager.learn_timeout
+        guard_time = valve.switch_manager.cache_update_guard_time
+        port_no = rng.choice(tuple(valve.dp.ports))
+        action = rng.choice(
+            ("learn",) * 8
+            + ("time", "time", "expire", "port", "link", "dot1x")
+            + ("reload", "reload", "cold_start")
+        )
+        if action == "learn":
+            vid = rng.choice(self.VIDS)
+            eth_src = "0e:00:00:00:00:%02x" % rng.randint(1, 12)
+            entry = valve.dp.vlans[vid].cached_host(eth_src)
+            seen["moves"] += entry is not None and entry.port.number != port_no
+            seen["bans"] += self._is_ban(self._learn(port_no, vid, eth_src), port_no)
+        elif action == "time":
+            self.mock_time(rng.choice((1, guard_time + 1)))
+        elif action == "expire":
+            self._expire(rng.choice((1, guard_time, learn_timeout + 1)))
+        elif action in ("port", "link"):
+            set_down, set_up = {
+                "port": (self.set_port_down, self.set_port_up),
+                "link": (self.set_port_link_down, self.set_port_link_up),
+            }[action]
+            set_down(port_no)
+            self._check_hosts_counts("%s %u down" % (action, port_no))
+            set_up(port_no)
+        elif action == "dot1x" and port_no != 4:
+            vlan_name = rng.choice((None, "v100", "v200", "v300"))
+            if vlan_name is None:
+                self.apply_ofmsgs(valve.del_dot1x_native_vlan(port_no))
+            else:
+                self.apply_ofmsgs(valve.add_dot1x_native_vlan(port_no, vlan_name))
+        elif action == "reload":
+            seen["variant"] = rng.choice(
+                [i for i in range(len(variants)) if i != seen["variant"]]
+            )
+            self.update_config(variants[seen["variant"]], reload_type=None)
+        elif action == "cold_start":
+            self.cold_start()
+        return action
+
+    def test_hosts_count_matches_vlans(self):
+        """Test port host counts against counting their VLANs, in random changes."""
+        variants = self._config_variants()
+        warm_starts = self.get_prom("faucet_config_reload_warm_total")
+        seen = {"moves": 0, "bans": 0}
+        for seed in range(2):
+            rng = random.Random(seed)
+            seen["variant"] = 0
+            for step in range(150):
+                action = self._random_change(rng, variants, seen)
+                self._check_hosts_counts("seed %u step %u %s" % (seed, step, action))
+            self.update_config(variants[0], reload_type=None)
+            self.cold_start()
+        self.assertGreater(
+            self.get_prom("faucet_config_reload_warm_total"), warm_starts
+        )
+        self.assertTrue(seen["moves"])
+        self.assertTrue(seen["bans"])
 
 
 class ValveIdleLearnTestCase(ValveTestBases.ValveTestNetwork):

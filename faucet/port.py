@@ -20,6 +20,7 @@ import netaddr
 
 from faucet.conf import Conf, test_config_condition
 from faucet import valve_of
+from faucet.vlan import HostsCounter
 
 # Forced port DOWN
 STACK_STATE_ADMIN_DOWN = 0
@@ -78,6 +79,8 @@ LACP_PORT_DISPLAY_DICT = {
 
 class Port(Conf):
     """Stores state for ports, including the configuration."""
+
+    mutable_attrs = frozenset(["hosts_counter"])
 
     defaults = {
         "number": None,
@@ -281,6 +284,8 @@ class Port(Conf):
         self.dyn_lacp_actor_state = LACP_ACTOR_NOTCONFIGURED
         self.dyn_stack_probe_info = {}
 
+        # Not dyn state, so that a port from a new config counts again.
+        self.hosts_counter = None
         self.tagged_vlans = []
         self.lldp_beacon = {}
         super().__init__(_id, dp_id, conf)
@@ -520,11 +525,28 @@ class Port(Conf):
     def hosts_count(self, vlans=None):
         """Return count of all hosts this port has learned (on all or specified VLANs)."""
         if vlans is None:
+            if self.dyn_finalized:
+                return self._all_vlans_hosts_count()
             vlans = self.vlans()
         hosts_count = 0
         for vlan in vlans:
             hosts_count += vlan.cached_hosts_count_on_port(self)
         return hosts_count
+
+    def _all_vlans_hosts_count(self):
+        """Return count of hosts on all VLANs, summing them only if it was not kept."""
+        counter = self.hosts_counter
+        # A configured port's VLANs change only with its 802.1X native VLAN.
+        if (
+            counter is None
+            or counter.count is None
+            or counter.dot1x_native_vlan is not self.dyn_dot1x_native_vlan
+        ):
+            counter = HostsCounter(self.dyn_dot1x_native_vlan)
+            for vlan in self.vlans():
+                counter.count += vlan.count_hosts_on_port(self, counter)
+            self.hosts_counter = counter
+        return counter.count
 
     def lldp_beacon_enabled(self):
         """Return True if LLDP beacon enabled on this port."""
