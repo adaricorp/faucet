@@ -25,6 +25,8 @@ import os
 import unittest
 from prometheus_client import CollectorRegistry
 from os_ken.controller import dpset
+from os_ken.controller import ofp_event
+from os_ken.controller.handler import CONFIG_DISPATCHER, MAIN_DISPATCHER
 from os_ken.controller.ofp_event import EventOFPMsgBase
 from faucet import faucet
 
@@ -68,6 +70,21 @@ class OSKenAppSmokeTest(unittest.TestCase):  # pytype: disable=module-attr
             event_handler(event)
         os_ken_app._check_thread_exception()
         os_ken_app._thread_jitter(1)
+
+    def test_port_desc_reply_while_connected(self):
+        """Test a port description reply reaches faucet once connected.
+
+        The cold start asks for one after its async config, and it arrives
+        after the datapath has left CONFIG_DISPATCHER.
+        """
+        # os-ken adds callers to a handler, and the event classes to
+        # ofp_event, at import time: pylint cannot see either.
+        handler = faucet.Faucet.port_desc_stats_reply_handler
+        callers = handler.callers  # pylint: disable=no-member
+        event_cls = ofp_event.EventOFPPortDescStatsReply  # pylint: disable=no-member
+        dispatchers = callers[event_cls].dispatchers
+        self.assertIn(CONFIG_DISPATCHER, dispatchers)
+        self.assertIn(MAIN_DISPATCHER, dispatchers)
 
 
 if __name__ == "__main__":
