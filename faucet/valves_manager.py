@@ -23,6 +23,7 @@ from faucet.conf import InvalidConfigError
 from faucet.config_parser_util import config_changed, CONFIG_HASH_FUNC
 from faucet.config_parser import dp_parser, dp_preparsed_parser
 from faucet.valve import valve_factory, SUPPORTED_HARDWARE
+from faucet.valve_of import ofp
 from faucet.valve_util import dpid_log, stat_config_files
 
 
@@ -397,9 +398,12 @@ class ValvesManager:
         ]
 
     def port_desc_stats_reply_handler(self, valve, msg, now):
-        """Handle a port desc stats reply message."""
+        """Handle a port desc stats reply message, or one part of one."""
         ofmsgs_by_valve = valve.port_desc_stats_reply_handler(
-            msg.body, self._other_running_valves(valve), now
+            msg.body,
+            self._other_running_valves(valve),
+            now,
+            more=bool(msg.flags & ofp.OFPMPF_REPLY_MORE),
         )
         self._send_ofmsgs_by_valve(ofmsgs_by_valve)
 
