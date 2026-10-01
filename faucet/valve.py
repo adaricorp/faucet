@@ -114,6 +114,7 @@ class Valve:
         "_last_lldp_advertise_sec",
         "_last_packet_in_sec",
         "_packet_in_count_sec",
+        "_port_desc_parts",
         "_port_highwater",
         "_route_manager_by_eth_type",
         "_route_manager_by_ipv",
@@ -155,6 +156,7 @@ class Valve:
         self._last_advertise_sec = None
         self._last_fast_advertise_sec = None
         self._last_lldp_advertise_sec = None
+        self._port_desc_parts = []
         self.dp_init()
 
     def _port_vlan_labels(self, port, vlan):
@@ -483,12 +485,17 @@ class Valve:
         all_up_port_nos = {port_no for port_no, status in port_status.items() if status}
         return (port_status, all_up_port_nos)
 
-    def _cold_start_ports_and_vlans(self, now, discovered_up_port_nos):
-        """Add all configured and discovered ports and VLANs at cold start time."""
-        always_up_port_nos = {
+    def _always_up_port_nos(self):
+        """Return the configured ports treated as up whatever the switch reports."""
+        return {
             port.number for port in self.dp.ports.values() if not port.opstatus_reconf
         }
-        discovered_up_port_nos = discovered_up_port_nos.union(always_up_port_nos)
+
+    def _cold_start_ports_and_vlans(self, now, discovered_up_port_nos):
+        """Add all configured and discovered ports and VLANs at cold start time."""
+        discovered_up_port_nos = discovered_up_port_nos.union(
+            self._always_up_port_nos()
+        )
 
         all_configured_port_nos = self._get_all_configured_port_nos()
         port_status, all_up_port_nos = self._get_ports_status(
@@ -552,7 +559,30 @@ class Valve:
 
         return cls._port_status_codes.get(reason, "UNKNOWN")
 
-    def port_desc_stats_reply_handler(self, port_desc_stats, _other_valves, now):
+    def port_desc_stats_reply_handler(
+        self, port_desc_stats, _other_valves, now, more=False
+    ):
+        """Return OpenFlow messages bringing port state in line with a port
+        description reply, once all of it has arrived.
+
+        Args:
+            port_desc_stats (list): port descriptions in this reply, or in
+                this part of one too large for a single message.
+            _other_valves (list): other running Valves.
+            now (float): current epoch time.
+            more (bool): True if further parts of this reply follow.
+        Returns:
+            dict: OpenFlow messages by Valve.
+        """
+        # A reply split across messages describes a slice of the switch's
+        # ports in each. A port missing from one slice is in another, so
+        # the ports are judged only against the whole reply.
+        self._port_desc_parts.extend(port_desc_stats)
+        if more:
+            return {}
+        port_desc_stats = self._port_desc_parts
+        self._port_desc_parts = []
+
         ofmsgs = []
 
         self.logger.info("port desc stats")
@@ -595,6 +625,9 @@ class Valve:
             for desc in port_desc_stats
             if valve_of.port_status_from_state(desc.state)
         )
+        # A port configured to ignore its operational status is up from the
+        # cold start on, and a reply saying otherwise must not take it down.
+        curr_dyn_up_port_nos.update(self._always_up_port_nos())
 
         conf_port_nos = set(self.dp.ports.keys())
 
@@ -813,6 +846,11 @@ class Valve:
         self.logger.info("Cold start configuring DP")
         self.notify({"DP_CHANGE": {"reason": "cold_start"}})
         ofmsgs = self._cold_start_ports_and_vlans(now, discovered_up_ports)
+        # A port that changes state between the port description these ports
+        # came from and the switch acting on our async config sends a status
+        # nobody receives. Asking again, after that config, catches it.
+        ofmsgs.append(valve_of.port_desc_stats_request())
+        self._port_desc_parts = []
         self.dp.cold_start(now)
         self._inc_var("of_dp_connections")
         self._reset_dp_status()
@@ -824,6 +862,7 @@ class Valve:
         self.logger.warning("datapath down")
         self.notify({"DP_CHANGE": {"reason": "disconnect"}})
         self.dp.dyn_running = False
+        self._port_desc_parts = []
         self._inc_var("of_dp_disconnections")
         self._reset_dp_status()
         self.ports_delete(self.dp.ports.keys(), now=now)
