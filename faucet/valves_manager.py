@@ -435,7 +435,10 @@ class ValvesManager:
             )
         if ofmsgs_by_valve:
             self._send_ofmsgs_by_valve(ofmsgs_by_valve)
-            valve.update_metrics(now, pkt_meta.port, rate_limited=True)
+            # Only the packet's own VLAN: metric_update covers the others.
+            valve.update_metrics(
+                now, pkt_meta.port, rate_limited=True, updated_vlan=pkt_meta.vlan
+            )
 
     def update_config_applied(self, sent=None, reset=False):
         """Update faucet_config_applied from {dpid: sent} dict,

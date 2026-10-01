@@ -1333,8 +1333,19 @@ class Valve:
                 ),
             )
 
-    def update_metrics(self, now, updated_port=None, rate_limited=False):
-        """Update Gauge/metrics."""
+    def update_metrics(
+        self, now, updated_port=None, rate_limited=False, updated_vlan=None
+    ):
+        """Update Gauge/metrics.
+
+        Args:
+            now (float): current epoch time.
+            updated_port (Port): if not None, update only this port's VLANs.
+            rate_limited (bool): skip VLANs updated within metrics_rate_limit_sec.
+            updated_vlan (VLAN): with updated_port, update only this VLAN,
+                if the port is on it, rather than every VLAN on the port.
+                A port with a VLAN assigned by 802.1X still updates them all.
+        """
 
         def _update_vlan(vlan, now, rate_limited):
             if vlan.dyn_last_updated_metrics_sec and rate_limited:
@@ -1384,7 +1395,18 @@ class Valve:
             vlan.dyn_host_cache_stats_stale[port.number] = False
 
         if updated_port:
-            for vlan in updated_port.vlans():
+            # metric_update skips the native VLAN of a port that 802.1X has
+            # assigned another VLAN, so such a port updates all its VLANs.
+            if updated_vlan is None or updated_port.dyn_dot1x_native_vlan is not None:
+                vlans = updated_port.vlans()
+            elif (
+                updated_vlan is updated_port.native_vlan
+                or updated_vlan.port_is_tagged(updated_port)
+            ):
+                vlans = (updated_vlan,)
+            else:
+                vlans = ()
+            for vlan in vlans:
                 if not vlan.reserved_internal_vlan and _update_vlan(
                     vlan, now, rate_limited
                 ):
