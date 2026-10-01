@@ -1560,7 +1560,40 @@ class ValveIPv4RouteManager(ValveRouteManager):
     def _vlan_nexthop_cache_limit(self, vlan):
         return vlan.proactive_arp_limit
 
-    def _arp_responder(self, vlan, priority, faucet_vip, faucet_vip_host, port=None):
+    @staticmethod
+    def _arp_responder_answers(faucet_vip):
+        """Return True if the switch answers ARP for a VIP.
+
+        Not for a /31 or /32 VIP: ip_in_vip_subnet() takes both addresses of
+        a /31 for its network and broadcast addresses, so FAUCET answers no
+        ARP from the far end of a point-to-point /31, and the switch does not
+        either, leaving the link as it is without arp_responder. A /32 VIP,
+        which the config refuses anyway, has no far end.
+        """
+        return faucet_vip.network.prefixlen < 31
+
+    def _arp_responder_match(self, vlan, faucet_vip, faucet_vip_host, port=None):
+        """Return the match and priority of a flow that answers ARP for a VIP.
+
+        Given a port the VLAN is untagged on, the flow matches that port, at a
+        priority above the VLAN's own flow, which answers tagged ports.
+        """
+        in_port = None
+        priority = self.route_priority + faucet_vip.ip.max_prefixlen + 1
+        if port is not None:
+            in_port = port.number
+            priority += 1
+        match = self.vip_table.match(
+            in_port=in_port,
+            vlan=vlan,
+            eth_type=valve_of.ether.ETH_TYPE_ARP,
+            arp_op=arp.ARP_REQUEST,
+            nw_dst=faucet_vip_host,
+            arp_spa=faucet_vip.network,
+        )
+        return match, priority
+
+    def _arp_responder(self, vlan, faucet_vip, faucet_vip_host, port=None):
         """Return a flow that answers ARP requests for a VIP on the switch.
 
         The request goes to the controller unchanged first, which learns the
@@ -1569,7 +1602,6 @@ class ValveIPv4RouteManager(ValveRouteManager):
         the controller is busy. Given a port the VLAN is untagged on, the
         flow matches that port and sends the reply untagged.
         """
-        in_port = None
         actions = [
             valve_of.output_controller(valve_packet.VLAN_ARP_PKT_SIZE),
             valve_of.copy_field("eth_src", "eth_dst", 48),
@@ -1581,19 +1613,13 @@ class ValveIPv4RouteManager(ValveRouteManager):
             self.vip_table.set_field(arp_spa=str(faucet_vip.ip)),
         ]
         if port is not None:
-            in_port = port.number
-            priority += 1
             actions.append(valve_of.pop_vlan())
         actions.append(valve_of.output_in_port())
+        match, priority = self._arp_responder_match(
+            vlan, faucet_vip, faucet_vip_host, port
+        )
         return self.vip_table.flowmod(
-            self.vip_table.match(
-                in_port=in_port,
-                vlan=vlan,
-                eth_type=valve_of.ether.ETH_TYPE_ARP,
-                arp_op=arp.ARP_REQUEST,
-                nw_dst=faucet_vip_host,
-                arp_spa=faucet_vip.network,
-            ),
+            match,
             priority=priority,
             inst=(valve_of.apply_actions(actions),),
         )
@@ -1606,25 +1632,16 @@ class ValveIPv4RouteManager(ValveRouteManager):
                 self.vip_table, {"eth_type": valve_of.ether.ETH_TYPE_ARP, "vlan": vlan}
             )
         )
-        # Not for a /31 or /32 VIP: ip_in_vip_subnet() takes both addresses of
-        # a /31 for its network and broadcast addresses, so FAUCET answers no
-        # ARP from the far end of a point-to-point /31, and the switch does not
-        # either, leaving the link as it is without arp_responder. A /32 VIP,
-        # which the config refuses anyway, has no far end.
-        if self.arp_responder and faucet_vip.network.prefixlen < 31:
+        if self.arp_responder and self._arp_responder_answers(faucet_vip):
             # ARP request for FAUCET VIP from its subnet, answered by the switch.
             # The per-port flows are added with the VLAN, not with the port, as
             # a warm start that moves a port between VLANs deletes and adds both
             # VLANs without restarting their other ports.
-            ofmsgs.append(
-                self._arp_responder(vlan, priority + 1, faucet_vip, faucet_vip_host)
-            )
+            ofmsgs.append(self._arp_responder(vlan, faucet_vip, faucet_vip_host))
             for port in vlan.untagged:
                 if port.running():
                     ofmsgs.append(
-                        self._arp_responder(
-                            vlan, priority + 1, faucet_vip, faucet_vip_host, port
-                        )
+                        self._arp_responder(vlan, faucet_vip, faucet_vip_host, port)
                     )
         # ARP for FAUCET VIP
         ofmsgs.append(
@@ -1686,16 +1703,29 @@ class ValveIPv4RouteManager(ValveRouteManager):
         return ofmsgs
 
     def del_port(self, port):
-        """Delete the ARP responder flows of a port untagged on a routed VLAN."""
-        if (
-            self.arp_responder
-            and port.native_vlan is not None
-            and port.native_vlan.faucet_vips_by_ipv(self.IPV)
-        ):
-            return [
-                self.vip_table.flowdel(match=self.vip_table.match(in_port=port.number))
-            ]
-        return []
+        """Delete the ARP responder flows of a port untagged on a routed VLAN.
+
+        Each flow is deleted strictly, as it was added, so that a warm start
+        that deletes and adds back a port that stays on its VLAN, as changing
+        the port does, replaces the flow in place: the add supersedes a delete
+        with the same match and priority. Deleted by in_port instead, the flow
+        would be gone from the delete until the add, while the port's flows in
+        earlier tables, which are deleted later or replaced in place, still let
+        its requests through, and the VLAN's own flow would answer them tagged.
+        """
+        vlan = port.native_vlan
+        ofmsgs = []
+        if not self.arp_responder or vlan is None:
+            return ofmsgs
+        for faucet_vip in vlan.faucet_vips_by_ipv(self.IPV):
+            if self._arp_responder_answers(faucet_vip):
+                match, priority = self._arp_responder_match(
+                    vlan, faucet_vip, self._host_from_faucet_vip(faucet_vip), port
+                )
+                ofmsgs.append(
+                    self.vip_table.flowdel(match=match, priority=priority, strict=True)
+                )
+        return ofmsgs
 
     def _add_host_fib_route_from_reply(self, now, pkt_meta):
         """Add a host FIB route given an ARP reply that changed no routes.
