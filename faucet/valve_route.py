@@ -558,7 +558,9 @@ class ValveRouteManager(ValveManagerBase):
             ofmsgs.append(self.fib_table.flowdel(match=self.fib_table.match(vlan=vlan)))
         return ofmsgs
 
-    def _add_resolved_route(self, vlan, ip_gw, ip_dst, eth_dst, is_updated):
+    def _add_resolved_route(
+        self, vlan, ip_gw, ip_dst, eth_dst, is_updated, readd=False
+    ):
         """Return flowmods for enabling routing of a resolved nexthop"""
         ofmsgs = []
         if is_updated:
@@ -567,6 +569,13 @@ class ValveRouteManager(ValveManagerBase):
                 % (ip_dst, ip_gw, eth_dst, vlan.vid)
             )
             ofmsgs.extend(self._del_route_flows(vlan, ip_dst))
+        elif readd:
+            # Every packet that races the route's flows to the switch asks
+            # for this, so a burst of them must not flood the log.
+            self.logger.debug(
+                "Re-adding route %s via %s (%s) on VLAN %u"
+                % (ip_dst, ip_gw, eth_dst, vlan.vid)
+            )
         else:
             self.logger.info(
                 "Adding new route %s via %s (%s) on VLAN %u"
@@ -844,7 +853,12 @@ class ValveRouteManager(ValveManagerBase):
                         if self._vlan_routes(vlan).get(host_route, None) == dst_ip:
                             ofmsgs.extend(
                                 self._add_resolved_route(
-                                    vlan, dst_ip, host_route, cached_eth_dst, False
+                                    vlan,
+                                    dst_ip,
+                                    host_route,
+                                    cached_eth_dst,
+                                    False,
+                                    readd=True,
                                 )
                             )
                         else:
