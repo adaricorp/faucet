@@ -1377,3 +1377,8 @@ def faucet_async(
 def desc_stats_request(datapath=None):
     """Query switch description."""
     return parser.OFPDescStatsRequest(datapath, 0)
+
+
+def port_desc_stats_request(datapath=None):
+    """Query switch port descriptions."""
+    return parser.OFPPortDescStatsRequest(datapath, 0)
