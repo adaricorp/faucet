@@ -6770,6 +6770,22 @@ vlans:
     )
 
 
+class FaucetTaggedGlobalIPv4RouteHairpinRoutedTest(FaucetTaggedGlobalIPv4RouteTest):
+    """Route between two VLANs on a port that hairpins only routed packets."""
+
+    CONFIG = FaucetTaggedGlobalIPv4RouteTest.CONFIG.replace(
+        "hairpin_unicast", "hairpin_routed"
+    )
+
+
+class FaucetTaggedGlobalIPv6RouteHairpinRoutedTest(FaucetTaggedGlobalIPv6RouteTest):
+    """Route between two VLANs on a port that hairpins only routed packets."""
+
+    CONFIG = FaucetTaggedGlobalIPv6RouteTest.CONFIG.replace(
+        "hairpin_unicast", "hairpin_routed"
+    )
+
+
 class FaucetTaggedScaleTest(FaucetTaggedTest):
     def _vids():  # pylint: disable=no-method-argument
         return list(range(100, 148))
