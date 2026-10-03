@@ -108,6 +108,7 @@ ETH_DST_HAIRPIN Table
 - Match fields: ``eth_dst, in_port, vlan_vid``
 - Operations:
     - For destination MAC addresses we have learned output packet towards that host (popping VLAN frame if we are outputting on an untagged port), and where hairpinning is desired (e.g. routing between hosts on the same port, but different VLANS).
+    - With ``hairpin_routed`` on a port, also match ``eth_src``, the FAUCET MAC that routing sets, so only routed packets are output back to that port (``drop_spoofed_faucet_mac``, on by default, drops a packet a host sends from that MAC). The table is not exact match if other ports on the datapath have ``hairpin`` or ``hairpin_unicast``.
     - Unknown traffic is sent to ETH_DST table.
 
 ETH_DST Table

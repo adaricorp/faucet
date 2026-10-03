@@ -493,6 +493,17 @@ OFP port number ranges (eg. 1-6).
       - If True it allows packets arriving on this port to be output to this
         port. This is necessary to allow routing between two vlans on this
         port, or for use with a WIFI radio port.
+    * - hairpin_routed
+      - boolean
+      - False
+      - If True, packets FAUCET routes to a host on this port are output to
+        this port when they arrived on it, which allows routing between two
+        vlans on this port. Unlike with hairpin, packets switched between
+        hosts on this port are not, unless drop_spoofed_faucet_mac is False
+        and a host sends from FAUCET's MAC. Cannot be used with another
+        hairpin option on the same port. The ETH_DST_HAIRPIN table then
+        also matches eth_src, and is not exact match if a port on the
+        datapath has another hairpin option.
     * - lldp_beacon
       - dictionary
       - {}

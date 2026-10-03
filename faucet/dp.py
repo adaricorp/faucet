@@ -570,6 +570,18 @@ class DP(Conf):
                 table_config.table_id = relative_table_id
             table_configs[name] = table_config
 
+        # A hairpin_routed port's flows also match eth_src, the FAUCET MAC
+        # that routing sets. Other hairpin ports' flows do not, so the table
+        # is exact match only while every hairpin port is hairpin_routed.
+        hairpin_routed_ports = [
+            port for port in self.hairpin_ports if port.hairpin_routed
+        ]
+        if hairpin_routed_ports:
+            table = table_configs["eth_dst_hairpin"]
+            table.match_types += (("eth_src", False),)
+            if len(hairpin_routed_ports) < len(self.hairpin_ports):
+                table.exact_match = False
+
         # Stacking with external ports, so need external forwarding request field.
         if self.has_externals:
             for table_name in ("vlan", "eth_dst", "flood"):
@@ -810,7 +822,7 @@ class DP(Conf):
             self.stack.add_port(port)
         if port.lldp_beacon_enabled():
             self.lldp_beacon_ports.append(port)
-        if port.hairpin or port.hairpin_unicast:
+        if port.hairpin or port.hairpin_unicast or port.hairpin_routed:
             self.hairpin_ports.append(port)
         if port.lacp and port.lacp_active:
             self.lacp_active_ports.append(port)
