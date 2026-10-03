@@ -893,6 +893,18 @@ class ValveSwitchManager(ValveManagerBase):  # pylint: disable=too-many-public-m
         # port they came in (e.g. multiple hosts on same WiFi AP,
         # and FAUCET is switching between them on the same port).
         if hairpinning:
+            if not delete_existing and dst_rule_idle_timeout:
+                # An add that replaces a flow need not restart its idle
+                # timeout (Open vSwitch keeps the old flow's last use), so
+                # an unused hairpin flow would expire while its host is
+                # still learned. Delete it first, matching only VLAN and MAC
+                # as delete_host_from_vlan() does: a delete with the add's
+                # own match and priority is optimized away.
+                ofmsgs.append(
+                    self.eth_dst_hairpin_table.flowdel(
+                        self.eth_dst_hairpin_table.match(vlan=vlan, eth_dst=eth_src)
+                    )
+                )
             ofmsgs.append(
                 self.eth_dst_hairpin_table.flowmod(
                     self.eth_dst_hairpin_table.match(
