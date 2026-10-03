@@ -765,6 +765,21 @@ class ValveSwitchManager(ValveManagerBase):  # pylint: disable=too-many-public-m
                 ofmsgs.append(table.flowdel(table.match(vlan=vlan, eth_dst=eth_src)))
         return ofmsgs
 
+    def _hairpin_match(self, port, vlan, eth_dst):
+        """Return the match of a host's flow in the eth_dst_hairpin table.
+
+        Routing sets eth_src to the FAUCET MAC of the VLAN it routes to, so
+        on a hairpin_routed port the flow matches only packets FAUCET routed,
+        as long as drop_spoofed_faucet_mac drops those a host sends from
+        that MAC.
+        """
+        eth_src = None
+        if port.hairpin_routed:
+            eth_src = vlan.faucet_mac
+        return self.eth_dst_hairpin_table.match(
+            in_port=port.number, vlan=vlan, eth_dst=eth_dst, eth_src=eth_src
+        )
+
     def expire_hosts_from_vlan(self, vlan, now):
         """Expire hosts from VLAN cache."""
         expired_hosts = vlan.expire_cache_hosts(now, self.learn_timeout)
@@ -849,7 +864,7 @@ class ValveSwitchManager(ValveManagerBase):  # pylint: disable=too-many-public-m
             )
         )
 
-        hairpinning = port.hairpin or port.hairpin_unicast
+        hairpinning = port.hairpin or port.hairpin_unicast or port.hairpin_routed
         # If we are refreshing only and not in hairpin mode, leave existing eth_dst alone.
         if refresh_rules and not hairpinning:
             return ofmsgs
@@ -912,9 +927,7 @@ class ValveSwitchManager(ValveManagerBase):  # pylint: disable=too-many-public-m
                 )
             ofmsgs.append(
                 self.eth_dst_hairpin_table.flowmod(
-                    self.eth_dst_hairpin_table.match(
-                        in_port=port.number, vlan=vlan, eth_dst=eth_src
-                    ),
+                    self._hairpin_match(port, vlan, eth_src),
                     priority=self.host_priority,
                     inst=self.pipeline.output(port, vlan, hairpin=True),
                     idle_timeout=dst_rule_idle_timeout,

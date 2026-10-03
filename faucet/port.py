@@ -108,6 +108,8 @@ class Port(Conf):
         # if True, then switch unicast and flood between hosts on this port (eg WiFi radio).
         "hairpin_unicast": False,
         # if True, then switch unicast between hosts on this port (eg WiFi radio).
+        "hairpin_routed": False,
+        # if True, then send back out this port only the packets FAUCET routed (eg between two VLANs).
         "lacp": 0,
         # if non 0 (LAG ID), experimental LACP support enabled on this port.
         "lacp_active": False,
@@ -176,6 +178,7 @@ class Port(Conf):
         "max_hosts": int,
         "hairpin": bool,
         "hairpin_unicast": bool,
+        "hairpin_routed": bool,
         "lacp": int,
         "lacp_active": bool,
         "lacp_collect_and_distribute": bool,
@@ -238,6 +241,7 @@ class Port(Conf):
         self.enabled = None
         self.hairpin = None
         self.hairpin_unicast = None
+        self.hairpin_routed = None
         self.lacp = None
         self.lacp_active = None
         self.lacp_collect_and_distribute = None
@@ -382,6 +386,10 @@ class Port(Conf):
         test_config_condition(
             self.hairpin and self.hairpin_unicast,
             "Cannot have both hairpin and hairpin_unicast enabled",
+        )
+        test_config_condition(
+            self.hairpin_routed and (self.hairpin or self.hairpin_unicast),
+            "Cannot have hairpin_routed with hairpin or hairpin_unicast enabled",
         )
         dot1x_features = {
             dot1x_feature
