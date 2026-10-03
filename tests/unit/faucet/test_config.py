@@ -3069,6 +3069,42 @@ dps:
 """
         self.check_config_failure(config, cp.dp_parser)
 
+    def test_hairpin_routed_with_hairpin(self):
+        """Test config fails with hairpin_routed and hairpin on one port."""
+        config = """
+vlans:
+    vlan100:
+        vid: 100
+dps:
+    sw1:
+        dp_id: 0x1
+        interfaces:
+            1:
+                native_vlan: vlan100
+                hairpin_routed: True
+                hairpin: %s
+"""
+        self.check_config_success(config % False, cp.dp_parser)
+        self.check_config_failure(config % True, cp.dp_parser)
+
+    def test_hairpin_routed_with_hairpin_unicast(self):
+        """Test config fails with hairpin_routed and hairpin_unicast on one port."""
+        config = """
+vlans:
+    vlan100:
+        vid: 100
+dps:
+    sw1:
+        dp_id: 0x1
+        interfaces:
+            1:
+                native_vlan: vlan100
+                hairpin_routed: True
+                hairpin_unicast: %s
+"""
+        self.check_config_success(config % False, cp.dp_parser)
+        self.check_config_failure(config % True, cp.dp_parser)
+
     def test_dupe_vid(self):
         """Test that VLANs cannot have same VID."""
         config = """
