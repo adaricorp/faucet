@@ -111,6 +111,14 @@ class Valve:
     function switch_features."""
 
     __slots__ = [
+        "_atomic_cold_start_failed",
+        "_bundle_commit_xid",
+        "_bundle_dp",
+        "_bundle_id",
+        "_bundle_next_send",
+        "_bundle_open",
+        "_bundle_open_xid",
+        "_bundles_lost",
         "_coprocessor_manager",
         "_dot1x_manager",
         "_last_advertise_sec",
@@ -144,6 +152,9 @@ class Valve:
     USE_BARRIERS = True
     STATIC_TABLE_IDS = False
     GROUPS = True
+    # Cold start bundles lost in a row before a switch is cold started
+    # without one.
+    ATOMIC_COLD_START_MAX_LOST = 3
 
     def __init__(self, dp, logname, metrics, notifier, dot1x):
         self.dot1x = dot1x
@@ -155,6 +166,22 @@ class Valve:
         self.logger = None
         self.recent_ofmsgs = deque(maxlen=32)
         self.stale_root = False
+        # A switch that refused a bundle, or lost too many in a row to a
+        # disconnection, is cold started without one from then on, for the
+        # life of this process.
+        self._atomic_cold_start_failed = False
+        self._bundle_id = 0
+        self._bundle_next_send = False
+        # True from sending a cold start's bundle until the switch answers
+        # its commit, or the connection it was sent on is gone.
+        self._bundle_open = False
+        # The connection (os_ken Datapath) the bundle in flight was sent on.
+        self._bundle_dp = None
+        # The xids of the bundle's open and commit, which the switch's
+        # answers to them carry.
+        self._bundle_open_xid = None
+        self._bundle_commit_xid = None
+        self._bundles_lost = 0
         self._packet_in_count_sec = None
         self._last_packet_in_sec = None
         self._last_advertise_sec = None
@@ -355,6 +382,8 @@ class Valve:
 
         Vendor specific configuration should be implemented here.
         """
+        # A new connection: a bundle sent on an earlier one is gone with it.
+        self._end_connection_bundle()
         ofmsgs = [
             valve_of.faucet_config(),
             valve_of.faucet_async(
@@ -362,8 +391,52 @@ class Valve:
             ),
             valve_of.desc_stats_request(),
         ]
-        ofmsgs.extend(self._delete_all_valve_flows())
+        # With an atomic cold start, the switch keeps forwarding on its
+        # flows until the cold start replaces them all at once.
+        if not self._atomic_cold_start():
+            ofmsgs.extend(self._delete_all_valve_flows())
         return ofmsgs
+
+    def _atomic_cold_start(self):
+        """Return True if a cold start replaces the flows in one bundle."""
+        return self.dp.atomic_cold_start and not self._atomic_cold_start_failed
+
+    def _reset_atomic_cold_start_status(self):
+        self._set_var("dp_atomic_cold_start", int(self._atomic_cold_start()))
+
+    def _disable_atomic_cold_start(self):
+        """Cold start without a bundle from now on."""
+        self._atomic_cold_start_failed = True
+        self._reset_atomic_cold_start_status()
+
+    def _end_connection_bundle(self):
+        """Forget a cold start's bundle, as its connection has ended."""
+        self._bundle_next_send = False
+        self._lose_bundle()
+
+    def _lose_bundle(self):
+        """Count the bundle in flight lost, as the connection it went on has ended."""
+        if not self._bundle_open:
+            return
+        # The switch discards a bundle it has not committed when the
+        # connection goes, and forwards on its old flows meanwhile.
+        self._bundle_open = False
+        self._bundle_dp = None
+        self._bundle_open_xid = None
+        self._bundle_commit_xid = None
+        self._bundles_lost += 1
+        self._inc_var("faucet_cold_start_bundles_lost")
+        self.logger.warning(
+            "connection ended before the switch committed the cold start's "
+            "bundle %u" % self._bundle_id
+        )
+        if self._bundles_lost >= self.ATOMIC_COLD_START_MAX_LOST:
+            self._disable_atomic_cold_start()
+            self.logger.error(
+                "%u cold start bundles in a row were not committed, so cold "
+                "starts replace the flows without a bundle from now on"
+                % self._bundles_lost
+            )
 
     def ofchannel_log(self, ofmsgs):
         """Log OpenFlow messages in text format to debugging log."""
@@ -867,15 +940,24 @@ class Valve:
     def _reset_dp_status(self):
         self._set_var("dp_status", int(self.dp.dyn_running))
 
-    def datapath_connect(self, now, discovered_up_ports):
+    def datapath_connect(self, now, discovered_up_ports, ryu_dp=None):
         """Handle Ryu datapath connection event and provision pipeline.
 
         Args:
             now (float): current epoch time.
             discovered_up_ports (set): datapath port numbers that are up.
+            ryu_dp (ryu.controller.controller.Datapath): the connection, if known.
         Returns:
             list: OpenFlow messages to send to datapath.
         """
+        if self._bundle_open and ryu_dp is not None and ryu_dp is not self._bundle_dp:
+            # A switch that connects again before its old connection is seen
+            # to end has that connection replaced, with no disconnection: the
+            # bundle sent on it went with it. os_ken closes the old connection
+            # before it passes on the new one, and passes on nothing the old
+            # one receives after, so faucet has already handled any answer to
+            # the bundle.
+            self._lose_bundle()
         self.logger.info("Cold start configuring DP")
         self.notify({"DP_CHANGE": {"reason": "cold_start"}})
         ofmsgs = self._cold_start_ports_and_vlans(now, discovered_up_ports)
@@ -888,6 +970,8 @@ class Valve:
         self._inc_var("of_dp_connections")
         self._reset_dp_status()
         self.logger.info(self.dp.pipeline_str())
+        # These are sent next, by send_flows(), which bundles them.
+        self._bundle_next_send = self._atomic_cold_start()
         return ofmsgs
 
     def datapath_disconnect(self, now):
@@ -898,6 +982,7 @@ class Valve:
         self._port_desc_parts = []
         self._inc_var("of_dp_disconnections")
         self._reset_dp_status()
+        self._end_connection_bundle()
         self.ports_delete(self.dp.ports.keys(), now=now)
 
     def _port_delete_flows_state(self, port, keep_cache=False, expire_vids=None):
@@ -1394,6 +1479,7 @@ class Valve:
         """Update table names for configuration."""
         self.metrics.reset_dpid(self.dp.base_prom_labels())
         self._reset_dp_status()
+        self._reset_atomic_cold_start_status()
 
         # Map table ids to table names
         tables = self.dp.tables.values()
@@ -2152,7 +2238,35 @@ class Valve:
 
         Args:
             msg (ryu.controller.ofp_event.EventOFPMsgBase): message from datapath.
+        Returns:
+            bool: True to reconnect, when the switch refused a cold start's
+                bundle and so kept its old flows, or discarded one on its
+                bundle idle timeout and so may apply part of it.
         """
+        # A flow mod in the bundle that the switch cannot apply is answered
+        # with its own error, as it would be without a bundle; the switch
+        # applies none of the bundle only if it fails the commit.
+        if self._answers_bundle_commit(msg):
+            self._bundle_open = False
+            self._bundle_dp = None
+            self._bundle_open_xid = None
+            self._bundle_commit_xid = None
+            self._inc_var("faucet_cold_start_bundles_refused")
+            self._inc_var("of_errors")
+            self._disable_atomic_cold_start()
+            self.logger.error(
+                "switch refused the cold start's bundle %u (OFError type %s code %s), "
+                "so it still has its previous flows: reconnecting to cold start "
+                "without a bundle"
+                % (self._bundle_id, msg.type, getattr(msg, "exp_type", msg.code))
+            )
+            return True
+        # Any other error that answers the bundle's open leaves the commit to
+        # tell: a switch that refuses the open refuses the commit too, and one
+        # that makes a new bundle of the adds after it makes it of them all.
+        if self._bundle_timed_out(msg):
+            self._discarded_bundle(msg)
+            return True
         orig_msgs = [
             orig_msg for orig_msg in self.recent_ofmsgs if orig_msg.xid == msg.xid
         ]
@@ -2175,7 +2289,7 @@ class Valve:
                 msg.type == valve_of.ofp.OFPET_GROUP_MOD_FAILED
                 and msg.code == valve_of.ofp.OFPGMFC_GROUP_EXISTS
             ):
-                return
+                return False
 
             # We output a flow referencing a group, that a redundant
             # controller deleted before sending its own copy of this flow.
@@ -2183,17 +2297,18 @@ class Valve:
                 msg.type == valve_of.ofp.OFPET_BAD_ACTION
                 and msg.code == valve_of.ofp.OFPBAC_BAD_OUT_GROUP
             ):
-                return
+                return False
         if (
             msg.type == valve_of.ofp.OFPET_METER_MOD_FAILED
             and msg.code == valve_of.ofp.OFPMMFC_METER_EXISTS
         ):
             # Same scenario as groups.
-            return
+            return False
         self._inc_var("of_errors")
         self.logger.error(
             "OFError type: %s code: %s %s" % (error_type, error_code, error_txt)
         )
+        return False
 
     def prepare_send_flows(self, flow_msgs):
         """Prepare to send flows to datapath.
@@ -2211,6 +2326,83 @@ class Valve:
         self.recent_ofmsgs.extend(reordered_flow_msgs)
         return reordered_flow_msgs
 
+    def _answers_bundle_commit(self, msg):
+        """Return True if msg answers the commit of the bundle in flight."""
+        return (
+            self._bundle_commit_xid is not None and msg.xid == self._bundle_commit_xid
+        )
+
+    def _bundle_timed_out(self, msg):
+        """Return True if msg is the switch discarding the bundle in flight.
+
+        The switch discards a bundle that receives no message for its bundle
+        idle timeout, and answers the bundle's open with a timeout error.
+        Each connection numbers its messages from its own xid, so only an
+        answer on the connection the bundle was sent on is the bundle's.
+        """
+        return (
+            self._bundle_open_xid is not None
+            and msg.xid == self._bundle_open_xid
+            and msg.datapath is self._bundle_dp
+            and valve_of.is_bundle_timeout(msg)
+        )
+
+    def _discarded_bundle(self, msg):
+        """Handle the switch discarding a cold start's bundle on its idle timeout.
+
+        Args:
+            msg (ryu.controller.ofp_event.EventOFPMsgBase): the timeout error,
+                which answers the bundle's open.
+        """
+        # The switch then makes a new bundle of any add that names the same
+        # id, so a commit after that applies only what was sent after the
+        # timeout: the switch may apply part of the cold start, and has not
+        # committed the bundle faucet sent. Reconnecting cold starts it
+        # again, and the bundle is counted lost when the connection ends, as
+        # for any other bundle the switch did not commit.
+        self._bundle_open_xid = None
+        # What the switch commits under the bundle's id is not the bundle.
+        self._bundle_commit_xid = None
+        self._inc_var("of_errors")
+        self.logger.error(
+            "switch discarded the cold start's bundle %u before its commit "
+            "(OFError type %s code %s), as no message reached it for the "
+            "switch's bundle idle timeout; it may apply part of it, so "
+            "reconnecting to cold start" % (self._bundle_id, msg.type, msg.exp_type)
+        )
+
+    def bundle_ctrl_reply(self, msg):
+        """Record the switch committing a cold start's bundle."""
+        if (
+            msg.type == valve_of.ofp.ONF_BCT_COMMIT_REPLY
+            and self._answers_bundle_commit(msg)
+        ):
+            self._bundle_open = False
+            self._bundle_dp = None
+            self._bundle_open_xid = None
+            self._bundle_commit_xid = None
+            self._bundles_lost = 0
+            self._inc_var("faucet_cold_start_bundles_committed")
+            self.logger.info(
+                "switch committed the cold start's bundle %u" % msg.bundle_id
+            )
+
+    def _bundle_flow_msgs(self, flow_msgs):
+        """Return a cold start's flow_msgs in one atomic bundle, or None."""
+        self._bundle_id = (self._bundle_id + 1) % 2**32
+        bundled_flow_msgs = valve_of.bundle_ofmsgs(flow_msgs, self._bundle_id)
+        if bundled_flow_msgs is None:
+            self.logger.warning(
+                "cold start has group or meter changes, "
+                "so it replaces the flows without a bundle"
+            )
+            return None
+        self.logger.info(
+            "cold start replaces the flows in one bundle (id %u, %u messages)"
+            % (self._bundle_id, len(bundled_flow_msgs))
+        )
+        return bundled_flow_msgs
+
     def send_flows(self, ryu_dp, flow_msgs, now):
         """Send flows to datapath (or disconnect an OF session).
 
@@ -2220,9 +2412,27 @@ class Valve:
         """
 
         def ryu_send_flows(local_flow_msgs):
-            for flow_msg in self.prepare_send_flows(local_flow_msgs):
+            prepared_flow_msgs = self.prepare_send_flows(local_flow_msgs)
+            bundle = False
+            if self._bundle_next_send:
+                self._bundle_next_send = False
+                bundled_flow_msgs = self._bundle_flow_msgs(prepared_flow_msgs)
+                if bundled_flow_msgs is not None:
+                    prepared_flow_msgs = bundled_flow_msgs
+                    bundle = True
+                    self._bundle_open = True
+                    self._bundle_dp = ryu_dp
+                    self._inc_var("faucet_cold_start_bundles")
+            for flow_msg in prepared_flow_msgs:
                 flow_msg.datapath = ryu_dp
+                if isinstance(flow_msg, valve_of.parser.ONFBundleAddMsg):
+                    flow_msg.message.datapath = ryu_dp
                 ryu_dp.send_msg(flow_msg)
+                if bundle and isinstance(flow_msg, valve_of.parser.ONFBundleCtrlMsg):
+                    if flow_msg.type == valve_of.ofp.ONF_BCT_OPEN_REQUEST:
+                        self._bundle_open_xid = flow_msg.xid
+                    elif flow_msg.type == valve_of.ofp.ONF_BCT_COMMIT_REQUEST:
+                        self._bundle_commit_xid = flow_msg.xid
 
         if flow_msgs is None:
             self.datapath_disconnect(now)

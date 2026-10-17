@@ -301,10 +301,28 @@ class Faucet(OSKenAppBase):
         Args:
             ryu_event (ryu.controller.ofp_event.EventOFPErrorMsg): trigger
         """
+        valve, ryu_dp, msg = self._get_valve(ryu_event)
+        if valve is None:
+            return
+        if valve.oferror(msg):
+            # The switch refused a cold start's bundle, or discarded it before
+            # its commit: reconnect, to cold start again.
+            ryu_dp.close()
+
+    @set_ev_cls(
+        ofp_event.EventONFBundleCtrlMsg, MAIN_DISPATCHER  # pylint: disable=no-member
+    )
+    @kill_on_exception(exc_logname)
+    def bundle_ctrl_handler(self, ryu_event):
+        """Handle a bundle control reply from a datapath.
+
+        Args:
+            ryu_event (ryu.controller.ofp_event.EventONFBundleCtrlMsg): trigger
+        """
         valve, _, msg = self._get_valve(ryu_event)
         if valve is None:
             return
-        valve.oferror(msg)
+        valve.bundle_ctrl_reply(msg)
 
     @set_ev_cls(
         ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER  # pylint: disable=no-member
@@ -341,7 +359,10 @@ class Faucet(OSKenAppBase):
             )
         }
         self._send_flow_msgs(
-            valve, self.valves_manager.datapath_connect(now, valve, discovered_up_ports)
+            valve,
+            self.valves_manager.datapath_connect(
+                now, valve, discovered_up_ports, ryu_dp
+            ),
         )
         self.valves_manager.update_config_applied({valve.dp.dp_id: True})
 
