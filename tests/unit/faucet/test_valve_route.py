@@ -3,6 +3,7 @@
 """Test FAUCET valve_route."""
 
 # pylint: disable=protected-access
+# pylint: disable=too-many-lines
 
 # Copyright (C) 2015 Brad Cowie, Christopher Lorier and Joe Stringer.
 # Copyright (C) 2015 Research and Innovation Advanced Network New Zealand Ltd.
@@ -20,6 +21,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import collections
 import ipaddress
 import random
 import unittest
@@ -28,9 +30,9 @@ from unittest import mock
 from os_ken.lib.packet import arp, icmpv6
 
 from clib.valve_test_lib import ValveTestBases
-from faucet import valve_packet
+from faucet import valve_of, valve_packet, valve_route
 from faucet.router import Router
-from faucet.valve_route import ValveIPv4RouteManager
+from faucet.valve_route import ValveIPv4RouteManager, ValveRouteManager
 from faucet.vlan import VLAN
 
 
@@ -67,6 +69,83 @@ def vlan_key(vlan):
     The global routing answer is an AnonVLAN, which has a VID and no name.
     """
     return (vlan.vid, getattr(vlan, "name", None))
+
+
+def replaced_proactive_resolve_neighbor(self, now, pkt_meta):
+    """ValveRouteManager._proactive_resolve_neighbor() as it was before the
+    guard time, sending a host's FIB flows again for every packet in.
+
+    Kept verbatim, as the oracle for the differential test below.
+    """
+    vlan = pkt_meta.vlan
+    dst_ip = pkt_meta.l3_dst
+    ofmsgs = []
+    if self.proactive_learn:
+        # The VLAN a packet arrives on is the current config's, so its VID
+        # finds the routers naming it.
+        vip_map = self.vip_maps_by_vid.get(vlan.vid, None)
+        if vip_map is None:
+            faucet_vip = vlan.vip_map(dst_ip)
+        else:
+            vlan, faucet_vip = vip_map.get(dst_ip, (None, None))
+        if (
+            vlan
+            and vlan.ip_in_vip_subnet(dst_ip, faucet_vip)
+            and faucet_vip.ip != dst_ip
+            and self._stateful_gw(vlan, dst_ip)
+        ):
+            limit = self._vlan_nexthop_cache_limit(vlan)
+            if limit is None or len(self._vlan_nexthop_cache(vlan)) < limit:
+                # TODO: avoid relearning L3 source if same L3 source tries
+                # multiple L3 destinations quickly.
+                ofmsgs.extend(self.add_host_fib_route_from_pkt(now, pkt_meta))
+                cached_eth_dst = self._cached_nexthop_eth_dst(vlan, dst_ip)
+                if cached_eth_dst is not None:
+                    # A resolved destination reaches us only while no flows
+                    # route to it: not yet, no longer, or never, when it is
+                    # known from an advert alone. Route it, not blackhole it.
+                    host_route = ipaddress.ip_network(dst_ip.exploded)
+                    if self._vlan_routes(vlan).get(host_route, None) == dst_ip:
+                        ofmsgs.extend(
+                            self._add_resolved_route(
+                                vlan,
+                                dst_ip,
+                                host_route,
+                                cached_eth_dst,
+                                False,
+                                readd=True,
+                            )
+                        )
+                    else:
+                        ofmsgs.extend(self._add_host_fib_route(vlan, dst_ip))
+                    return ofmsgs
+                resolution_in_progress = dst_ip in vlan.dyn_host_gws_by_ipv[self.IPV]
+                ofmsgs.extend(self._add_host_fib_route(vlan, dst_ip, blackhole=True))
+                nexthop_cache_entry = self._update_nexthop_cache(
+                    now, vlan, None, None, dst_ip
+                )
+                if not resolution_in_progress:
+                    resolve_flows = self._resolve_gateway_flows(
+                        dst_ip,
+                        nexthop_cache_entry,
+                        vlan,
+                        nexthop_cache_entry.cache_time,
+                    )
+                    ofmsgs.extend(resolve_flows)
+    return ofmsgs
+
+
+class FirstChoiceRandom:
+    """randint() and shuffle() of the random module, made deterministic."""
+
+    @staticmethod
+    def randint(low, _high):
+        """Return the lowest choice."""
+        return low
+
+    @staticmethod
+    def shuffle(_items):
+        """Leave the items in their order."""
 
 
 class ValveRouteManagerVLANTestCase(unittest.TestCase):
@@ -608,6 +687,8 @@ dps:
                             route_manager.logger, "info", client_ips[ipv]
                         )
                         route_manager.logger.reset_mock()
+                        # Only packets after the guard time re-add the route.
+                        self.mock_time(route_manager.HOST_FIB_GUARD_TIME)
                         for _ in range(3):
                             self.rcv_packet(1, 0x100, dict(from_host))
                         raced = _logged(route_manager.logger, "info", client_ips[ipv])
@@ -645,7 +726,16 @@ dps:
                     route_manager = valve._route_manager_by_ipv[ipv]
                     client_route = ipaddress.ip_network(client_ips[ipv])
                     table.apply_ofmsgs(
-                        route_manager._del_route_flows(self._vlan(vid), client_route)
+                        [
+                            route_manager.fib_table.flowdel(
+                                route_manager._route_match(routed_vlan, client_route),
+                                priority=route_manager._route_priority(client_route),
+                                strict=True,
+                            )
+                            for routed_vlan in route_manager._routed_vlans(
+                                self._vlan(vid)
+                            )
+                        ]
                     )
                     outputs = table.get_port_outputs(dict(from_host))
                     self.assertFalse(
@@ -655,6 +745,9 @@ dps:
                         ),
                         "client's route not deleted",
                     )
+                    # faucet cannot tell, so a packet puts them back only once
+                    # the guard time since they went out has passed.
+                    self.mock_time(route_manager.HOST_FIB_GUARD_TIME)
                     self.rcv_packet(1, 0x100, dict(from_host))
                     outputs = table.get_port_outputs(dict(from_host))
                     self.assertTrue(
@@ -664,6 +757,267 @@ dps:
                         ),
                         "resolved client's route not restored",
                     )
+
+    def _packet_to_client(self, client, ipv):
+        """Send a packet from the host to a client, and return the FIB flow
+        mods for the client's address it sent."""
+        from_host = self._from_host(client, ipv)
+        ofmsgs = self.rcv_packet(1, 0x100, from_host)[self.DP_ID]
+        valve = self.valves_manager.valves[self.DP_ID]
+        fib_table_id = valve._route_manager_by_ipv[ipv].fib_table.table_id
+        client_ip = self.CLIENTS[client][3][ipv]
+        return [
+            flowmod
+            for flowmod in ValveTestBases.flowmods_from_flows(ofmsgs)
+            if flowmod.table_id == fib_table_id
+            and flowmod.match.get("ipv%u_dst" % ipv, (None,))[0] == client_ip
+        ]
+
+    def _client_routed(self, client, ipv):
+        """Return True if the host's traffic to a client is routed to it."""
+        port, _, client_mac, _ = self.CLIENTS[client]
+        outputs = self.network.tables[self.DP_ID].get_port_outputs(
+            self._from_host(client, ipv)
+        )
+        return any(pkt["eth_dst"] == client_mac for pkt in outputs.get(port, []))
+
+    def _assert_resent_after_guard_time(self, client, ipv, flows):
+        """Assert packets for a client send its flows again only once the
+        guard time since they went out has passed, and change nothing before."""
+        table = self.network.tables[self.DP_ID]
+        before = str(table)
+        for _ in range(3):
+            self.assertFalse(
+                self._packet_to_client(client, ipv), "raced %s sent again" % flows
+            )
+        self.assertEqual(before, str(table), "raced packets changed the flows")
+        self.mock_time(ValveRouteManager.HOST_FIB_GUARD_TIME)
+        self.assertTrue(
+            self._packet_to_client(client, ipv),
+            "%s not sent after the guard time" % flows,
+        )
+        self.assertFalse(
+            self._packet_to_client(client, ipv),
+            "%s sent again within the guard time" % flows,
+        )
+
+    def test_raced_client_flows_not_resent(self):
+        """Test packets racing a client's blackhole or route to the switch send
+        neither again until the guard time has passed."""
+        for client in self.CLIENTS:
+            for ipv in (4, 6):
+                with self.subTest(client=client, ipv=ipv):
+                    self.assertTrue(
+                        self._packet_to_client(client, ipv), "no blackhole sent"
+                    )
+                    self._assert_resent_after_guard_time(client, ipv, "blackhole")
+                    self._reply(client, ipv)
+                    self.assertTrue(self._client_routed(client, ipv))
+                    self._assert_resent_after_guard_time(client, ipv, "route")
+                    self.assertTrue(self._client_routed(client, ipv))
+
+    def test_deleted_client_route_restored(self):
+        """Test a packet for a resolved client whose route's flows faucet
+        deleted puts them back straight away."""
+        valve = self.valves_manager.valves[self.DP_ID]
+        table = self.network.tables[self.DP_ID]
+        for client, (_, vid, _, client_ips) in self.CLIENTS.items():
+            for ipv in (4, 6):
+                with self.subTest(client=client, ipv=ipv):
+                    self._packet_to_client(client, ipv)
+                    self._reply(client, ipv)
+                    route_manager = valve._route_manager_by_ipv[ipv]
+                    client_route = ipaddress.ip_network(client_ips[ipv])
+                    table.apply_ofmsgs(
+                        route_manager._del_route_flows(self._vlan(vid), client_route)
+                    )
+                    self.assertFalse(self._client_routed(client, ipv))
+                    self.assertTrue(self._packet_to_client(client, ipv))
+                    self.assertTrue(
+                        self._client_routed(client, ipv), "client's route not restored"
+                    )
+
+    def test_blackhole_resent_after_cold_start(self):
+        """Test a packet for a client being resolved sends its blackhole again
+        after a cold start, however soon."""
+        with mock.patch.object(ValveRouteManager, "HOST_FIB_GUARD_TIME", 3600):
+            for client in self.CLIENTS:
+                for ipv in (4, 6):
+                    with self.subTest(client=client, ipv=ipv):
+                        self._packet_to_client(client, ipv)
+                        self.cold_start()
+                        self.assertTrue(
+                            self._packet_to_client(client, ipv),
+                            "blackhole not sent after a cold start",
+                        )
+
+    def test_blackhole_resent_when_due(self):
+        """Test a packet for a client being resolved sends its blackhole again
+        once the last could have timed out, or after the clock went back."""
+        valve = self.valves_manager.valves[self.DP_ID]
+        for client in self.CLIENTS:
+            for ipv in (4, 6):
+                with self.subTest(client=client, ipv=ipv):
+                    route_manager = valve._route_manager_by_ipv[ipv]
+                    # The shortest hard timeout a blackhole gets is 2s.
+                    route_manager.max_resolve_backoff_time = 1
+                    route_manager.max_host_fib_retry_count = 2
+                    self._packet_to_client(client, ipv)
+                    self.mock_time(2)
+                    self.assertTrue(
+                        self._packet_to_client(client, ipv),
+                        "blackhole not sent once the last could have timed out",
+                    )
+                    self.mock_time(-1)
+                    self.assertTrue(
+                        self._packet_to_client(client, ipv),
+                        "blackhole not sent after the clock went back",
+                    )
+
+    def test_route_resent_after_warm_start(self):
+        """Test a packet for a resolved client sends its route again straight
+        after a warm start, which can delete FIB flows it does not add back."""
+        configs = [
+            self.CONFIG.replace(
+                "routers:\n", "  other:\n    vid: 0x400\nrouters:\n"
+            ).replace(
+                "        native_vlan: guest\n",
+                "        native_vlan: guest\n      4:\n        native_vlan: other\n",
+            ),
+            self.CONFIG,
+        ]
+        with mock.patch.object(ValveRouteManager, "HOST_FIB_GUARD_TIME", 3600):
+            for client in self.CLIENTS:
+                for ipv in (4, 6):
+                    with self.subTest(client=client, ipv=ipv):
+                        self._packet_to_client(client, ipv)
+                        self._reply(client, ipv)
+                        self.assertFalse(
+                            self._packet_to_client(client, ipv),
+                            "route sent again within the guard time",
+                        )
+                        self.update_config(configs[0], reload_type="warm")
+                        configs.reverse()
+                        self.assertTrue(
+                            self._packet_to_client(client, ipv),
+                            "route not sent after a warm start",
+                        )
+                        self.assertTrue(self._client_routed(client, ipv))
+
+    def _random_steps(self, seed, count):
+        """Return count random steps: packets from the host to a client,
+        replies from a client, time passing, port flaps, reloads and cold
+        starts."""
+        rng = random.Random(seed)
+        clients = sorted(self.CLIENTS)
+        steps = []
+        for _ in range(count):
+            kind = rng.choices(
+                ("punt", "reply", "tick", "flap", "reload", "cold"),
+                weights=(12, 3, 6, 1, 1, 1),
+            )[0]
+            arg = None
+            if kind in ("punt", "reply"):
+                arg = (rng.choice(clients), rng.choice((4, 6)))
+            elif kind == "tick":
+                arg = rng.choice((0.5, 2, 4, 6, 31, 70))
+            elif kind == "flap":
+                arg = rng.choice((1, 2, 3))
+            steps.append((kind, arg))
+        return steps
+
+    def _run_step(self, kind, arg, configs):
+        """Run a step; return what a packet from the host sent."""
+        valve = self.valves_manager.valves[self.DP_ID]
+        if kind == "punt":
+            return self.rcv_packet(1, 0x100, self._from_host(*arg))[self.DP_ID]
+        if kind == "reply":
+            self._reply(*arg)
+        elif kind == "tick":
+            now = self.mock_time(arg)
+            for service in (valve.state_expire, valve.resolve_gateways):
+                for ofmsgs in service(now, None).values():
+                    self.apply_ofmsgs(ofmsgs)
+        elif kind == "flap":
+            self.set_port_down(arg)
+            self.set_port_up(arg)
+        elif kind == "reload":
+            self.update_config(configs[0], reload_type=None)
+            configs.reverse()
+        else:
+            self.cold_start()
+        return []
+
+    def _restart_valves(self):
+        """Replace the valves and the network with new ones, at the start time."""
+        self.teardown_valves()
+        # No table to compare the new network's with.
+        self.network = None
+        self.mock_now_sec = 100
+        self.setup_valves(self.CONFIG)
+
+    def _run_steps(self, steps):
+        """Run steps on new valves. Return, for each, the flows it left, and
+        the FIB flow mods and other messages its packet sent."""
+        self._restart_valves()
+        configs = [
+            self.CONFIG.replace(
+                "        native_vlan: guest\n",
+                "        native_vlan: guest\n      4:\n        native_vlan: office\n",
+            ),
+            self.CONFIG,
+        ]
+        results = []
+        for kind, arg in steps:
+            ofmsgs = self._run_step(kind, arg, configs)
+            valve = self.valves_manager.valves[self.DP_ID]
+            fib_table_ids = {
+                route_manager.fib_table.table_id
+                for route_manager in valve._route_manager_by_ipv.values()
+            }
+            fib = collections.Counter()
+            others = collections.Counter()
+            for ofmsg in ofmsgs:
+                if valve_of.is_flowmod(ofmsg) and ofmsg.table_id in fib_table_ids:
+                    fib[str(ofmsg)] += 1
+                elif valve_of.is_packetout(ofmsg):
+                    # A flood's ports come in no fixed order.
+                    actions = tuple(sorted(str(action) for action in ofmsg.actions))
+                    others[(bytes(ofmsg.data), actions)] += 1
+                else:
+                    others[str(ofmsg)] += 1
+            results.append((str(self.network.tables[self.DP_ID]), fib, others))
+        return results
+
+    def test_flows_match_resending(self):
+        """Test random packets, replies, expiries, port flaps, reloads and cold
+        starts leave the flows that sending a host's FIB flows again for every
+        packet leaves, at every step, sending fewer FIB flow mods and the same
+        other messages."""
+        sent = collections.Counter()
+        for seed in range(3):
+            steps = self._random_steps(seed, 60)
+            # Both resolve alike only if faucet's random choices are the same.
+            with mock.patch.object(valve_route, "random", FirstChoiceRandom()):
+                guarded = self._run_steps(steps)
+                with mock.patch.object(
+                    ValveRouteManager,
+                    "_proactive_resolve_neighbor",
+                    replaced_proactive_resolve_neighbor,
+                ):
+                    resending = self._run_steps(steps)
+            for index, (step, result, oracle) in enumerate(
+                zip(steps, guarded, resending)
+            ):
+                with self.subTest(seed=seed, step=index, kind=step[0]):
+                    self.assertEqual(oracle[0], result[0], "flows differ")
+                    self.assertFalse(result[1] - oracle[1], "FIB flow mods not resent")
+                    self.assertEqual(oracle[2], result[2], "other messages differ")
+                sent["guarded"] += sum(result[1].values())
+                sent["resending"] += sum(oracle[1].values())
+        self.assertLess(
+            sent["guarded"], sent["resending"], "every FIB flow mod sent again"
+        )
 
 
 if __name__ == "__main__":
