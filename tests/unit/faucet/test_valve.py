@@ -1990,5 +1990,544 @@ vlans:
         )
 
 
+class ValveAtomicColdStartTestCase(ValveTestBases.ValveTestNetwork):
+    """Test a cold start replacing the flows in one atomic bundle."""
+
+    REQUIRE_TFM = False
+
+    CONFIG = """
+dps:
+    s1:
+        dp_id: 1
+        hardware: "Open vSwitch"
+        atomic_cold_start: true
+        interfaces:
+            p1:
+                number: 1
+                native_vlan: v100
+            p2:
+                number: 2
+                native_vlan: v100
+vlans:
+    v100:
+        vid: 0x100
+        faucet_vips: ["10.0.0.254/24"]
+"""
+
+    class FakeDatapath:
+        """Record what faucet sends, numbering messages as the switch would."""
+
+        ofproto = ofp
+        ofproto_parser = parser
+
+        def __init__(self):
+            self.sent = []
+            self.closed = False
+            self.xid = 0
+
+        def send_msg(self, msg):
+            """Record msg with its own xid."""
+            if msg.xid is None:
+                self.xid += 1
+                msg.set_xid(self.xid)
+            msg.serialize()
+            self.sent.append(msg)
+
+        def close(self):
+            """Record a close."""
+            self.closed = True
+
+    def setUp(self):
+        """Setup a routed VLAN."""
+        self.setup_valves(self.CONFIG)
+        self.valve = self.valves_manager.valves[self.DP_ID]
+
+    @staticmethod
+    def _global_deletes(ofmsgs):
+        return [ofmsg for ofmsg in ofmsgs if valve_of.is_global_flowdel(ofmsg)]
+
+    def _cold_start(self, disconnect=True):
+        """Connect the DP again, and return what faucet sends the switch."""
+        ryu_dp = self.FakeDatapath()
+        if disconnect:
+            self.valve.datapath_disconnect(self.mock_time())
+        features = self.valve.switch_features(None)
+        ofmsgs = self.valve.datapath_connect(self.mock_time(), {1, 2})
+        self.valve.send_flows(ryu_dp, ofmsgs, self.mock_time())
+        return features, ryu_dp
+
+    @staticmethod
+    def _bundle(ryu_dp):
+        """Return the bundle messages sent to ryu_dp."""
+        return [
+            ofmsg
+            for ofmsg in ryu_dp.sent
+            if isinstance(ofmsg, (parser.ONFBundleCtrlMsg, parser.ONFBundleAddMsg))
+        ]
+
+    def _commit_reply(self, ryu_dp, xid=None):
+        """Return the switch's reply to the commit of the bundle sent to ryu_dp."""
+        commit = self._bundle(ryu_dp)[-1]
+        reply = parser.ONFBundleCtrlMsg(
+            None, commit.bundle_id, ofp.ONF_BCT_COMMIT_REPLY, 0, []
+        )
+        reply.xid = commit.xid if xid is None else xid
+        return reply
+
+    def _bundle_counts(self):
+        """Return the bundles sent, committed, refused and lost."""
+        return tuple(
+            int(self.get_prom("faucet_cold_start_bundles%s_total" % outcome))
+            for outcome in ("", "_committed", "_refused", "_lost")
+        )
+
+    def _atomic_status(self):
+        return int(self.get_prom("dp_atomic_cold_start"))
+
+    def test_bundle_ofmsgs(self):
+        """Test flow mods go in one bundle, in order, and the rest around it."""
+        flowdel = self.valve._delete_all_valve_flows()[0]
+        config = valve_of.faucet_config()
+        async_config = valve_of.faucet_async()
+        packetout = valve_of.packetout(1, bytes(64))
+        ofmsgs = self.valve.dp.tables["vlan"].flowdrop(priority=1)
+        bundled = valve_of.bundle_ofmsgs(
+            [config, flowdel, valve_of.barrier(), ofmsgs, async_config, packetout], 7
+        )
+        kinds = [type(ofmsg).__name__ for ofmsg in bundled]
+        self.assertEqual(
+            kinds,
+            [
+                "OFPSetConfig",
+                "ONFBundleCtrlMsg",
+                "ONFBundleAddMsg",
+                "ONFBundleAddMsg",
+                "ONFBundleCtrlMsg",
+                "OFPBarrierRequest",
+                "OFPSetAsync",
+                "OFPPacketOut",
+            ],
+        )
+        self.assertEqual(bundled[1].type, ofp.ONF_BCT_OPEN_REQUEST)
+        self.assertEqual(bundled[4].type, ofp.ONF_BCT_COMMIT_REQUEST)
+        self.assertEqual(
+            [ofmsg.message.command for ofmsg in bundled[2:4]],
+            [ofp.OFPFC_DELETE, ofp.OFPFC_ADD],
+        )
+        for ofmsg in bundled[1:5]:
+            self.assertEqual(ofmsg.bundle_id, 7)
+            self.assertEqual(ofmsg.flags, ofp.ONF_BF_ATOMIC | ofp.ONF_BF_ORDERED)
+        self.assertIsNone(
+            valve_of.bundle_ofmsgs([flowdel, self.valve.dp.groups.delete_all()], 7)
+        )
+        self.assertIsNone(valve_of.bundle_ofmsgs([config, packetout], 7))
+
+    def test_cold_start_in_one_bundle(self):
+        """Test connecting keeps the flows and replaces them in one bundle."""
+        features, ryu_dp = self._cold_start()
+        self.assertFalse(self._global_deletes(features), "flows deleted on connect")
+        kinds = [type(ofmsg).__name__ for ofmsg in ryu_dp.sent]
+        open_index = kinds.index("ONFBundleCtrlMsg")
+        commit_index = len(kinds) - 1 - kinds[::-1].index("ONFBundleCtrlMsg")
+        self.assertEqual(ryu_dp.sent[open_index].type, ofp.ONF_BCT_OPEN_REQUEST)
+        self.assertEqual(ryu_dp.sent[commit_index].type, ofp.ONF_BCT_COMMIT_REQUEST)
+        inside = ryu_dp.sent[open_index + 1 : commit_index]
+        self.assertTrue(inside)
+        self.assertTrue(
+            all(
+                kind == "ONFBundleAddMsg"
+                for kind in kinds[open_index + 1 : commit_index]
+            )
+        )
+        self.assertTrue(
+            valve_of.is_global_flowdel(inside[0].message),
+            "bundle does not start with the delete",
+        )
+        self.assertFalse(
+            any(valve_of.is_flowmod(ofmsg) for ofmsg in ryu_dp.sent),
+            "flow mod outside the bundle",
+        )
+        async_index = kinds.index("OFPSetAsync")
+        self.assertGreater(
+            async_index, commit_index, "packet ins asked for before the commit"
+        )
+        self.assertTrue(
+            all(ofmsg.xid == ofmsg.message.xid for ofmsg in inside),
+            "inner xid not the outer xid",
+        )
+        self.assertEqual((1, 0, 0, 0), self._bundle_counts())
+        self.assertEqual(1, self._atomic_status())
+
+    def test_committed_bundle(self):
+        """Test the switch committing the bundle is counted once."""
+        _, ryu_dp = self._cold_start()
+        bundle = self._bundle(ryu_dp)
+        open_reply = parser.ONFBundleCtrlMsg(
+            None, bundle[0].bundle_id, ofp.ONF_BCT_OPEN_REPLY, 0, []
+        )
+        open_reply.xid = bundle[0].xid
+        for reply in (open_reply, self._commit_reply(ryu_dp, xid=bundle[-1].xid + 1)):
+            self.valve.bundle_ctrl_reply(reply)
+            self.assertEqual((1, 0, 0, 0), self._bundle_counts())
+        self.valve.bundle_ctrl_reply(self._commit_reply(ryu_dp))
+        self.valve.bundle_ctrl_reply(self._commit_reply(ryu_dp))
+        self.valve.datapath_disconnect(self.mock_time())
+        self.assertEqual((1, 1, 0, 0), self._bundle_counts())
+        self.assertEqual(1, self._atomic_status())
+
+    def test_refused_bundle(self):
+        """Test a refused bundle reconnects, to cold start without one."""
+        error = parser.OFPErrorMsg(
+            None, type_=ofp.OFPET_BAD_INSTRUCTION, code=ofp.OFPBIC_BAD_TABLE_ID
+        )
+        # With no bundle in flight, an error without an xid is only an error.
+        self.assertFalse(self.valve.oferror(error))
+        _, ryu_dp = self._cold_start()
+        bundle = self._bundle(ryu_dp)
+        of_errors = self.get_prom("of_errors_total")
+        # A flow mod the switch cannot apply has an error of its own, and
+        # the switch still commits the rest of the bundle.
+        error.xid = bundle[1].xid
+        self.assertFalse(self.valve.oferror(error))
+        self.assertEqual((1, 0, 0, 0), self._bundle_counts())
+        self.assertEqual(1, self._atomic_status())
+        # Failing the commit, it applies none of the bundle.
+        error = parser.OFPErrorMsg(
+            None, type_=ofp.OFPET_EXPERIMENTER, exp_type=2313, experimenter=0x4F4E4600
+        )
+        error.xid = bundle[-1].xid
+        self.assertTrue(self.valve.oferror(error))
+        self.assertEqual((1, 0, 1, 0), self._bundle_counts())
+        self.assertEqual(0, self._atomic_status())
+        self.assertEqual(of_errors + 2, self.get_prom("of_errors_total"))
+        self.assertFalse(self.valve.oferror(error), "refused twice")
+        features, ryu_dp = self._cold_start()
+        self.assertTrue(self._global_deletes(features), "no delete once refused")
+        self.assertFalse(self._bundle(ryu_dp), "bundled again once refused")
+        self.assertEqual((1, 0, 1, 0), self._bundle_counts())
+
+    def test_lost_bundles(self):
+        """Test bundles lost in a row to disconnections stop bundling."""
+        max_lost = self.valve.ATOMIC_COLD_START_MAX_LOST
+        for _ in range(max_lost):
+            _, ryu_dp = self._cold_start()
+        # A commit starts the count of bundles lost in a row again.
+        self.valve.bundle_ctrl_reply(self._commit_reply(ryu_dp))
+        self.assertEqual((max_lost, 1, 0, max_lost - 1), self._bundle_counts())
+        for _ in range(max_lost):
+            _, ryu_dp = self._cold_start()
+            self.assertTrue(self._bundle(ryu_dp), "stopped bundling too soon")
+        self.assertEqual(1, self._atomic_status())
+        features, ryu_dp = self._cold_start()
+        self.assertTrue(self._global_deletes(features), "no delete once lost")
+        self.assertFalse(self._bundle(ryu_dp), "bundled again once lost")
+        self.assertEqual((2 * max_lost, 1, 0, 2 * max_lost - 1), self._bundle_counts())
+        self.assertEqual(0, self._atomic_status())
+
+    def test_reconnect_loses_bundle(self):
+        """Test a reconnection with no disconnection loses an open bundle."""
+        _, ryu_dp = self._cold_start()
+        self.valve.switch_features(None)
+        self.assertEqual((1, 0, 0, 1), self._bundle_counts())
+        # A late answer to the lost bundle's commit is not counted.
+        self.valve.bundle_ctrl_reply(self._commit_reply(ryu_dp))
+        error = parser.OFPErrorMsg(
+            None, type_=ofp.OFPET_EXPERIMENTER, exp_type=2313, experimenter=0x4F4E4600
+        )
+        error.xid = self._bundle(ryu_dp)[-1].xid
+        self.assertFalse(self.valve.oferror(error))
+        self.assertEqual((1, 0, 0, 1), self._bundle_counts())
+
+    def _cold_start_on(self, ryu_dp):
+        """Cold start the DP on connection ryu_dp, with no switch features."""
+        ofmsgs = self.valve.datapath_connect(self.mock_time(), {1, 2}, ryu_dp)
+        self.valve.send_flows(ryu_dp, ofmsgs, self.mock_time())
+        return self._bundle(ryu_dp)
+
+    def test_replaced_connection_loses_bundle(self):
+        """Test a cold start on a new connection loses the old one's bundle.
+
+        A switch that connects again before its old connection is seen to end
+        has that connection replaced with no disconnection, so faucet can
+        send a cold start on the old connection after the new one's switch
+        features, and then cold start the new one.
+        """
+        self.valve.datapath_disconnect(self.mock_time())
+        old_dp = self.FakeDatapath()
+        new_dp = self.FakeDatapath()
+        # Each connection numbers its messages from its own random xid.
+        new_dp.xid = 1000
+        self.valve.switch_features(None)
+        self.valve.switch_features(None)
+        self.assertTrue(self._cold_start_on(old_dp))
+        self.assertEqual((1, 0, 0, 0), self._bundle_counts())
+        self.assertTrue(self._cold_start_on(new_dp), "new connection not bundled")
+        self.assertEqual((2, 0, 0, 1), self._bundle_counts())
+        # More sent on the connection the bundle went on loses nothing.
+        self.valve.send_flows(new_dp, [valve_of.barrier()], self.mock_time())
+        self.assertEqual((2, 0, 0, 1), self._bundle_counts())
+        # A late answer on the old connection is not counted; the new one's is.
+        self.valve.bundle_ctrl_reply(self._commit_reply(old_dp))
+        self.assertEqual((2, 0, 0, 1), self._bundle_counts())
+        self.valve.bundle_ctrl_reply(self._commit_reply(new_dp))
+        self.assertEqual((2, 1, 0, 1), self._bundle_counts())
+        self.assertEqual(1, self._atomic_status())
+
+    def test_replaced_connection_commits_before_cold_start(self):
+        """Test a bundle a replaced connection commits before the cold start counts.
+
+        os_ken sends on the new connection once it has registered it, before
+        faucet cold starts it, and still passes on what the old connection
+        received before os_ken closed it.
+        """
+        self.valve.datapath_disconnect(self.mock_time())
+        old_dp = self.FakeDatapath()
+        new_dp = self.FakeDatapath()
+        new_dp.xid = 1000
+        self.valve.switch_features(None)
+        self.valve.switch_features(None)
+        self.assertTrue(self._cold_start_on(old_dp))
+        flowmods = [self.valve.dp.tables["vlan"].flowdrop(priority=1)]
+        self.valve.send_flows(new_dp, flowmods, self.mock_time())
+        self.assertEqual((1, 0, 0, 0), self._bundle_counts())
+        self.valve.bundle_ctrl_reply(self._commit_reply(old_dp))
+        self.assertEqual((1, 1, 0, 0), self._bundle_counts())
+        self.assertTrue(self._cold_start_on(new_dp), "new connection not bundled")
+        self.assertEqual((2, 1, 0, 0), self._bundle_counts())
+
+    def test_replaced_connections_lose_bundles(self):
+        """Test bundles lost in a row to replaced connections stop bundling."""
+        max_lost = self.valve.ATOMIC_COLD_START_MAX_LOST
+        for lost in range(max_lost):
+            self.assertTrue(self._cold_start_on(self.FakeDatapath()))
+            self.assertEqual((lost + 1, 0, 0, lost), self._bundle_counts())
+            self.assertEqual(1, self._atomic_status())
+        ryu_dp = self.FakeDatapath()
+        self.assertFalse(self._cold_start_on(ryu_dp), "bundled again once lost")
+        self.assertTrue(self._global_deletes(ryu_dp.sent), "flows not deleted")
+        self.assertEqual((max_lost, 0, 0, max_lost), self._bundle_counts())
+        self.assertEqual(0, self._atomic_status())
+
+    def test_cold_start_not_sent(self):
+        """Test a cold start never sent bundles nothing sent later."""
+        flowmods = [self.valve.dp.tables["vlan"].flowdrop(priority=1)]
+        for disconnect in (True, False):
+            self.valve.switch_features(None)
+            self.valve.datapath_connect(self.mock_time(), {1, 2})
+            # The DP went before the cold start was sent.
+            if disconnect:
+                self.valve.datapath_disconnect(self.mock_time())
+            else:
+                self.valve.switch_features(None)
+            ryu_dp = self.FakeDatapath()
+            self.valve.send_flows(ryu_dp, flowmods, self.mock_time())
+            self.assertFalse(self._bundle(ryu_dp), "bundled a later send")
+        self.assertEqual((0, 0, 0, 0), self._bundle_counts())
+
+    def test_toggle_without_cold_start(self):
+        """Test changing atomic_cold_start applies from the next cold start."""
+        warm = self.get_prom("faucet_config_reload_warm_total")
+        for atomic in (False, True):
+            self.update_config(
+                self.CONFIG.replace(
+                    "atomic_cold_start: true", "atomic_cold_start: %s" % atomic
+                ),
+                reload_expected=False,
+            )
+            self.assertEqual(warm, self.get_prom("faucet_config_reload_warm_total"))
+            self.assertEqual(int(atomic), self._atomic_status())
+            features, ryu_dp = self._cold_start()
+            self.assertNotEqual(atomic, bool(self._global_deletes(features)))
+            self.assertEqual(atomic, bool(self._bundle(ryu_dp)))
+
+    def test_cold_start_with_groups(self):
+        """Test a cold start with group changes still deletes, without a bundle."""
+        self.update_config(
+            self.CONFIG.replace(
+                "atomic_cold_start: true",
+                "atomic_cold_start: true\n        group_table: true",
+            ),
+        )
+        features, ryu_dp = self._cold_start()
+        self.assertFalse(self._global_deletes(features), "flows deleted on connect")
+        self.assertFalse(self._bundle(ryu_dp), "group changes bundled")
+        self.assertTrue(self._global_deletes(ryu_dp.sent), "flows not deleted")
+        self.assertTrue(any(valve_of.is_groupdel(ofmsg) for ofmsg in ryu_dp.sent))
+        self.assertEqual((0, 0, 0, 0), self._bundle_counts())
+
+    def test_atomic_cold_start_hardware(self):
+        """Test atomic_cold_start is refused on hardware without bundles."""
+        self.update_config(
+            self.CONFIG.replace('"Open vSwitch"', '"GenericTFM"'),
+            reload_expected=False,
+            error_expected=1,
+        )
+
+    def _open_error(self, ryu_dp, xid=None):
+        """Return the error the switch answers the open of ryu_dp's bundle with.
+
+        The switch answers a bundle's open with an error when it discards the
+        bundle, as it does once the bundle has received nothing for the
+        switch's bundle idle timeout.
+        """
+        error = parser.OFPErrorMsg(
+            None,
+            type_=ofp.OFPET_EXPERIMENTER,
+            exp_type=ofp.ONFERR_ET_TIMEOUT,
+            experimenter=0x4F4E4600,
+        )
+        error.xid = self._bundle(ryu_dp)[0].xid if xid is None else xid
+        error.datapath = ryu_dp
+        return error
+
+    def _commit_error(self, ryu_dp):
+        """Return the error the switch answers a commit it fails with."""
+        error = parser.OFPErrorMsg(
+            None, type_=ofp.OFPET_EXPERIMENTER, exp_type=2313, experimenter=0x4F4E4600
+        )
+        error.xid = self._bundle(ryu_dp)[-1].xid
+        error.datapath = ryu_dp
+        return error
+
+    def test_discarded_bundle(self):
+        """Test a bundle discarded before its commit reconnects, and is lost.
+
+        The switch makes a new bundle of the adds sent after it discards one,
+        so it can commit part of the cold start.
+        """
+        _, ryu_dp = self._cold_start()
+        of_errors = self.get_prom("of_errors_total")
+        self.assertTrue(self.valve.oferror(self._open_error(ryu_dp)))
+        self.assertEqual(of_errors + 1, self.get_prom("of_errors_total"))
+        # The switch times a bundle out once: another timeout is only an error.
+        self.assertFalse(self.valve.oferror(self._open_error(ryu_dp)))
+        self.assertEqual(of_errors + 2, self.get_prom("of_errors_total"))
+        self.assertEqual((1, 0, 0, 0), self._bundle_counts())
+        # What the switch commits, or fails to, under the bundle's id is not
+        # the bundle.
+        self.valve.bundle_ctrl_reply(self._commit_reply(ryu_dp))
+        self.assertFalse(self.valve.oferror(self._commit_error(ryu_dp)))
+        self.assertEqual((1, 0, 0, 0), self._bundle_counts())
+        self.assertEqual(1, self._atomic_status())
+        # The connection ends, and its cold start is bundled again.
+        features, ryu_dp = self._cold_start()
+        self.assertEqual((2, 0, 0, 1), self._bundle_counts())
+        self.assertFalse(self._global_deletes(features), "flows deleted on connect")
+        self.assertTrue(self._bundle(ryu_dp), "not bundled again once discarded")
+        self.valve.bundle_ctrl_reply(self._commit_reply(ryu_dp))
+        self.assertEqual((2, 1, 0, 1), self._bundle_counts())
+        self.assertEqual(1, self._atomic_status())
+
+    def test_discarded_bundles(self):
+        """Test bundles discarded in a row stop bundling, as lost ones do."""
+        max_lost = self.valve.ATOMIC_COLD_START_MAX_LOST
+        for lost in range(max_lost):
+            _, ryu_dp = self._cold_start()
+            self.assertTrue(self._bundle(ryu_dp), "stopped bundling too soon")
+            self.assertTrue(self.valve.oferror(self._open_error(ryu_dp)))
+            self.assertEqual(1, self._atomic_status())
+            self.valve.datapath_disconnect(self.mock_time())
+            self.assertEqual((lost + 1, 0, 0, lost + 1), self._bundle_counts())
+        self.assertEqual(0, self._atomic_status())
+        features, ryu_dp = self._cold_start()
+        self.assertTrue(self._global_deletes(features), "no delete once discarded")
+        self.assertFalse(self._bundle(ryu_dp), "bundled again once discarded")
+        self.assertEqual((max_lost, 0, 0, max_lost), self._bundle_counts())
+
+    def test_open_error_on_old_connection(self):
+        """Test only an answer on the bundle's own connection discards it.
+
+        Each connection numbers its messages from its own xid, so an old
+        connection's answer can carry the xid of the bundle's open.
+        """
+        old_dp = self.FakeDatapath()
+        _, ryu_dp = self._cold_start()
+        open_xid = self._bundle(ryu_dp)[0].xid
+        for other_dp in (old_dp, None):
+            self.assertFalse(
+                self.valve.oferror(self._open_error(other_dp, xid=open_xid))
+            )
+        self.assertEqual((1, 0, 0, 0), self._bundle_counts())
+        self.assertTrue(self.valve.oferror(self._open_error(ryu_dp)))
+        self.valve.datapath_disconnect(self.mock_time())
+        self.assertEqual((1, 0, 0, 1), self._bundle_counts())
+
+    def test_open_refused(self):
+        """Test a switch that refuses the bundle's open refuses it at the commit.
+
+        A switch that cannot take a bundle, as one without bundles or a
+        connection in the secondary role, answers each of its messages with
+        an error, in the order they were sent.
+        """
+        _, ryu_dp = self._cold_start()
+        bundle = self._bundle(ryu_dp)
+        of_errors = self.get_prom("of_errors_total")
+        error = parser.OFPErrorMsg(
+            None, type_=ofp.OFPET_BAD_REQUEST, code=ofp.OFPBRC_IS_SLAVE
+        )
+        error.datapath = ryu_dp
+        for ofmsg in bundle[:-1]:
+            error.xid = ofmsg.xid
+            self.assertFalse(self.valve.oferror(error))
+        self.assertEqual((1, 0, 0, 0), self._bundle_counts())
+        error.xid = bundle[-1].xid
+        self.assertTrue(self.valve.oferror(error))
+        self.assertEqual(of_errors + len(bundle), self.get_prom("of_errors_total"))
+        self.assertEqual((1, 0, 1, 0), self._bundle_counts())
+        self.assertEqual(0, self._atomic_status())
+
+    def test_open_error_then_commit(self):
+        """Test the commit tells after an error on the open other than a timeout.
+
+        A switch that already has a bundle of the id refuses the open, and
+        discards that bundle, then makes a new one of the adds after the
+        open, so of all of the cold start, which it commits.
+        """
+        _, ryu_dp = self._cold_start()
+        error = self._open_error(ryu_dp)
+        error.exp_type = ofp.ONFERR_ET_BAD_ID
+        self.assertFalse(self.valve.oferror(error))
+        self.valve.bundle_ctrl_reply(self._commit_reply(ryu_dp))
+        self.assertEqual((1, 1, 0, 0), self._bundle_counts())
+        self.assertEqual(1, self._atomic_status())
+
+    def test_errors_on_bundle_connection(self):
+        """Test other errors on the bundle's connection are handled as before."""
+        _, ryu_dp = self._cold_start()
+        bundle = self._bundle(ryu_dp)
+        of_errors = self.get_prom("of_errors_total")
+        for xid in (bundle[1].xid, bundle[-1].xid + 1):
+            error = parser.OFPErrorMsg(
+                None, type_=ofp.OFPET_BAD_INSTRUCTION, code=ofp.OFPBIC_BAD_TABLE_ID
+            )
+            error.xid = xid
+            error.datapath = ryu_dp
+            self.assertFalse(self.valve.oferror(error))
+        self.assertEqual(of_errors + 2, self.get_prom("of_errors_total"))
+        self.assertEqual((1, 0, 0, 0), self._bundle_counts())
+        # Nor is another experimenter's error of the timeout's type on the open.
+        error = self._open_error(ryu_dp)
+        error.experimenter = 0x2320
+        self.assertFalse(self.valve.oferror(error))
+        # Nor a timeout that answers an add: the switch answers with the
+        # message that made the bundle, so that is one it made of adds.
+        self.assertFalse(
+            self.valve.oferror(self._open_error(ryu_dp, xid=bundle[1].xid))
+        )
+        self.assertEqual((1, 0, 0, 0), self._bundle_counts())
+        # The timeout that answers the bundle's open still discards it.
+        self.assertTrue(self.valve.oferror(self._open_error(ryu_dp)))
+        # Committed or refused, a bundle's open has no answer to wait for.
+        _, ryu_dp = self._cold_start()
+        self.valve.bundle_ctrl_reply(self._commit_reply(ryu_dp))
+        self.assertFalse(self.valve.oferror(self._open_error(ryu_dp)))
+        _, ryu_dp = self._cold_start()
+        self.assertTrue(self.valve.oferror(self._commit_error(ryu_dp)))
+        self.assertFalse(self.valve.oferror(self._open_error(ryu_dp)))
+        self.valve.datapath_disconnect(self.mock_time())
+        self.assertEqual((3, 1, 1, 1), self._bundle_counts())
+        self.assertEqual(0, self._atomic_status())
+
+
 if __name__ == "__main__":
     unittest.main()  # pytype: disable=module-attr
