@@ -79,6 +79,9 @@ class DP(Conf):
         # IPv6 ND neighbor timeout (seconds)
         "ofchannel_log": None,
         # OF channel log
+        "atomic_cold_start": False,
+        # If True, a cold start replaces the switch's flows in one atomic
+        # bundle, so it forwards on its old flows until then (Open vSwitch only)
         "stack": None,
         # stacking config, when cross connecting multiple DPs
         "ignore_learn_ins": 10,
@@ -172,6 +175,7 @@ class DP(Conf):
         "arp_neighbor_timeout": int,
         "nd_neighbor_timeout": int,
         "ofchannel_log": str,
+        "atomic_cold_start": bool,
         "stack": dict,
         "ignore_learn_ins": int,
         "drop_broadcast_source_address": bool,
@@ -246,6 +250,7 @@ class DP(Conf):
         self.advertise_interval = None
         self.fast_advertise_interval = None
         self.arp_neighbor_timeout = None
+        self.atomic_cold_start = None
         self.nd_neighbor_timeout = None
         self.combinatorial_port_flood = None
         self.configured = False
@@ -383,6 +388,13 @@ class DP(Conf):
         )
         test_config_condition(
             self.nd_neighbor_timeout > 65535, "nd_neighbor_timeout cannot be > 65535"
+        )
+        test_config_condition(
+            self.atomic_cold_start and self.hardware != "Open vSwitch",
+            (
+                "atomic_cold_start needs bundles on a pipeline without table "
+                "features, so hardware must be Open vSwitch, not %s" % self.hardware
+            ),
         )
         test_config_condition(
             self.combinatorial_port_flood and self.group_table,
@@ -1757,7 +1769,14 @@ class DP(Conf):
         elif new_dp.routers != self.routers:
             logger.info("DP routers config changed - requires cold start")
         elif not self.ignore_subconf(
-            new_dp, ignore_keys=["interfaces", "interface_ranges", "routers"]
+            new_dp,
+            # atomic_cold_start changes only how the next cold start is sent.
+            ignore_keys=[
+                "interfaces",
+                "interface_ranges",
+                "routers",
+                "atomic_cold_start",
+            ],
         ):
             logger.info(
                 "DP config changed - requires cold start: %s" % self.conf_diff(new_dp)
