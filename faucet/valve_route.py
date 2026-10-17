@@ -107,6 +107,7 @@ class ValveRouteManager(ValveManagerBase):
         "notify",
         "global_vlan",
         "global_routing",
+        "host_fib_sent",
         "logger",
         "max_host_fib_retry_count",
         "max_hosts_per_resolve_cycle",
@@ -127,6 +128,8 @@ class ValveRouteManager(ValveManagerBase):
     MAX_PACKET_IN_SIZE = valve_of.MAX_PACKET_IN_BYTES
     CONTROL_ETH_TYPES = ()  # type: ignore
     IP_PKT = None
+    # Seconds for which a packet in does not send a host's FIB flows again.
+    HOST_FIB_GUARD_TIME = 5
 
     def __init__(
         self,
@@ -163,6 +166,7 @@ class ValveRouteManager(ValveManagerBase):
         self.routers = routers
         self.routers_by_vid = self._routers_by_vid()
         self.vip_maps_by_vid = self._vip_maps_by_vid()
+        self.host_fib_sent = {}
         self.active = False
         self.global_routing = self._global_routing()
         self.stack_manager = stack_manager
@@ -375,6 +379,36 @@ class ValveRouteManager(ValveManagerBase):
         nexthop_cache = self._vlan_nexthop_cache(vlan)
         del nexthop_cache[ip_gw]
 
+    def _host_fib_sent_recently(self, now, vlan, host_ip, eth_dst):
+        """Return True if a host's FIB flows went to the switch too recently
+        for a packet in to send them again.
+
+        Args:
+            now (float): seconds since epoch.
+            vlan (vlan): VLAN of the host.
+            host_ip (ipaddress.ip_address): IP address of host.
+            eth_dst (str): MAC address the flows route to, None for a blackhole.
+        Returns:
+            bool: True if the same flows were sent within the guard time and
+                not deleted since.
+        """
+        sent = self.host_fib_sent.get(vlan.vid, {}).get(host_ip, None)
+        if sent is None:
+            return False
+        sent_time, sent_eth_dst = sent
+        guard_time = self.HOST_FIB_GUARD_TIME
+        if sent_eth_dst is None:
+            # Not if the blackhole could have timed out since.
+            guard_time = min(
+                guard_time,
+                self.max_resolve_backoff_time * self.max_host_fib_retry_count,
+            )
+        return sent_eth_dst == eth_dst and 0 <= now - sent_time < guard_time
+
+    def _set_host_fib_sent(self, now, vlan, host_ip, eth_dst):
+        """Note that a host's FIB flows went to the switch."""
+        self.host_fib_sent.setdefault(vlan.vid, {})[host_ip] = (now, eth_dst)
+
     def _nexthop_actions(self, eth_dst, vlan):
         """Return flowrule actions for fib entry"""
         actions = []
@@ -555,6 +589,9 @@ class ValveRouteManager(ValveManagerBase):
     def add_vlan(self, vlan, cold_start):
         """Add a VLAN."""
         ofmsgs = []
+        if cold_start:
+            # The switch has none of the FIB flows of the VLAN's hosts.
+            self.host_fib_sent.pop(vlan.vid, None)
         # add controller IPs if configured.
         for faucet_vip in vlan.faucet_vips_by_ipv(self.IPV):
             max_prefixlen = faucet_vip.ip.max_prefixlen
@@ -794,6 +831,9 @@ class ValveRouteManager(ValveManagerBase):
                         vlan, resolved_ip_gw, ip_dst, eth_src, is_updated
                     )
                 )
+            host_route = ipaddress.ip_network(resolved_ip_gw.exploded)
+            if self._vlan_routes(vlan).get(host_route, None) == resolved_ip_gw:
+                self._set_host_fib_sent(now, vlan, resolved_ip_gw, eth_src)
 
         self._update_nexthop_cache(now, vlan, eth_src, port, resolved_ip_gw)
         return ofmsgs
@@ -1021,8 +1061,15 @@ class ValveRouteManager(ValveManagerBase):
                         # A resolved destination reaches us only while no flows
                         # route to it: not yet, no longer, or never, when it is
                         # known from an advert alone. Route it, not blackhole it.
+                        # Packets queued at the switch before the route's flows
+                        # got there arrive after them: if the flows went out
+                        # moments ago, do not send them again.
                         host_route = ipaddress.ip_network(dst_ip.exploded)
-                        if self._vlan_routes(vlan).get(host_route, None) == dst_ip:
+                        if self._vlan_routes(vlan).get(host_route, None) != dst_ip:
+                            ofmsgs.extend(self._add_host_fib_route(vlan, dst_ip))
+                        elif not self._host_fib_sent_recently(
+                            now, vlan, dst_ip, cached_eth_dst
+                        ):
                             ofmsgs.extend(
                                 self._add_resolved_route(
                                     vlan,
@@ -1033,15 +1080,20 @@ class ValveRouteManager(ValveManagerBase):
                                     readd=True,
                                 )
                             )
-                        else:
-                            ofmsgs.extend(self._add_host_fib_route(vlan, dst_ip))
+                            self._set_host_fib_sent(now, vlan, dst_ip, cached_eth_dst)
                         return ofmsgs
                     resolution_in_progress = (
                         dst_ip in vlan.dyn_host_gws_by_ipv[self.IPV]
                     )
-                    ofmsgs.extend(
-                        self._add_host_fib_route(vlan, dst_ip, blackhole=True)
+                    # Nor a blackhole that went out moments ago.
+                    blackhole = not self._host_fib_sent_recently(
+                        now, vlan, dst_ip, None
                     )
+                    ofmsgs.extend(
+                        self._add_host_fib_route(vlan, dst_ip, blackhole=blackhole)
+                    )
+                    if blackhole:
+                        self._set_host_fib_sent(now, vlan, dst_ip, None)
                     nexthop_cache_entry = self._update_nexthop_cache(
                         now, vlan, None, None, dst_ip
                     )
@@ -1194,6 +1246,9 @@ class ValveRouteManager(ValveManagerBase):
     def _del_route_flows(self, vlan, ip_dst):
         """Delete all flows matching the vlan and ip_dst"""
         ofmsgs = []
+        if ip_dst.prefixlen == ip_dst.max_prefixlen:
+            # A packet for the host sends its flows again at once.
+            self.host_fib_sent.get(vlan.vid, {}).pop(ip_dst.network_address, None)
         routed_vlans = self._routed_vlans(vlan)
         for routed_vlan in routed_vlans:
             route_match = self._route_match(routed_vlan, ip_dst)
