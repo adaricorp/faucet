@@ -103,6 +103,22 @@ class FaucetMetrics(PromClient):
         self.of_dp_disconnections = self._dpid_counter(
             "of_dp_disconnections", "number of OF connections from a DP"
         )
+        self.faucet_cold_start_bundles = self._dpid_counter(
+            "faucet_cold_start_bundles",
+            "number of cold starts sent to DP in one bundle",
+        )
+        self.faucet_cold_start_bundles_committed = self._dpid_counter(
+            "faucet_cold_start_bundles_committed",
+            "number of cold start bundles DP committed",
+        )
+        self.faucet_cold_start_bundles_refused = self._dpid_counter(
+            "faucet_cold_start_bundles_refused",
+            "number of cold start bundles DP refused",
+        )
+        self.faucet_cold_start_bundles_lost = self._dpid_counter(
+            "faucet_cold_start_bundles_lost",
+            "number of cold start bundles whose connection ended before DP committed them",
+        )
         self.vlan_hosts_learned = self._gauge(
             "vlan_hosts_learned",
             "number of hosts learned on a VLAN",
@@ -181,6 +197,10 @@ class FaucetMetrics(PromClient):
             "port_lacp_state", "state of LACP on a port", self.port_required_labels
         )
         self.dp_status = self._dpid_gauge("dp_status", "status of datapaths")
+        self.dp_atomic_cold_start = self._dpid_gauge(
+            "dp_atomic_cold_start",
+            "1 if a cold start replaces the flows of DP in one bundle",
+        )
         self.dp_root_hop_port = self._gauge(
             "dp_root_hop_port", "port that leads to stack root DP", self.REQUIRED_LABELS
         )

@@ -464,8 +464,8 @@ class ValvesManager:
         fraction = configured / count if count > 0 else 0
         self.metrics.faucet_config_applied.set(fraction)
 
-    def datapath_connect(self, now, valve, discovered_up_ports):
+    def datapath_connect(self, now, valve, discovered_up_ports, ryu_dp=None):
         """Handle connection from DP."""
         self.meta_dp_state.dp_last_live_time[valve.dp.name] = now
         self.update_config_applied({valve.dp.dp_id: True})
-        return valve.datapath_connect(now, discovered_up_ports)
+        return valve.datapath_connect(now, discovered_up_ports, ryu_dp)

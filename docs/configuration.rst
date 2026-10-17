@@ -283,6 +283,25 @@ string names given to the datapath, or the OFP datapath id.
       - int
       - 2**11-1
       - When global routing is enabled, FIB VID used internally
+    * - atomic_cold_start
+      - boolean
+      - False
+      - If True, a cold start replaces the switch's flows in one atomic
+        bundle (the ONF bundle extension for OpenFlow 1.3), so the switch
+        forwards on its old flows until the new ones are all in, instead of
+        dropping traffic from when it connects. Open vSwitch only. The
+        switch holds every flow in the bundle until it commits it, so it
+        needs more memory during a cold start. A cold start that changes
+        groups or meters is sent without a bundle. A switch that refuses a
+        bundle, or does not commit three in a row before its connection
+        ends, is cold started without one until Faucet restarts. Open
+        vSwitch discards a bundle that receives nothing for
+        ``other_config:bundle-idle-timeout`` seconds (10 by default), and
+        Faucet then reconnects and cold starts the datapath. At a large
+        scale, where Faucet can be busy for longer than that while it sends
+        a bundle, raise it, for example with ``ovs-vsctl set Open_vSwitch .
+        other_config:bundle-idle-timeout=60``. Changing this option does not
+        cold start the datapath; it applies from the next cold start.
 
 
 Stacking (DP)

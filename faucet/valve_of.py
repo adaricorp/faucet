@@ -19,6 +19,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import copy
 import functools
 import ipaddress
 import random
@@ -38,6 +39,7 @@ from os_ken.ofproto import ether
 
 # pylint: disable=unused-import
 from os_ken.ofproto import inet  # noqa: F401
+from os_ken.ofproto import ofproto_common
 from os_ken.ofproto import ofproto_v1_3 as ofp
 from os_ken.ofproto import ofproto_v1_3_parser as parser
 
@@ -1371,6 +1373,75 @@ def faucet_async(
         [packet_in_mask, packet_in_mask],
         [port_status_mask, port_status_mask],
         [flow_removed_mask, flow_removed_mask],
+    )
+
+
+def is_bundle_timeout(ofmsg):
+    """Return True if ofmsg is the switch's error for a bundle it timed out.
+
+    A switch discards a bundle that receives no message for its bundle idle
+    timeout, and answers the bundle's open with this error.
+
+    Args:
+        ofmsg: ryu.ofproto.ofproto_v1_3_parser error message.
+    Returns:
+        bool: True if is a bundle timeout error
+    """
+    return (
+        ofmsg.type == ofp.OFPET_EXPERIMENTER
+        and ofmsg.experimenter == ofproto_common.ONF_EXPERIMENTER_ID
+        and ofmsg.exp_type == ofp.ONFERR_ET_TIMEOUT
+    )
+
+
+def bundle_ofmsgs(ofmsgs, bundle_id):
+    """Return ofmsgs with their flow mods in one atomic, ordered bundle.
+
+    The switch applies every flow mod in the bundle at once, when it is
+    committed, so it keeps forwarding on the flows it has until then.
+    Configuration goes before the bundle, and an async config, packet outs
+    and anything else that cannot be bundled after the commit, so the
+    controller asks for packet ins only once the new flows are in place.
+    Barriers are left out of the bundle and one follows the commit.
+
+    Returns None if ofmsgs hold group or meter mods, which not every switch
+    can bundle atomically, so the caller sends ofmsgs as they are.
+    """
+    before = []
+    bundled = []
+    after = []
+    flags = ofp.ONF_BF_ATOMIC | ofp.ONF_BF_ORDERED
+    for ofmsg in ofmsgs:
+        if is_groupmod(ofmsg) or is_metermod(ofmsg):
+            return None
+        if is_flowmod(ofmsg):
+            inner = copy.copy(ofmsg)
+            inner.xid = None
+            inner.buf = None
+            bundled.append(parser.ONFBundleAddMsg(None, bundle_id, flags, inner, []))
+        elif isinstance(ofmsg, parser.OFPBarrierRequest):
+            continue
+        elif isinstance(ofmsg, parser.OFPSetConfig):
+            before.append(ofmsg)
+        else:
+            after.append(ofmsg)
+    if not bundled:
+        return None
+    return (
+        before
+        + [
+            parser.ONFBundleCtrlMsg(
+                None, bundle_id, ofp.ONF_BCT_OPEN_REQUEST, flags, []
+            )
+        ]
+        + bundled
+        + [
+            parser.ONFBundleCtrlMsg(
+                None, bundle_id, ofp.ONF_BCT_COMMIT_REQUEST, flags, []
+            ),
+            barrier(),
+        ]
+        + after
     )
 
 
