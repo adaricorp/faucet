@@ -926,6 +926,15 @@ contains a dictionary of individual acls each keyed by its name.
 Each acl contains a list of rules: a packet will have the first matching rule
 applied to it.
 
+Each rule of the ACLs used together, in a port's or a VLAN's acls_in, a
+VLAN's acls_out or a datapath's dp_acls, takes an OpenFlow priority of its
+own, so they can have at most 65534 rules between them. An 802.1X ACL
+(auth_acl, noauth_acl, or an ACL with dot1x_assigned) is installed on its
+own, and can have at most 16384 rules. Setting lowest_priority (or
+priority_offset, its default) above 0 lowers both limits by as much. A
+configuration with more is rejected. ACLs with exact_match share one
+priority, and have no such limit.
+
 Each rule is a dictionary containing the single key 'rule' with matches
 and actions. Matches are key/values based on the `ryu RESTFul API.
 <https://ryu.readthedocs.io/en/latest/app/ofctl_rest.html#reference-description-of-match-and-actions>`_
