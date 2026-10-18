@@ -304,10 +304,16 @@ class Faucet(OSKenAppBase):
         valve, ryu_dp, msg = self._get_valve(ryu_event)
         if valve is None:
             return
-        if valve.oferror(msg):
-            # The switch refused a cold start's bundle, or discarded it before
-            # its commit: reconnect, to cold start again.
+        flow_msgs = valve.oferror(msg)
+        if flow_msgs is None:
+            # The switch refused a bundle, so kept its old flows, or discarded
+            # one on its idle timeout, so may apply part of it, and its flow
+            # mods cannot be sent again: reconnect, to cold start.
             ryu_dp.close()
+        elif flow_msgs:
+            # A warm start's bundle that the switch refused or discarded: send
+            # its flow mods again.
+            self._send_flow_msgs(valve, flow_msgs, ryu_dp=ryu_dp)
 
     @set_ev_cls(
         ofp_event.EventONFBundleCtrlMsg, MAIN_DISPATCHER  # pylint: disable=no-member

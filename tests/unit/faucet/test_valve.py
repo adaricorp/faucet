@@ -2331,14 +2331,14 @@ vlans:
             None, type_=ofp.OFPET_BAD_INSTRUCTION, code=ofp.OFPBIC_BAD_TABLE_ID
         )
         # With no bundle in flight, an error without an xid is only an error.
-        self.assertFalse(self.valve.oferror(error))
+        self.assertEqual([], self.valve.oferror(error))
         _, ryu_dp = self._cold_start()
         bundle = self._bundle(ryu_dp)
         of_errors = self.get_prom("of_errors_total")
         # A flow mod the switch cannot apply has an error of its own, and
         # the switch still commits the rest of the bundle.
         error.xid = bundle[1].xid
-        self.assertFalse(self.valve.oferror(error))
+        self.assertEqual([], self.valve.oferror(error))
         self.assertEqual((1, 0, 0, 0), self._bundle_counts())
         self.assertEqual(1, self._atomic_status())
         # Failing the commit, it applies none of the bundle.
@@ -2346,11 +2346,11 @@ vlans:
             None, type_=ofp.OFPET_EXPERIMENTER, exp_type=2313, experimenter=0x4F4E4600
         )
         error.xid = bundle[-1].xid
-        self.assertTrue(self.valve.oferror(error))
+        self.assertIsNone(self.valve.oferror(error))
         self.assertEqual((1, 0, 1, 0), self._bundle_counts())
         self.assertEqual(0, self._atomic_status())
         self.assertEqual(of_errors + 2, self.get_prom("of_errors_total"))
-        self.assertFalse(self.valve.oferror(error), "refused twice")
+        self.assertEqual([], self.valve.oferror(error), "refused twice")
         features, ryu_dp = self._cold_start()
         self.assertTrue(self._global_deletes(features), "no delete once refused")
         self.assertFalse(self._bundle(ryu_dp), "bundled again once refused")
@@ -2385,7 +2385,7 @@ vlans:
             None, type_=ofp.OFPET_EXPERIMENTER, exp_type=2313, experimenter=0x4F4E4600
         )
         error.xid = self._bundle(ryu_dp)[-1].xid
-        self.assertFalse(self.valve.oferror(error))
+        self.assertEqual([], self.valve.oferror(error))
         self.assertEqual((1, 0, 0, 1), self._bundle_counts())
 
     def _cold_start_on(self, ryu_dp):
@@ -2547,16 +2547,16 @@ vlans:
         """
         _, ryu_dp = self._cold_start()
         of_errors = self.get_prom("of_errors_total")
-        self.assertTrue(self.valve.oferror(self._open_error(ryu_dp)))
+        self.assertIsNone(self.valve.oferror(self._open_error(ryu_dp)))
         self.assertEqual(of_errors + 1, self.get_prom("of_errors_total"))
         # The switch times a bundle out once: another timeout is only an error.
-        self.assertFalse(self.valve.oferror(self._open_error(ryu_dp)))
+        self.assertEqual([], self.valve.oferror(self._open_error(ryu_dp)))
         self.assertEqual(of_errors + 2, self.get_prom("of_errors_total"))
         self.assertEqual((1, 0, 0, 0), self._bundle_counts())
         # What the switch commits, or fails to, under the bundle's id is not
         # the bundle.
         self.valve.bundle_ctrl_reply(self._commit_reply(ryu_dp))
-        self.assertFalse(self.valve.oferror(self._commit_error(ryu_dp)))
+        self.assertEqual([], self.valve.oferror(self._commit_error(ryu_dp)))
         self.assertEqual((1, 0, 0, 0), self._bundle_counts())
         self.assertEqual(1, self._atomic_status())
         # The connection ends, and its cold start is bundled again.
@@ -2574,7 +2574,7 @@ vlans:
         for lost in range(max_lost):
             _, ryu_dp = self._cold_start()
             self.assertTrue(self._bundle(ryu_dp), "stopped bundling too soon")
-            self.assertTrue(self.valve.oferror(self._open_error(ryu_dp)))
+            self.assertIsNone(self.valve.oferror(self._open_error(ryu_dp)))
             self.assertEqual(1, self._atomic_status())
             self.valve.datapath_disconnect(self.mock_time())
             self.assertEqual((lost + 1, 0, 0, lost + 1), self._bundle_counts())
@@ -2594,11 +2594,11 @@ vlans:
         _, ryu_dp = self._cold_start()
         open_xid = self._bundle(ryu_dp)[0].xid
         for other_dp in (old_dp, None):
-            self.assertFalse(
-                self.valve.oferror(self._open_error(other_dp, xid=open_xid))
+            self.assertEqual(
+                [], self.valve.oferror(self._open_error(other_dp, xid=open_xid))
             )
         self.assertEqual((1, 0, 0, 0), self._bundle_counts())
-        self.assertTrue(self.valve.oferror(self._open_error(ryu_dp)))
+        self.assertIsNone(self.valve.oferror(self._open_error(ryu_dp)))
         self.valve.datapath_disconnect(self.mock_time())
         self.assertEqual((1, 0, 0, 1), self._bundle_counts())
 
@@ -2618,10 +2618,10 @@ vlans:
         error.datapath = ryu_dp
         for ofmsg in bundle[:-1]:
             error.xid = ofmsg.xid
-            self.assertFalse(self.valve.oferror(error))
+            self.assertEqual([], self.valve.oferror(error))
         self.assertEqual((1, 0, 0, 0), self._bundle_counts())
         error.xid = bundle[-1].xid
-        self.assertTrue(self.valve.oferror(error))
+        self.assertIsNone(self.valve.oferror(error))
         self.assertEqual(of_errors + len(bundle), self.get_prom("of_errors_total"))
         self.assertEqual((1, 0, 1, 0), self._bundle_counts())
         self.assertEqual(0, self._atomic_status())
@@ -2636,7 +2636,7 @@ vlans:
         _, ryu_dp = self._cold_start()
         error = self._open_error(ryu_dp)
         error.exp_type = ofp.ONFERR_ET_BAD_ID
-        self.assertFalse(self.valve.oferror(error))
+        self.assertEqual([], self.valve.oferror(error))
         self.valve.bundle_ctrl_reply(self._commit_reply(ryu_dp))
         self.assertEqual((1, 1, 0, 0), self._bundle_counts())
         self.assertEqual(1, self._atomic_status())
@@ -2652,28 +2652,28 @@ vlans:
             )
             error.xid = xid
             error.datapath = ryu_dp
-            self.assertFalse(self.valve.oferror(error))
+            self.assertEqual([], self.valve.oferror(error))
         self.assertEqual(of_errors + 2, self.get_prom("of_errors_total"))
         self.assertEqual((1, 0, 0, 0), self._bundle_counts())
         # Nor is another experimenter's error of the timeout's type on the open.
         error = self._open_error(ryu_dp)
         error.experimenter = 0x2320
-        self.assertFalse(self.valve.oferror(error))
+        self.assertEqual([], self.valve.oferror(error))
         # Nor a timeout that answers an add: the switch answers with the
         # message that made the bundle, so that is one it made of adds.
-        self.assertFalse(
-            self.valve.oferror(self._open_error(ryu_dp, xid=bundle[1].xid))
+        self.assertEqual(
+            [], self.valve.oferror(self._open_error(ryu_dp, xid=bundle[1].xid))
         )
         self.assertEqual((1, 0, 0, 0), self._bundle_counts())
         # The timeout that answers the bundle's open still discards it.
-        self.assertTrue(self.valve.oferror(self._open_error(ryu_dp)))
+        self.assertIsNone(self.valve.oferror(self._open_error(ryu_dp)))
         # Committed or refused, a bundle's open has no answer to wait for.
         _, ryu_dp = self._cold_start()
         self.valve.bundle_ctrl_reply(self._commit_reply(ryu_dp))
-        self.assertFalse(self.valve.oferror(self._open_error(ryu_dp)))
+        self.assertEqual([], self.valve.oferror(self._open_error(ryu_dp)))
         _, ryu_dp = self._cold_start()
-        self.assertTrue(self.valve.oferror(self._commit_error(ryu_dp)))
-        self.assertFalse(self.valve.oferror(self._open_error(ryu_dp)))
+        self.assertIsNone(self.valve.oferror(self._commit_error(ryu_dp)))
+        self.assertEqual([], self.valve.oferror(self._open_error(ryu_dp)))
         self.valve.datapath_disconnect(self.mock_time())
         self.assertEqual((3, 1, 1, 1), self._bundle_counts())
         self.assertEqual(0, self._atomic_status())
