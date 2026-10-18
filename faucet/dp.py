@@ -82,6 +82,9 @@ class DP(Conf):
         "atomic_cold_start": False,
         # If True, a cold start replaces the switch's flows in one atomic
         # bundle, so it forwards on its old flows until then (Open vSwitch only)
+        "atomic_warm_start": False,
+        # If True, a warm start changes the switch's flows in one atomic
+        # bundle, so it forwards on its old flows until then (Open vSwitch only)
         "stack": None,
         # stacking config, when cross connecting multiple DPs
         "ignore_learn_ins": 10,
@@ -176,6 +179,7 @@ class DP(Conf):
         "nd_neighbor_timeout": int,
         "ofchannel_log": str,
         "atomic_cold_start": bool,
+        "atomic_warm_start": bool,
         "stack": dict,
         "ignore_learn_ins": int,
         "drop_broadcast_source_address": bool,
@@ -251,6 +255,7 @@ class DP(Conf):
         self.fast_advertise_interval = None
         self.arp_neighbor_timeout = None
         self.atomic_cold_start = None
+        self.atomic_warm_start = None
         self.nd_neighbor_timeout = None
         self.combinatorial_port_flood = None
         self.configured = False
@@ -393,6 +398,13 @@ class DP(Conf):
             self.atomic_cold_start and self.hardware != "Open vSwitch",
             (
                 "atomic_cold_start needs bundles on a pipeline without table "
+                "features, so hardware must be Open vSwitch, not %s" % self.hardware
+            ),
+        )
+        test_config_condition(
+            self.atomic_warm_start and self.hardware != "Open vSwitch",
+            (
+                "atomic_warm_start needs bundles on a pipeline without table "
                 "features, so hardware must be Open vSwitch, not %s" % self.hardware
             ),
         )
@@ -1770,12 +1782,14 @@ class DP(Conf):
             logger.info("DP routers config changed - requires cold start")
         elif not self.ignore_subconf(
             new_dp,
-            # atomic_cold_start changes only how the next cold start is sent.
+            # atomic_cold_start and atomic_warm_start change only how the
+            # next cold or warm start is sent.
             ignore_keys=[
                 "interfaces",
                 "interface_ranges",
                 "routers",
                 "atomic_cold_start",
+                "atomic_warm_start",
             ],
         ):
             logger.info(

@@ -282,6 +282,32 @@ string names given to the datapath, or the OFP datapath id.
         a bundle, raise it, for example with ``ovs-vsctl set Open_vSwitch .
         other_config:bundle-idle-timeout=60``. Changing this option does not
         cold start the datapath; it applies from the next cold start.
+    * - atomic_warm_start
+      - boolean
+      - False
+      - If True, a warm start changes the switch's flows in one atomic
+        bundle, as atomic_cold_start does for a cold start, so the switch
+        forwards on its old flows until it applies the new ones all at
+        once, instead of a changed port or VLAN dropping or not flooding
+        traffic until its last flow is in. Packet outs are sent after the
+        commit. Open vSwitch only. The switch holds every flow in the
+        bundle until it commits it, and applies a large bundle in one go,
+        so a warm start that changes many flows needs more memory and keeps
+        the switch busy for longer at once. A warm start that changes
+        groups or meters, that is sent before the switch has answered the
+        previous bundle's commit, or that goes to a new connection from the
+        switch before its cold start, is sent without a bundle. If the
+        switch refuses a warm start's bundle, Faucet sends the same flow
+        changes again without one, or cold starts the datapath if it has
+        changed its flows since. As with atomic_cold_start, Open vSwitch
+        discards a bundle that receives nothing for
+        ``other_config:bundle-idle-timeout`` seconds (10 by default), and
+        may then apply part of it, so Faucet does the same for a warm
+        start's bundle it discards. A switch that refuses a bundle, or
+        does not commit three in a row, as it discards them or its
+        connection ends first, is warm started without one until Faucet
+        restarts. Changing this option does not cold start the datapath;
+        it applies from the next warm start.
 
 
 Stacking (DP)
