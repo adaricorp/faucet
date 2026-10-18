@@ -2355,6 +2355,137 @@ dps:
             self.assertEqual(next_table, eth_dst_table.table_id)
 
 
+class ValveStaticRouteChangeVLANPortsTestCase(ValveTestBases.ValveTestNetwork):
+    """Test static routes when a warm start changes a routed VLAN's ports only.
+
+    The gateway's own port is unchanged, and so is the VLAN's own config, so
+    the gateway stays resolved and its routes stay.
+    """
+
+    REQUIRE_TFM = False
+    FAUCET_MAC2 = "0e:00:00:00:00:02"
+    GATEWAYS = (ip_address("10.20.0.1"), ip_address("fb00::1"))
+    ROUTES = ("0.0.0.0/0", "10.99.99.0/24", "::/0", "2001:db8:99::/64")
+
+    def _config(self, vlan2_ports=(2, 3), vlan2_routes=ROUTES):
+        """Return a config routing vlan1 with vlan2, whose routes are via GATEWAYS."""
+        interfaces = {1: {"native_vlan": "vlan1"}}
+        for port in vlan2_ports:
+            interfaces[port] = {"native_vlan": "vlan2"}
+        routes = [
+            {"route": {"ip_dst": ip_dst, "ip_gw": str(self._gateway(ip_dst))}}
+            for ip_dst in vlan2_routes
+        ]
+        return config_parser_util.yaml_dump(
+            {
+                "vlans": {
+                    "vlan1": {
+                        "vid": 0x100,
+                        "faucet_vips": ["10.10.0.254/24", "fa00::254/64"],
+                    },
+                    "vlan2": {
+                        "vid": 0x200,
+                        "faucet_vips": ["10.20.0.254/24", "fb00::254/64"],
+                        "faucet_mac": self.FAUCET_MAC2,
+                        "routes": routes,
+                    },
+                },
+                "routers": {"router-1": {"vlans": ["vlan1", "vlan2"]}},
+                "dps": {
+                    "s1": {
+                        "dp_id": 1,
+                        "hardware": "Open vSwitch",
+                        "ignore_learn_ins": 0,
+                        "interfaces": interfaces,
+                    }
+                },
+            }
+        )
+
+    def _gateway(self, ip_dst):
+        """Return the gateway of ip_dst's IP version."""
+        version = 6 if ":" in ip_dst else 4
+        return next(ip_gw for ip_gw in self.GATEWAYS if ip_gw.version == version)
+
+    def _resolve_gateway(self):
+        """The gateway on port 2 asks for its VIPs, so faucet resolves it."""
+        self.l3_learn_host(
+            2,
+            0x200,
+            self.P2_V200_MAC,
+            list(self.GATEWAYS),
+            [ip_address("10.20.0.254"), ip_address("fb00::254")],
+        )
+
+    def _static_routes(self):
+        """Return the FIBs' flows for vlan2's routes, as {(vlan, ip_dst): eth_dst}."""
+        valve = self.valves_manager.valves[self.DP_ID]
+        vlan_names = {
+            vlan.vid | ofp.OFPVID_PRESENT: vlan.name for vlan in valve.dp.vlans.values()
+        }
+        routes = {}
+        for table_name, field in (("ipv4_fib", "ipv4_dst"), ("ipv6_fib", "ipv6_dst")):
+            fib_table_id = valve.dp.tables[table_name].table_id
+            for flow in self.network.tables[self.DP_ID].tables[fib_table_id]:
+                if field not in flow.match_values:
+                    continue
+                # Packed bytes, so a /0 is read in its own IP version.
+                ip_dst = "%s/%u" % (
+                    ip_address(flow.match_values[field].bytes),
+                    flow.match_masks[field].bin.count("1"),
+                )
+                if ip_dst not in self.ROUTES:
+                    continue
+                vlan_name = vlan_names[flow.match_values["vlan_vid"].int]
+                for instruction in flow.instructions:
+                    if instruction.type != ofp.OFPIT_APPLY_ACTIONS:
+                        continue
+                    for action in instruction.actions:
+                        if getattr(action, "key", None) == "eth_dst":
+                            routes[(vlan_name, ip_dst)] = action.value
+        return routes
+
+    def _routed(self, *ip_dsts):
+        """Return ip_dsts routed via the gateway on both VLANs."""
+        return {
+            (vlan_name, ip_dst): self.P2_V200_MAC
+            for vlan_name in ("vlan1", "vlan2")
+            for ip_dst in ip_dsts
+        }
+
+    def setUp(self):
+        """Setup the config and resolve the gateway"""
+        self.setup_valves(self._config())
+        self._resolve_gateway()
+        self.assertEqual(self._routed(*self.ROUTES), self._static_routes())
+
+    def _verify_vlan2_ports_change(self, vlan2_ports):
+        """Changing only vlan2's ports keeps the gateway and its routes."""
+        self.update_config(self._config(vlan2_ports=vlan2_ports), reload_type="warm")
+        vlan2 = self.valves_manager.valves[self.DP_ID].dp.vlans[0x200]
+        for ip_gw in self.GATEWAYS:
+            self.assertIn(ip_gw, vlan2.neigh_cache_by_ipv(ip_gw.version))
+        self.assertEqual(self._routed(*self.ROUTES), self._static_routes())
+
+    def test_add_port(self):
+        """Test adding a port to a routed VLAN keeps its static routes."""
+        self._verify_vlan2_ports_change((2, 3, 4))
+
+    def test_delete_port(self):
+        """Test deleting a port from a routed VLAN keeps its static routes."""
+        self._verify_vlan2_ports_change((2,))
+
+    def test_delete_static_route_after_add_port(self):
+        """Test a route deleted before its gateway resolves again leaves no flows."""
+        self.update_config(self._config(vlan2_ports=(2, 3, 4)), reload_type="warm")
+        self.update_config(
+            self._config(vlan2_ports=(2, 3, 4), vlan2_routes=("0.0.0.0/0", "::/0")),
+            reload_type="warm",
+        )
+        self._resolve_gateway()
+        self.assertEqual(self._routed("0.0.0.0/0", "::/0"), self._static_routes())
+
+
 class ValveAddVIPTestCase(ValveTestBases.ValveTestNetwork):
     """Test adding VIPs to a VLAN."""
 
@@ -5691,10 +5822,10 @@ dps:
         batches = []
         vip_hosts = []
 
-        def scanned_del_vlans(valve, vlans, dp_vlans):
+        def scanned_del_vlans(valve, vlans, dp_vlans, **kwargs):
             dp_vlans = _ScannedVLANs(dp_vlans)
             batches.append((vlans, dp_vlans))
-            return del_vlans(valve, vlans, dp_vlans)
+            return del_vlans(valve, vlans, dp_vlans, **kwargs)
 
         def counted_host_from_faucet_vip(route_manager, faucet_vip):
             vip_hosts.append(faucet_vip)
