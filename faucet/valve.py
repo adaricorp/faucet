@@ -450,11 +450,18 @@ class Valve:
             ofmsgs.extend(self.add_vlan(vlan, cold_start=cold_start))
         return ofmsgs
 
-    def del_vlan(self, vlan, dp_vlan_refs):
-        """Delete a configured VLAN."""
+    def del_vlan(self, vlan, dp_vlan_refs, keep_routing=False):
+        """Delete a configured VLAN.
+
+        With keep_routing, the route managers keep the VLAN's flows and next
+        hops, as a warm start adds the VLAN back with the same routing.
+        """
         self.logger.info("Delete VLAN %s" % vlan)
         ofmsgs = []
+        route_managers = self._route_manager_by_ipv.values()
         for manager in self._managers:
+            if keep_routing and manager in route_managers:
+                continue
             ofmsgs.extend(manager.del_vlan(vlan, dp_vlan_refs[manager]))
         expired_hosts = list(vlan.dyn_host_cache.values())
         for entry in expired_hosts:
@@ -463,10 +470,10 @@ class Valve:
         # ports changed, the new config's VLAN shares its caches, so clear
         # them in place: the VLAN's hosts must be learned again, as their
         # flows have been deleted.
-        vlan.clear_caches()
+        vlan.clear_caches(keep_neighbours=keep_routing)
         return ofmsgs
 
-    def del_vlans(self, vlans, dp_vlans):
+    def del_vlans(self, vlans, dp_vlans, keep_routing_vids=frozenset()):
         ofmsgs = []
         # Gather what each manager reference counts against once, rather
         # than rescanning every VLAN on the DP for each VLAN deleted.
@@ -474,7 +481,11 @@ class Valve:
             manager: manager.dp_vlan_refs(dp_vlans) for manager in self._managers
         }
         for vlan in vlans:
-            ofmsgs.extend(self.del_vlan(vlan, dp_vlan_refs))
+            ofmsgs.extend(
+                self.del_vlan(
+                    vlan, dp_vlan_refs, keep_routing=vlan.vid in keep_routing_vids
+                )
+            )
         return ofmsgs
 
     def _get_all_configured_port_nos(self):
@@ -1596,24 +1607,20 @@ class Valve:
                 return True
         return False
 
-    def _changed_port_expire_vids(self, new_dp, changed_ports, changed_vids):
-        """Return the VLAN IDs to expire next hops on, for changed ports.
+    def _expire_scope_vids(self, new_dp, changed_vids):
+        """Return the VLAN IDs whose next hops a warm start expires.
 
-        A port whose own config did not change is changed only because of its
-        VLANs, or the stack or mirroring around it. Next hops learned on its
-        unchanged VLANs are still reachable through it, so they are kept,
-        unless the VLAN can share FIB flows with a changed VLAN: if their
-        subnets overlap (hosts on both could have the same address, and so
-        share a host route), or if they route the same destination (expiring
-        one gateway deletes the route flow they share). Ports whose own config
-        changed are left out, so next hops on all their VLANs are expired.
+        Those of the VLANs whose routing changes, and of every VLAN that can
+        share FIB flows with one of them: if their subnets overlap (hosts on
+        both could have the same address, and so share a host route), or if
+        they route the same destination (expiring one gateway deletes the
+        route flow they share).
 
         Args:
             new_dp (DP): new dataplane configuration.
-            changed_ports (set): changed port numbers.
-            changed_vids (set): changed, ACL changed or deleted VLAN IDs.
+            changed_vids (set): VLAN IDs whose routing changes.
         Returns:
-            dict: VLAN IDs to expire next hops on, by port number.
+            set: VLAN IDs.
         """
         changed_vlans = [
             dp.vlans[vid]
@@ -1641,19 +1648,116 @@ class Valve:
                 for ip_dst in vlan.routes_by_ipv(ipv)
             ):
                 expire_vids.add(vlan.vid)
+        return expire_vids
+
+    def _kept_routing_vids(
+        self, new_dp, changed_vids, deleted_vids, changed_acl_vids, routers_change
+    ):
+        """Return the changed VLAN IDs whose routing a warm start keeps.
+
+        A VLAN is changed when a port joins or leaves it, as well as when its
+        own config changes. One whose own config is unchanged, and that is
+        routed with the same VLANs as before, routes as it did: the new
+        config's VLAN shares its caches (see Conf.merge_dyn()), and its FIB
+        flows and the routes via its next hops are still right. So they are
+        kept, unless the VLAN can share FIB flows with a VLAN whose routing
+        does change (see _expire_scope_vids()). A VLAN whose ACLs alone
+        change routes as it did too.
+
+        Not a VLAN with an LACP port, though: a warm start deletes every port
+        of a changed VLAN, and deleting an LACP port expires none of its next
+        hops (see lacp_update()). Nor any VLAN of a stacked datapath, where a
+        host can move to another stack port with the topology.
+
+        Args:
+            new_dp (DP): new dataplane configuration.
+            changed_vids (set): changed VLAN IDs.
+            deleted_vids (set): deleted VLAN IDs.
+            changed_acl_vids (set): VLAN IDs whose ACLs alone changed.
+            routers_change (tuple): _routers_change() of the running config.
+        Returns:
+            tuple: the VLAN IDs whose routing is kept, and _expire_scope_vids()
+                of the others.
+        """
+        if self.dp.stack or new_dp.stack:
+            return (
+                set(),
+                self._expire_scope_vids(
+                    new_dp, changed_vids | deleted_vids | changed_acl_vids
+                ),
+            )
+        old_peers = new_peers = {}
+        if routers_change is not None:
+            old_peers = routers_change[0]
+            new_peers = valve_route.ValveRouteManager.routed_peers(new_dp.routers)
+        lacp_vids = {
+            vlan.vid
+            for port in self.dp.ports.values()
+            if port.lacp
+            for vlan in port.vlans()
+        }
+        kept_vids = {
+            vid
+            for vid in changed_vids - lacp_vids
+            if self.dp.vlans[vid].ignore_subconf(
+                new_dp.vlans[vid], ignore_keys=["acls_in", "description"]
+            )
+            and old_peers.get(vid, set()) == new_peers.get(vid, set())
+        }
+        while True:
+            expire_vids = self._expire_scope_vids(
+                new_dp, (changed_vids - kept_vids) | deleted_vids
+            )
+            if not kept_vids & expire_vids:
+                return (kept_vids, expire_vids)
+            kept_vids -= expire_vids
+
+    def _changed_port_expire_vids(self, new_dp, changed_ports, expire_vids):
+        """Return the VLAN IDs to expire next hops on, for changed ports.
+
+        A port whose own config did not change is changed only because of its
+        VLANs, or the stack or mirroring around it. Next hops learned on its
+        other VLANs are still reachable through it, so they are kept. So are
+        those on a port whose own config changed only in which VLANs it
+        carries, or in its ACLs, on each VLAN it carries as it did, tagged or
+        untagged. Ports whose own config changed otherwise are left out, so
+        next hops on all their VLANs are expired.
+
+        Args:
+            new_dp (DP): new dataplane configuration.
+            changed_ports (set): changed port numbers.
+            expire_vids (set): _expire_scope_vids() of the VLANs whose routing
+                changes.
+        Returns:
+            dict: VLAN IDs to expire next hops on, by port number.
+        """
         expire_vids_by_port = {}
         for port_num in changed_ports:
             port = self.dp.ports.get(port_num, None)
             new_port = new_dp.ports.get(port_num, None)
             if port is None or new_port is None:
                 continue
-            if not port.ignore_subconf(new_port, ignore_keys=["description"]):
+            if port.ignore_subconf(new_port, ignore_keys=["description"]):
+                kept_vids = {vlan.vid for vlan in new_port.vlans()}
+            elif port.ignore_subconf(
+                new_port,
+                ignore_keys=["acls_in", "description", "native_vlan", "tagged_vlans"],
+            ):
+                kept_vids = {vlan.vid for vlan in port.tagged_vlans} & {
+                    vlan.vid for vlan in new_port.tagged_vlans
+                }
+                if (
+                    port.native_vlan is not None
+                    and new_port.native_vlan is not None
+                    and port.native_vlan.vid == new_port.native_vlan.vid
+                ):
+                    kept_vids.add(port.native_vlan.vid)
+            else:
                 continue
-            new_vids = {vlan.vid for vlan in new_port.vlans()}
             expire_vids_by_port[port_num] = {
                 vlan.vid
                 for vlan in port.vlans()
-                if vlan.vid in expire_vids or vlan.vid not in new_vids
+                if vlan.vid in expire_vids or vlan.vid not in kept_vids
             }
         return expire_vids_by_port
 
@@ -1792,11 +1896,16 @@ class Valve:
             self.dp_init(new_dp)
             return restart_type, ofmsgs
 
+        # A VLAN changed only through its ports, and one whose ACLs alone
+        # change, keeps its routing.
+        kept_routing_vids, expire_vids = self._kept_routing_vids(
+            new_dp, changed_vids, deleted_vids, changed_acl_vlans, routers_change
+        )
         if deleted_ports:
             ofmsgs.extend(self.ports_delete(deleted_ports))
         if changed_ports:
             expire_vids_by_port = self._changed_port_expire_vids(
-                new_dp, changed_ports, changed_vids | deleted_vids | changed_acl_vlans
+                new_dp, changed_ports, expire_vids
             )
             ofmsgs.extend(
                 self.ports_delete(
@@ -1822,7 +1931,13 @@ class Valve:
 
         if changed_vids:
             changed_vlans = [self.dp.vlans[vid] for vid in changed_vids]
-            ofmsgs.extend(self.del_vlans(changed_vlans, new_dp.vlans.values()))
+            ofmsgs.extend(
+                self.del_vlans(
+                    changed_vlans,
+                    new_dp.vlans.values(),
+                    keep_routing_vids=kept_routing_vids,
+                )
+            )
 
         self.dp_init(new_dp, valves)
 
@@ -1859,7 +1974,7 @@ class Valve:
         if changed_vids:
             changed_vlans = {self.dp.vlans[vid] for vid in changed_vids}
             ofmsgs.extend(self.add_vlans(changed_vlans, cold_start=False))
-        for vid in added_vids | changed_vids:
+        for vid in added_vids | (changed_vids - kept_routing_vids):
             # Other VLANs in the same router keep their resolved next hops,
             # so install their routes on the added or changed VLAN too.
             vlan = self.dp.vlans[vid]
