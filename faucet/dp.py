@@ -34,6 +34,7 @@ from faucet.vlan import VLAN
 from faucet.conf import Conf, test_config_condition
 from faucet.faucet_pipeline import ValveTableConfig
 from faucet.valve import SUPPORTED_HARDWARE
+from faucet.valve_acl import ValveAclManager
 from faucet.valve_table import ValveTable, ValveGroupTable
 from faucet.stack import Stack
 
@@ -1278,6 +1279,33 @@ class DP(Conf):
                     ("ACLs when used together must have consistent exact_match"),
                 )
 
+        def verify_acl_rule_count(acls, acls_of, exact_match, dot1x=False):
+            """Verify ACLs used together have a priority for each rule."""
+            if exact_match:
+                # Every rule of an exact match table has the same priority.
+                return
+            rules = sum(len(acl.rules) for acl in acls)
+            max_rules = ValveAclManager.max_rules(self.lowest_priority, dot1x=dot1x)
+            test_config_condition(
+                rules > max_rules,
+                (
+                    "%s has %u ACL rules, more than the %u that %s can have"
+                    % (
+                        acls_of,
+                        rules,
+                        max_rules,
+                        "an 802.1X ACL" if dot1x else "ACLs used together",
+                    )
+                ),
+            )
+
+        def verify_dot1x_acl_rule_count(acl_name):
+            """Verify an 802.1X ACL has a priority for each rule."""
+            acl = self.acls[acl_name]
+            verify_acl_rule_count(
+                [acl], "802.1X ACL %s" % acl_name, acl.exact_match, dot1x=True
+            )
+
         def resolve_acls():
             """Resolve config references in ACLs."""
             for vlan in self.vlans.values():
@@ -1288,6 +1316,9 @@ class DP(Conf):
                         acls.append(self.acls[acl])
                     vlan.acls_in = acls
                     verify_acl_exact_match(acls)
+                    verify_acl_rule_count(
+                        acls, "VLAN %s acls_in" % vlan.vid, acls[0].exact_match
+                    )
                 if vlan.acls_out:
                     acls = []
                     for acl in vlan.acls_out:
@@ -1295,6 +1326,9 @@ class DP(Conf):
                         acls.append(self.acls[acl])
                     vlan.acls_out = acls
                     verify_acl_exact_match(acls)
+                    verify_acl_rule_count(
+                        acls, "VLAN %s acls_out" % vlan.vid, acls[0].exact_match
+                    )
             for port in self.ports.values():
                 if port.acls_in:
                     acls = []
@@ -1306,6 +1340,9 @@ class DP(Conf):
                         acls.append(self.acls[acl])
                     port.acls_in = acls
                     verify_acl_exact_match(acls)
+                    verify_acl_rule_count(
+                        acls, "port %s acls_in" % port.number, acls[0].exact_match
+                    )
 
                 if port.dot1x_dyn_acl:
                     acl_names = [
@@ -1316,6 +1353,7 @@ class DP(Conf):
 
                     for acl_name in acl_names:
                         resolve_acl(acl_name, port_num=port.number)
+                        verify_dot1x_acl_rule_count(acl_name)
 
                 if port.dot1x_acl:
                     acl_names = [
@@ -1326,6 +1364,7 @@ class DP(Conf):
                     for acl_name in acl_names:
                         if self.acls.get(acl_name, None):
                             resolve_acl(acl_name, port_num=port.number)
+                            verify_dot1x_acl_rule_count(acl_name)
 
             if self.dp_acls:
                 acls = []
@@ -1333,6 +1372,8 @@ class DP(Conf):
                     resolve_acl(acl)
                     acls.append(self.acls[acl])
                 self.dp_acls = acls
+                # DP ACLs are never installed as an exact match table.
+                verify_acl_rule_count(acls, "dp_acls", False)
             # Build unbuilt tunnel ACL rules (DP is not the source of the tunnel)
             for acl in self.acls:
                 if self.acls[acl].is_tunnel_acl():

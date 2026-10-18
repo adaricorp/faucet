@@ -435,6 +435,30 @@ def add_mac_address_to_match(match, eth_src):
 class ValveAclManager(ValveManagerBase):
     """Handle installation of ACLs on a DP"""
 
+    # Each rule of the ACLs of a port, a VLAN or the DP takes a priority of
+    # its own, one below the rule before it, so N rules need N priorities
+    # above the table miss. They count down from the top of OpenFlow's
+    # 16-bit priority, below only the override flows that must match
+    # ahead of any rule (tunnels and 802.1X EAPOL).
+    OVERRIDE_PRIORITY = 0xFFFF
+    ACL_PRIORITY = OVERRIDE_PRIORITY - 1
+
+    @classmethod
+    def max_rules(cls, lowest_priority, dot1x=False):
+        """Return how many rules the ACLs of a port, a VLAN or the DP can hold.
+
+        An 802.1X ACL is installed on its own, and its rules count down from
+        the 802.1X flows' priority instead.
+
+        Args:
+            lowest_priority (int): priority of the table miss flow.
+            dot1x (bool): True to return how many rules an 802.1X ACL can hold.
+        Returns:
+            int: rules that get a priority of their own above the table miss.
+        """
+        first_priority = cls._HIGH_PRIORITY if dot1x else cls.ACL_PRIORITY
+        return max(first_priority - lowest_priority, 0)
+
     def __init__(
         self,
         port_acl_table,
@@ -449,8 +473,8 @@ class ValveAclManager(ValveManagerBase):
         self.vlan_acl_table = vlan_acl_table
         self.egress_acl_table = egress_acl_table
         self.pipeline = pipeline
-        self.acl_priority = self._FILTER_PRIORITY
-        self.override_priority = self.acl_priority + 1
+        self.acl_priority = self.ACL_PRIORITY
+        self.override_priority = self.OVERRIDE_PRIORITY
         self.auth_priority = self._HIGH_PRIORITY
         self.low_priority = self.auth_priority - 1
         self.meters = meters
