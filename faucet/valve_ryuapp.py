@@ -117,6 +117,13 @@ class OSKenAppBase(app_manager.OSKenApp):
     def signal_handler(self, sigid, _):
         """Handle signals.
 
+        A signal handler runs in whichever greenlet was running when the
+        signal arrived, often this app's own event loop. Only the event loop
+        makes room in its event queue, and a sender waits whenever it cannot
+        take a place in the queue at once: when the queue is full, or when
+        other senders are already waiting for a place. So the reconfigure
+        event is sent from a new greenlet, which can wait.
+
         Args:
             sigid (int): signal received.
         """
@@ -124,7 +131,7 @@ class OSKenAppBase(app_manager.OSKenApp):
             self.close()
             sys.exit(0)
         if sigid == signal.SIGHUP:
-            self.send_event(self.__class__.__name__, EventReconfigure())
+            hub.spawn(self.send_event, self.__class__.__name__, EventReconfigure())
 
     @staticmethod
     def _config_files_changed():
