@@ -1950,12 +1950,15 @@ class Valve:
             up_port_nos = self.dp.dyn_up_port_nos.intersection(
                 self._get_all_configured_port_nos()
             )
-        if added_ports:
-            all_up_port_nos = [port for port in added_ports if port in up_port_nos]
-            ofmsgs.extend(self.ports_add(all_up_port_nos))
-        if changed_ports:
-            all_up_port_nos = [port for port in changed_ports if port in up_port_nos]
-            ofmsgs.extend(self.ports_add(all_up_port_nos))
+            # Together, so the VLANs they share are built once, with all of
+            # them up, rather than once with the added ones and again with
+            # the changed ones too.
+            ofmsgs.extend(
+                self.ports_add(
+                    [port for port in added_ports if port in up_port_nos]
+                    + [port for port in changed_ports if port in up_port_nos]
+                )
+            )
         if self.acl_manager:
             if changed_acl_ports:
                 for port_num in changed_acl_ports:
