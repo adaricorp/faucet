@@ -25,6 +25,7 @@ from os_ken.ofproto import ofproto_v1_3_parser as parser
 
 from faucet import valve as valve_module
 from faucet import valve_of
+from faucet import valves_manager as valves_manager_module
 
 from tests.unit.faucet.test_valve_atomic_warm_start import (
     ValveAtomicWarmStartTestBase,
@@ -157,9 +158,14 @@ class ValveTrimMemoryTestCase(ValveAtomicWarmStartTestBase):
         """Test memory is handed back after a large send without a bundle."""
         self.setup_again(())
         for trim_after, calls in ((10**6, 0), (10, 1)):
+            # Not the collection the reload asks for, which trims too.
             with mock.patch.object(
                 valve_module.Valve, "TRIM_AFTER_FLOW_MSGS", trim_after
-            ), mock.patch.object(valve_module, "_trim_memory") as trim_memory:
+            ), mock.patch.object(
+                valves_manager_module, "collect_garbage"
+            ), mock.patch.object(
+                valve_module, "_trim_memory"
+            ) as trim_memory:
                 sent = self.warm_start(
                     p3_vlans=("v100,v200", "v100")[calls], options=()
                 )
@@ -177,6 +183,58 @@ class ValveTrimMemoryTestCase(ValveAtomicWarmStartTestBase):
                 valve_module._trim_memory()  # pylint: disable=protected-access
                 cdll.return_value.malloc_trim.assert_called_once_with(0)
             collect.assert_not_called()
+
+
+class ValveCollectReplacedConfigsTestCase(ValveAtomicWarmStartTestBase):
+    """Test faucet collects the configs reloads replace, once no bundle waits."""
+
+    def collect_garbage(self):
+        """Return a mock of the garbage collection a reload asks for."""
+        return mock.patch.object(valves_manager_module, "collect_garbage")
+
+    def services(self):
+        """Run a periodic service, as faucet does every few seconds."""
+        self.valves_manager.valve_flow_services(self.mock_time(0), "fast_state_expire")
+
+    def test_after_bundle_answered(self):
+        """Test a reload collects once the switch commits its bundle."""
+        with self.collect_garbage() as collect_garbage:
+            commit = self.assert_bundled(self.warm_start())
+            self.services()
+            collect_garbage.assert_not_called()
+            self.valve.bundle_ctrl_reply(commit_reply(commit))
+            collect_garbage.assert_not_called()
+            self.services()
+            collect_garbage.assert_called_once_with()
+            self.services()
+            collect_garbage.assert_called_once_with()
+
+    def test_after_bundle_lost(self):
+        """Test a reload collects once its bundle's connection is gone."""
+        with self.collect_garbage() as collect_garbage:
+            self.assert_bundled(self.warm_start())
+            self.valve.datapath_disconnect(self.mock_time())
+            collect_garbage.assert_not_called()
+            self.services()
+            collect_garbage.assert_called_once_with()
+
+    def test_without_bundle(self):
+        """Test a reload that sends no bundle collects at once."""
+        self.setup_again(())
+        with self.collect_garbage() as collect_garbage:
+            self.assert_not_bundled(self.warm_start(options=()))
+            collect_garbage.assert_called_once_with()
+            self.services()
+            collect_garbage.assert_called_once_with()
+
+    def test_collect_garbage(self):
+        """Test the collection hands the memory it frees back to the OS."""
+        calls = mock.Mock()
+        with mock.patch("gc.collect", calls.collect), mock.patch.object(
+            valve_module, "_trim_memory", calls.trim
+        ):
+            valve_module.collect_garbage()
+        self.assertEqual([mock.call.collect(), mock.call.trim()], calls.mock_calls)
 
 
 if __name__ == "__main__":
