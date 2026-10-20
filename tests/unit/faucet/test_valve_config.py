@@ -1833,16 +1833,29 @@ dps:
         """Setup a port with an ACL, carrying a VLAN with ACLs"""
         self.setup_valves(self.CONFIG)
 
-    def _reload_releases_dp(self, config):
-        old_dp = weakref.ref(self.valves_manager.valves[self.DP_ID].dp)
-        self.update_config(config, reload_type="warm")
+    def _reload_releases_dp(self, config, reload_type="warm"):
+        old_dp = self.valves_manager.valves[self.DP_ID].dp
+        old = [
+            weakref.ref(conf)
+            for conf in [old_dp, *old_dp.vlans.values(), *old_dp.ports.values()]
+        ]
+        del old_dp
+        self.update_config(config, reload_type=reload_type)
+        # Nothing but its own cycles holds it.
         gc.collect()
-        self.assertIsNone(old_dp())
+        self.assertEqual([], [ref() for ref in old if ref() is not None])
 
     def test_warm_start_releases_config(self):
         """Test adding and removing a VLAN on a port with an ACL."""
         self._reload_releases_dp(self.MORE_CONFIG)
         self._reload_releases_dp(self.CONFIG)
+
+    def test_reload_releases_config(self):
+        """Test a reload that changes no flows releases the config it replaced."""
+        self._reload_releases_dp(
+            self.CONFIG.replace("vid: 0x100", "vid: 0x100\n        description: v"),
+            reload_type=None,
+        )
 
 
 class ValveTestVLANRef(ValveTestBases.ValveTestNetwork):

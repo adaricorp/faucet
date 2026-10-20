@@ -24,6 +24,8 @@ from faucet.config_parser_util import config_changed, CONFIG_HASH_FUNC
 from faucet.config_parser import dp_parser, dp_preparsed_parser
 from faucet.valve import valve_factory, SUPPORTED_HARDWARE
 from faucet.valve_util import dpid_log, stat_config_files
+from faucet.valve_of import build_match_dict
+from faucet.valve_table import ValveTable
 
 
 class MetaDPState:
@@ -320,6 +322,10 @@ class ValvesManager:
             for deleted_dp in deleted_dpids:
                 delete_dp(deleted_dp)
                 del self.valves[deleted_dp]
+        # These caches key on the VLANs matches were built for, so would keep
+        # the configs they came from alive, which no flow is built from now.
+        ValveTable.match.cache_clear()
+        build_match_dict.cache_clear()
         self.bgp.reset(self.valves)
         self.dot1x.reset(self.valves)
         self.update_config_applied(sent)
