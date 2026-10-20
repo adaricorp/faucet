@@ -18,10 +18,12 @@
 # limitations under the License.
 
 import unittest
+from unittest import mock
 
 from os_ken.ofproto import ofproto_v1_3 as ofp
 from os_ken.ofproto import ofproto_v1_3_parser as parser
 
+from faucet import valve as valve_module
 from faucet import valve_of
 
 from tests.unit.faucet.test_valve_atomic_warm_start import (
@@ -29,6 +31,7 @@ from tests.unit.faucet.test_valve_atomic_warm_start import (
     bundle_ctrls,
     bundled,
     commit_error,
+    commit_reply,
     flow_body,
     open_error,
 )
@@ -135,6 +138,45 @@ class ValveBundleMemoryTestCase(ValveAtomicWarmStartTestBase):
         self.assert_sent_again(
             sent, self.valve.oferror(open_error(bundle_open, self.ryu_dp))
         )
+
+
+class ValveTrimMemoryTestCase(ValveAtomicWarmStartTestBase):
+    """Test faucet hands memory back after a large start."""
+
+    def test_after_commit(self):
+        """Test memory is handed back once the switch commits a bundle."""
+        with mock.patch.object(valve_module, "_trim_memory") as trim_memory:
+            commit = self.assert_bundled(self.warm_start())
+            trim_memory.assert_not_called()
+            self.valve.bundle_ctrl_reply(commit_reply(commit))
+            trim_memory.assert_called_once_with()
+            self.valve.bundle_ctrl_reply(commit_reply(commit))
+            trim_memory.assert_called_once_with()
+
+    def test_after_unbundled_send(self):
+        """Test memory is handed back after a large send without a bundle."""
+        self.setup_again(())
+        for trim_after, calls in ((10**6, 0), (10, 1)):
+            with mock.patch.object(
+                valve_module.Valve, "TRIM_AFTER_FLOW_MSGS", trim_after
+            ), mock.patch.object(valve_module, "_trim_memory") as trim_memory:
+                sent = self.warm_start(
+                    p3_vlans=("v100,v200", "v100")[calls], options=()
+                )
+                self.assert_not_bundled(sent)
+                self.assertGreater(len(sent), 10)
+                self.assertEqual(calls, trim_memory.call_count)
+
+    def test_without_glibc(self):
+        """Test handing memory back, with or without glibc, collects no garbage."""
+        with mock.patch("gc.collect") as collect:
+            for error in (OSError("no libc.so.6"), AttributeError("malloc_trim")):
+                with mock.patch.object(valve_module.ctypes, "CDLL", side_effect=error):
+                    valve_module._trim_memory()  # pylint: disable=protected-access
+            with mock.patch.object(valve_module.ctypes, "CDLL") as cdll:
+                valve_module._trim_memory()  # pylint: disable=protected-access
+                cdll.return_value.malloc_trim.assert_called_once_with(0)
+            collect.assert_not_called()
 
 
 if __name__ == "__main__":
