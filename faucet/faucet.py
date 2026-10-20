@@ -308,8 +308,9 @@ class Faucet(OSKenAppBase):
         if flow_msgs is None:
             # The switch refused a bundle, so kept its old flows, or discarded
             # one on its idle timeout, so may apply part of it, and its flow
-            # mods cannot be sent again: reconnect, to cold start.
-            ryu_dp.close()
+            # mods cannot be sent again: end the connection, to cold start, as
+            # a reload that cold starts the datapath does.
+            self._send_flow_msgs(valve, None, ryu_dp=ryu_dp)
         elif flow_msgs:
             # A warm start's bundle that the switch refused or discarded: send
             # its flow mods again.

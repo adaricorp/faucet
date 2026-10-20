@@ -233,7 +233,7 @@ class ValveAtomicUnreadTestCase(ValveAtomicUnreadTestBase):
         sent = self.warm_start()
         self.assert_bundled(sent)
         (bundle_open,) = bundle_ctrls(sent, ofp.ONF_BCT_OPEN_REQUEST)
-        self.assert_not_bundled(self.warm_start(p3_vlans="v100"))
+        self.change_flows()
         self.assertIsNone(self.valve.oferror(open_error(bundle_open, self.ryu_dp)))
         # The reload is handled before the reconnect the discard ordered.
         self.cold_reload()
