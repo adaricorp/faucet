@@ -265,6 +265,27 @@ class Valve:
         ]  # pylint: disable=protected-access
         metrics_var.remove(*label_values)
 
+    def _rehome_learned_hosts(self):
+        """Point learned hosts and next hops at this config's ports.
+
+        A VLAN shares its learned hosts and next hops with the previous
+        config's VLAN (Conf.merge_dyn), and each holds its port: so the
+        previous config's ports, and through them the rest of that config,
+        stay alive until each host is learned again.
+        """
+        ports = self.dp.ports
+        for vlan in self.dp.vlans.values():
+            entries = list(vlan.dyn_host_cache.values())
+            for neigh_cache in vlan.dyn_neigh_cache_by_ipv.values():
+                entries.extend(neigh_cache.values())
+            for entry in entries:
+                port = entry.port
+                if port is None:
+                    continue
+                new_port = ports.get(port.number, None)
+                if new_port is not None and new_port is not port:
+                    entry.port = new_port
+
     def close_logs(self):
         """Explicitly close any active loggers."""
         if self.logger is not None:
@@ -290,6 +311,7 @@ class Valve:
                 dps = [valve.dp for valve in valves]
             new_dp.clone_dyn_state(self.dp, dps)
             self.dp = new_dp
+            self._rehome_learned_hosts()
 
         self.close_logs()
         self.logger = ValveLogger(
