@@ -20,6 +20,7 @@
 # limitations under the License.
 
 from collections import defaultdict, deque
+from itertools import zip_longest
 import random
 import time
 
@@ -744,7 +745,15 @@ class ValveRouteManager(ValveManagerBase):
         return ofmsgs
 
     def _vlan_unresolved_nexthops(self, vlan, ip_gws, now):
-        """Return unresolved or expired IP gateways, never tried/oldest first.
+        """Return unresolved or expired IP gateways, never tried/oldest first,
+        taking those with no MAC and refreshes of resolved ones in turn.
+
+        A refresh due counts as never tried. Taken by tries alone, a next hop
+        with no MAC that missed a request, and so is not routed at all, waits
+        for as long as more refreshes come due each cycle than it requests.
+        Taken with no MAC strictly first, refreshes wait instead, for as long
+        as new addresses keep coming, as from a scan of the subnet, and a
+        next hop that has gone stays routed.
 
         Args:
            vlan (vlan): VLAN containing this RIB/FIB.
@@ -762,16 +771,32 @@ class ValveRouteManager(ValveManagerBase):
             for ip_gw, entry in nexthop_entries
             if entry is None or entry.resolution_due(now, self.neighbor_timeout)
         ]
-        unresolved_nexthops_by_retries = defaultdict(list)
+        no_mac_by_retries = defaultdict(list)
+        refreshes_by_retries = defaultdict(list)
         for ip_gw, entry in not_fresh_nexthops:
             if entry is None:
                 entry = self._update_nexthop_cache(now, vlan, None, None, ip_gw)
-            unresolved_nexthops_by_retries[entry.resolve_retries].append(ip_gw)
+            if entry.eth_src is None:
+                no_mac_by_retries[entry.resolve_retries].append(ip_gw)
+            else:
+                refreshes_by_retries[entry.resolve_retries].append(ip_gw)
         unresolved_nexthops = deque()
-        for _retries, nexthops in sorted(unresolved_nexthops_by_retries.items()):
-            random.shuffle(nexthops)
-            unresolved_nexthops.extend(nexthops)
+        for turn in zip_longest(
+            self._fewest_retries_first(no_mac_by_retries),
+            self._fewest_retries_first(refreshes_by_retries),
+        ):
+            unresolved_nexthops.extend(ip_gw for ip_gw in turn if ip_gw is not None)
         return unresolved_nexthops
+
+    @staticmethod
+    def _fewest_retries_first(nexthops_by_retries):
+        """Return next hops, fewest retries first, those with as many in random
+        order."""
+        nexthops_in_order = []
+        for _retries, nexthops in sorted(nexthops_by_retries.items()):
+            random.shuffle(nexthops)
+            nexthops_in_order.extend(nexthops)
+        return nexthops_in_order
 
     def advertise(self, vlan):
         raise NotImplementedError  # pragma: no cover
