@@ -617,6 +617,145 @@ vlans:
         self.assertEqual(0, int(self.get_prom("port_lacp_state", labels=labels)))
 
 
+class ValveLACPPortDownTestCase(ValveTestBases.ValveTestNetwork):
+    """Test the flows left when an LACP port with LACP up goes down."""
+
+    # p5 keeps the pipeline the same when p2 stops being a hairpin port.
+    CONFIG = """
+dps:
+    s1:
+        dp_id: 1
+        hardware: "Open vSwitch"
+        interfaces:
+            p1:
+                number: 1
+                tagged_vlans: [%(p1_vlans)s]
+                lacp: 1
+                max_hosts: %(p1_max_hosts)u
+            p2:
+                number: 2
+                native_vlan: v200
+                hairpin: %(p2_hairpin)s
+            p3:
+                number: 3
+                native_vlan: v200
+            p4:
+                number: 4
+                tagged_vlans: [v100, v200]
+            p5:
+                number: 5
+                native_vlan: v100
+                hairpin: true
+vlans:
+    v100:
+        vid: 0x100
+    v200:
+        vid: 0x200
+"""
+
+    REQUIRE_TFM = False
+
+    def config(self, p1_vlans="v100, v200", p1_max_hosts=255, p2_hairpin="true"):
+        """Return CONFIG with p1's VLANs and max_hosts, and p2's hairpin."""
+        return self.CONFIG % {
+            "p1_vlans": p1_vlans,
+            "p1_max_hosts": p1_max_hosts,
+            "p2_hairpin": p2_hairpin,
+        }
+
+    def setUp(self):
+        """Set up the DP and bring up LACP on p1."""
+        self.setup_valves(self.config())
+        self.rcv_packet(
+            1,
+            0,
+            {
+                "actor_system": "0e:00:00:00:00:02",
+                "partner_system": FAUCET_MAC,
+                "eth_dst": slow.SLOW_PROTOCOL_MULTICAST,
+                "eth_src": "0e:00:00:00:00:02",
+                "actor_state_synchronization": 1,
+            },
+        )
+
+    def table_flows(self, table_name):
+        """Return the flows in the DP's table_name table."""
+        valve = self.valves_manager.valves[self.DP_ID]
+        table_id = valve.dp.tables[table_name].table_id
+        return self.network.tables[self.DP_ID].tables[table_id]
+
+    def port_flows(self, table_name, port_no):
+        """Return the flows in table_name that match in_port port_no."""
+        return [
+            flow
+            for flow in self.table_flows(table_name)
+            if "in_port" in flow.match_values
+            and flow.match_values["in_port"].int == port_no
+        ]
+
+    def flows(self):
+        """Return every flow on the DP, comparably."""
+        return sorted(
+            str(flow)
+            for table in self.network.tables[self.DP_ID].tables
+            for flow in table
+        )
+
+    def hairpin_flood_flows(self, port_no):
+        """Return the flood flows that flood from port_no back out of it."""
+        return [
+            flow
+            for flow in self.port_flows("flood", port_no)
+            for instruction in flow.instructions
+            for action in getattr(instruction, "actions", ())
+            if getattr(action, "port", None) == ofp.OFPP_IN_PORT
+        ]
+
+    def vlan_flows(self, port_no, vid):
+        """Return the vlan table's flows for port_no on VLAN vid."""
+        return [
+            flow
+            for flow in self.port_flows("vlan", port_no)
+            if "vlan_vid" in flow.match_values
+            and flow.match_values["vlan_vid"].int == vid | ofp.OFPVID_PRESENT
+        ]
+
+    def assert_cold_start_flows(self):
+        """Assert a cold start leaves the DP with the flows it has now."""
+        flows = self.flows()
+        self.cold_start()
+        self.assertEqual(flows, self.flows())
+
+    def test_warm_start_no_longer_hairpin(self):
+        """Test p2 loses its hairpin flood flows in a warm start changing p1."""
+        self.assertTrue(self.hairpin_flood_flows(2))
+        self.update_config(
+            self.config(p1_max_hosts=5, p2_hairpin="false"), reload_type="warm"
+        )
+        self.assertFalse(self.hairpin_flood_flows(2))
+        self.assert_cold_start_flows()
+
+    def test_warm_start_leaves_vlan(self):
+        """Test p1 takes in no v200 traffic once a warm start removes it."""
+        self.assertTrue(self.vlan_flows(1, 0x200))
+        self.update_config(self.config(p1_vlans="v100"), reload_type="warm")
+        self.assertFalse(self.vlan_flows(1, 0x200))
+        self.assert_cold_start_flows()
+
+    def test_port_down(self):
+        """Test p1 down keeps only its drop flow, and the flood flows without it."""
+        self.set_port_link_down(1)
+        self.assertEqual(
+            [[]], [list(flow.instructions) for flow in self.port_flows("vlan", 1)]
+        )
+        flood_flows = sorted(str(flow) for flow in self.table_flows("flood"))
+        self.valves_manager.valves[self.DP_ID].datapath_disconnect(self.mock_time())
+        self.connect_dp(ports_up=[2, 3, 4, 5])
+        self.assertEqual(
+            flood_flows, sorted(str(flow) for flow in self.table_flows("flood"))
+        )
+
+
 class ValveTFMSizeOverride(ValveTestBases.ValveTestNetwork):
     """Test TFM size override."""
 
