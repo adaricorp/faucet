@@ -317,9 +317,11 @@ string names given to the datapath, or the OFP datapath id.
         bundle until it commits it, and applies a large bundle in one go,
         so a warm start that changes many flows needs more memory and keeps
         the switch busy for longer at once. A warm start that changes
-        groups or meters, that is sent before the switch has answered the
-        previous bundle's commit, or that goes to a new connection from the
-        switch before its cold start, is sent without a bundle. If the
+        groups or meters, or that goes to a new connection from the switch
+        before its cold start, is sent without a bundle. One sent before
+        the switch has answered the previous bundle's commit goes in a
+        bundle of its own behind it, which the switch commits in turn,
+        unless the switch has discarded the bundle ahead. If the
         switch refuses a warm start's bundle, Faucet sends the same flow
         changes again without one, or cold starts the datapath if it has
         changed its flows since. As with atomic_cold_start, Open vSwitch
@@ -328,8 +330,9 @@ string names given to the datapath, or the OFP datapath id.
         may then apply part of it, so Faucet does the same for a warm
         start's bundle it discards. A switch that refuses a bundle, or
         does not commit three in a row, as it discards them or its
-        connection ends first, is warm started without one until Faucet
-        restarts; as with atomic_cold_start, a bundle whose connection
+        connection ends first (bundles lost with one connection count as
+        one), is warm started without one until Faucet restarts; as with
+        atomic_cold_start, a bundle whose connection
         Faucet ends itself before it reads the answer does not count toward
         the three. Changing this option does not cold start the datapath;
         it applies from the next warm start.

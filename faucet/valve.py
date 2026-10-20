@@ -105,6 +105,21 @@ class ValveLogger:
         self.logger.warning(self._dpid_prefix(log_msg))
 
 
+class _SentBundle:
+    """A bundle sent ahead of the one in flight, or left unread when its connection ended."""
+
+    __slots__ = ["restart_type", "bundle_id", "ryu_dp", "open_xid", "commit_xid"]
+
+    def __init__(
+        self, restart_type, bundle_id, ryu_dp, open_xid, commit_xid
+    ):  # pylint: disable=too-many-arguments,too-many-positional-arguments
+        self.restart_type = restart_type
+        self.bundle_id = bundle_id
+        self.ryu_dp = ryu_dp
+        self.open_xid = open_xid
+        self.commit_xid = commit_xid
+
+
 class Valve:
     """Generates the messages to configure a datapath as a l2 learning switch.
 
@@ -122,7 +137,8 @@ class Valve:
         "_bundle_open",
         "_bundle_open_xid",
         "_bundle_resend",
-        "_bundle_unread",
+        "_bundles_ahead",
+        "_bundles_unread",
         "_bundles_lost",
         "_connecting_dp",
         "_coprocessor_manager",
@@ -200,11 +216,14 @@ class Valve:
         # or discard its bundle, until faucet changes the switch's flows
         # again.
         self._bundle_resend = None
-        # A bundle whose connection faucet itself ended after sending its
-        # commit, until faucet reads the switch's answer to it, or that
-        # connection's end: (restart type, id, connection, open xid, commit
-        # xid). The switch may have committed it.
-        self._bundle_unread = None
+        # Bundles sent before the one in flight, on its connection, that the
+        # switch has yet to answer, the oldest first. The switch reads each
+        # one's commit before the next one's open, so commits them in turn.
+        self._bundles_ahead = []
+        # Bundles whose connection faucet itself ended after sending their
+        # commit, until faucet reads the switch's answer to them, or that
+        # connection's end. The switch may have committed them.
+        self._bundles_unread = []
         self._bundles_lost = {"cold": 0, "warm": 0}
         # The connection (os_ken Datapath) that sent switch features, until
         # faucet cold starts it.
@@ -459,8 +478,25 @@ class Valve:
         self._bundle_resend = None
         return restart_type
 
+    def _bundles_in_flight(self):
+        """Forget every bundle in flight, and return them, the oldest first."""
+        bundles = self._bundles_ahead
+        self._bundles_ahead = []
+        if self._bundle_open is not None:
+            bundles.append(
+                _SentBundle(
+                    self._bundle_open,
+                    self._bundle_id,
+                    self._bundle_dp,
+                    self._bundle_open_xid,
+                    self._bundle_commit_xid,
+                )
+            )
+        self._end_bundle()
+        return bundles
+
     def _end_connection_bundle(self, closing=False):
-        """Forget a cold or warm start's bundle, as its connection has ended.
+        """Forget the cold or warm starts' bundles, as their connection has ended.
 
         Args:
             closing (bool): True if faucet itself is ending the connection.
@@ -468,67 +504,67 @@ class Valve:
         self._bundle_next_send = None
         # faucet has handled what an earlier connection it ended received
         # before it ended, so an answer to a bundle on it is not coming.
-        self._settle_unread_bundle()
-        if closing and self._bundle_commit_xid is not None:
-            # The switch may have committed the bundle, and its answer may be
-            # waiting to be handled: the connection's messages received
-            # before it ends still are, after this.
-            self._leave_bundle_unread()
-        else:
-            self._lose_bundle()
+        self._settle_unread_bundles()
+        lost = []
+        for bundle in self._bundles_in_flight():
+            if closing and bundle.commit_xid is not None:
+                # The switch may have committed the bundle, and its answer may
+                # be waiting to be handled: the connection's messages received
+                # before it ends still are, after this.
+                self._bundles_unread.append(bundle)
+                self.logger.info(
+                    "ending the connection before reading the switch's answer "
+                    "to the commit of the %s start's bundle %u"
+                    % (bundle.restart_type, bundle.bundle_id)
+                )
+            else:
+                lost.append(bundle)
+        self._count_lost_bundles(lost)
 
-    def _leave_bundle_unread(self):
-        """Forget the bundle in flight until faucet reads its answer, if it can."""
-        self._bundle_unread = (
-            self._bundle_open,
-            self._bundle_id,
-            self._bundle_dp,
-            self._bundle_open_xid,
-            self._bundle_commit_xid,
-        )
-        restart_type = self._end_bundle()
-        self.logger.info(
-            "ending the connection before reading the switch's answer to the "
-            "commit of the %s start's bundle %u" % (restart_type, self._bundle_id)
-        )
+    def _settle_unread_bundles(self):
+        """Count unread bundles lost, though not toward those lost in a row."""
+        # Whether the switch committed them is unknown, and faucet ending the
+        # connection says nothing of the switch, so they neither count toward
+        # the bundles lost in a row nor start their count again. The cold
+        # start that follows replaces their flows either way.
+        for bundle in self._bundles_unread:
+            self.logger.warning(
+                "faucet ended the connection before it read the switch's answer "
+                "to the commit of the %s start's bundle %u, so it may or may not "
+                "have been committed" % (bundle.restart_type, bundle.bundle_id)
+            )
+            self._inc_var("faucet_%s_start_bundles_lost" % bundle.restart_type)
+            self._inc_var("faucet_%s_start_bundles_abandoned" % bundle.restart_type)
+        self._bundles_unread = []
 
-    def _settle_unread_bundle(self):
-        """Count an unread bundle lost, though not toward those lost in a row."""
-        if self._bundle_unread is None:
-            return
-        restart_type, bundle_id = self._bundle_unread[:2]
-        self._bundle_unread = None
-        # Whether the switch committed it is unknown, and faucet ending the
-        # connection says nothing of the switch, so this neither counts
-        # toward the bundles lost in a row nor starts their count again. The
-        # cold start that follows replaces its flows either way.
-        self.logger.warning(
-            "faucet ended the connection before it read the switch's answer "
-            "to the commit of the %s start's bundle %u, so it may or may not "
-            "have been committed" % (restart_type, bundle_id)
-        )
-        self._inc_var("faucet_%s_start_bundles_lost" % restart_type)
-        self._inc_var("faucet_%s_start_bundles_abandoned" % restart_type)
-
-    def _answers_unread(self, msg, xid_index):
-        """Return True if msg answers the unread bundle's open or commit."""
-        return (
-            self._bundle_unread is not None
-            and msg.datapath is self._bundle_unread[2]
-            and msg.xid == self._bundle_unread[xid_index]
-        )
+    @staticmethod
+    def _answered_bundle(bundles, msg, timeout=False, same_dp=True):
+        """Return the bundle of bundles whose commit (or with timeout, open) msg answers."""
+        for bundle in bundles:
+            xid = bundle.open_xid if timeout else bundle.commit_xid
+            if (
+                xid is not None
+                and msg.xid == xid
+                and (not same_dp or msg.datapath is bundle.ryu_dp)
+            ):
+                return bundle
+        return None
 
     def _unread_bundle_error(self, msg):
-        """Handle the switch's error answering the unread bundle, if it does.
+        """Handle the switch's error answering an unread bundle, if it does.
 
         Returns:
-            bool: True if msg answered the unread bundle.
+            bool: True if msg answered an unread bundle.
         """
-        timed_out = self._answers_unread(msg, 3) and valve_of.is_bundle_timeout(msg)
-        if not timed_out and not self._answers_unread(msg, 4):
+        bundle = None
+        if valve_of.is_bundle_timeout(msg):
+            bundle = self._answered_bundle(self._bundles_unread, msg, timeout=True)
+        timed_out = bundle is not None
+        if bundle is None:
+            bundle = self._answered_bundle(self._bundles_unread, msg)
+        if bundle is None:
             return False
-        restart_type, bundle_id = self._bundle_unread[:2]
-        self._bundle_unread = None
+        self._bundles_unread.remove(bundle)
         self._inc_var("of_errors")
         error = "OFError type %s code %s" % (
             msg.type,
@@ -539,35 +575,83 @@ class Valve:
             self.logger.error(
                 "switch discarded the %s start's bundle %u before its commit "
                 "(%s), on the connection faucet has since ended"
-                % (restart_type, bundle_id, error)
+                % (bundle.restart_type, bundle.bundle_id, error)
             )
-            self._count_lost_bundle(restart_type)
+            self._count_lost_bundle(bundle.restart_type)
             return True
-        self._inc_var("faucet_%s_start_bundles_refused" % restart_type)
-        self._disable_atomic_start(restart_type)
+        self._inc_var("faucet_%s_start_bundles_refused" % bundle.restart_type)
+        self._disable_atomic_start(bundle.restart_type)
         self.logger.error(
             "switch refused the %s start's bundle %u (%s), on the connection "
-            "faucet has since ended" % (restart_type, bundle_id, error)
+            "faucet has since ended" % (bundle.restart_type, bundle.bundle_id, error)
+        )
+        return True
+
+    def _ahead_bundle_error(self, msg):
+        """Handle the switch's error answering a bundle ahead, if it does.
+
+        A bundle sent since changed the flows the bundle ahead was built to
+        leave, so the switch has neither: faucet reconnects, to cold start.
+
+        Returns:
+            bool: True if msg answered a bundle ahead.
+        """
+        bundle = None
+        if valve_of.is_bundle_timeout(msg):
+            bundle = self._answered_bundle(self._bundles_ahead, msg, timeout=True)
+        timed_out = bundle is not None
+        if bundle is None:
+            bundle = self._answered_bundle(self._bundles_ahead, msg, same_dp=False)
+        if bundle is None:
+            return False
+        self._inc_var("of_errors")
+        error = "OFError type %s code %s" % (
+            msg.type,
+            getattr(msg, "exp_type", msg.code),
+        )
+        if timed_out:
+            # Lost when the connection ends; what the switch commits under
+            # its id is not the bundle.
+            bundle.open_xid = None
+            bundle.commit_xid = None
+            self.logger.error(
+                "switch discarded the %s start's bundle %u before its commit "
+                "(%s), and a later bundle changed the flows since: reconnecting "
+                "to cold start" % (bundle.restart_type, bundle.bundle_id, error)
+            )
+            return True
+        self._bundles_ahead.remove(bundle)
+        self._inc_var("faucet_%s_start_bundles_refused" % bundle.restart_type)
+        self._disable_atomic_start(bundle.restart_type)
+        self.logger.error(
+            "switch refused the %s start's bundle %u (%s), so it still has the "
+            "flows from before it, which a later bundle changed: reconnecting to "
+            "cold start" % (bundle.restart_type, bundle.bundle_id, error)
         )
         return True
 
     def _lose_bundle(self):
-        """Count the bundle in flight lost, as the connection it went on has ended."""
-        restart_type = self._end_bundle()
-        if restart_type is None:
-            return
-        # The switch discards a bundle it has not committed when the
-        # connection goes, and forwards on its old flows meanwhile.
-        self.logger.warning(
-            "connection ended before the switch committed the %s start's "
-            "bundle %u" % (restart_type, self._bundle_id)
-        )
-        self._count_lost_bundle(restart_type)
+        """Count the bundles in flight lost, as the connection they went on has ended."""
+        self._count_lost_bundles(self._bundles_in_flight())
 
-    def _count_lost_bundle(self, restart_type):
+    def _count_lost_bundles(self, bundles):
+        """Count bundles lost with one connection, as one toward those in a row."""
+        for bundle in bundles:
+            # The switch discards a bundle it has not committed when the
+            # connection goes, and forwards on its old flows meanwhile.
+            self.logger.warning(
+                "connection ended before the switch committed the %s start's "
+                "bundle %u" % (bundle.restart_type, bundle.bundle_id)
+            )
+            self._inc_var("faucet_%s_start_bundles_lost" % bundle.restart_type)
+        for restart_type in sorted({bundle.restart_type for bundle in bundles}):
+            self._count_lost_bundle(restart_type, counted=True)
+
+    def _count_lost_bundle(self, restart_type, counted=False):
         """Count a bundle the switch did not commit, toward those in a row."""
         self._bundles_lost[restart_type] += 1
-        self._inc_var("faucet_%s_start_bundles_lost" % restart_type)
+        if not counted:
+            self._inc_var("faucet_%s_start_bundles_lost" % restart_type)
         if restart_type == "warm":
             max_lost = self.ATOMIC_WARM_START_MAX_LOST
             verb = "change"
@@ -2412,6 +2496,8 @@ class Valve:
         """
         if self._unread_bundle_error(msg):
             return []
+        if self._ahead_bundle_error(msg):
+            return None
         # A flow mod in the bundle that the switch cannot apply is answered
         # with its own error, as it would be without a bundle; the switch
         # applies none of the bundle only if it fails the commit.
@@ -2606,10 +2692,16 @@ class Valve:
         if msg.type != valve_of.ofp.ONF_BCT_COMMIT_REPLY:
             return
         on_ended = ""
-        if self._answers_unread(msg, 4):
-            restart_type = self._bundle_unread[0]
-            self._bundle_unread = None
+        bundle = self._answered_bundle(self._bundles_unread, msg)
+        if bundle is not None:
+            self._bundles_unread.remove(bundle)
             on_ended = ", on the connection faucet has since ended"
+        else:
+            bundle = self._answered_bundle(self._bundles_ahead, msg, same_dp=False)
+            if bundle is not None:
+                self._bundles_ahead.remove(bundle)
+        if bundle is not None:
+            restart_type = bundle.restart_type
         elif self._answers_bundle_commit(msg):
             restart_type = self._end_bundle()
         else:
@@ -2622,12 +2714,22 @@ class Valve:
         )
         _trim_memory()
 
+    def _bundle_discarded(self):
+        """Return True if the switch discarded a bundle in flight, so faucet reconnects."""
+        return self._bundle_commit_xid is None or any(
+            bundle.commit_xid is None for bundle in self._bundles_ahead
+        )
+
     def _bundle_flow_msgs(self, flow_msgs, restart_type, ryu_dp):
         """Return a cold or warm start's flow_msgs in one atomic bundle, or None."""
         verb = "replaces" if restart_type == "cold" else "changes"
-        if self._bundle_open is not None:
-            # Were the switch to refuse the earlier bundle, faucet must know
-            # which flows it kept.
+        if self._bundle_open is not None and (
+            ryu_dp is not self._bundle_dp or self._bundle_discarded()
+        ):
+            # A bundle in flight on a connection being replaced, or one the
+            # switch discarded, which faucet reconnects to cold start: were
+            # the switch to refuse the first, faucet must know which flows it
+            # kept, and the reconnect loses this one too.
             self.logger.info(
                 "%s start %s the flows without a bundle, as the switch has yet "
                 "to commit bundle %u" % (restart_type, verb, self._bundle_id)
@@ -2653,14 +2755,31 @@ class Valve:
                 "so it %s the flows without a bundle" % (restart_type, verb)
             )
             return None
+        behind = ""
+        if self._bundle_open is not None:
+            # The switch commits the bundle in flight before it reads this
+            # one's open, so commits each whole, in turn. Their flow mods,
+            # sent since, leave nothing of it to send again.
+            self._bundles_ahead.append(
+                _SentBundle(
+                    self._bundle_open,
+                    self._bundle_id,
+                    self._bundle_dp,
+                    self._bundle_open_xid,
+                    self._bundle_commit_xid,
+                )
+            )
+            behind = ", behind bundle %u, which the switch has yet to commit" % (
+                self._bundle_id
+            )
         self._bundle_id = bundle_id
         if restart_type == "warm":
             self._bundle_resend = [
                 flow_msg for flow_msg in flow_msgs if valve_of.is_flowmod(flow_msg)
             ]
         self.logger.info(
-            "%s start %s the flows in one bundle (id %u, %u messages)"
-            % (restart_type, verb, bundle_id, bundled[0])
+            "%s start %s the flows in one bundle (id %u, %u messages)%s"
+            % (restart_type, verb, bundle_id, bundled[0], behind)
         )
         return bundled[1]
 
