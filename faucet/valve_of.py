@@ -19,7 +19,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import copy
 import functools
 import ipaddress
 import random
@@ -1394,7 +1393,7 @@ def is_bundle_timeout(ofmsg):
     )
 
 
-def bundle_ofmsgs(ofmsgs, bundle_id):
+def bundle_ofmsgs_lazy(ofmsgs, bundle_id):
     """Return ofmsgs with their flow mods in one atomic, ordered bundle.
 
     The switch applies every flow mod in the bundle at once, when it is
@@ -1406,43 +1405,54 @@ def bundle_ofmsgs(ofmsgs, bundle_id):
 
     Returns None if ofmsgs hold group or meter mods, which not every switch
     can bundle atomically, so the caller sends ofmsgs as they are.
+    Otherwise returns the number of messages, and an iterator of them that
+    puts each flow mod in its bundle add as it reaches it, so they are not
+    all held twice; ofmsgs must not change until it is done. A flow mod goes
+    in the bundle itself, not a copy, and takes its bundle add's xid.
     """
     before = []
-    bundled = []
     after = []
-    flags = ofp.ONF_BF_ATOMIC | ofp.ONF_BF_ORDERED
+    flowmods = 0
     for ofmsg in ofmsgs:
         if is_groupmod(ofmsg) or is_metermod(ofmsg):
             return None
         if is_flowmod(ofmsg):
-            inner = copy.copy(ofmsg)
-            inner.xid = None
-            inner.buf = None
-            bundled.append(parser.ONFBundleAddMsg(None, bundle_id, flags, inner, []))
+            flowmods += 1
         elif isinstance(ofmsg, parser.OFPBarrierRequest):
             continue
         elif isinstance(ofmsg, parser.OFPSetConfig):
             before.append(ofmsg)
         else:
             after.append(ofmsg)
-    if not bundled:
+    if not flowmods:
         return None
-    return (
-        before
-        + [
-            parser.ONFBundleCtrlMsg(
-                None, bundle_id, ofp.ONF_BCT_OPEN_REQUEST, flags, []
-            )
-        ]
-        + bundled
-        + [
-            parser.ONFBundleCtrlMsg(
-                None, bundle_id, ofp.ONF_BCT_COMMIT_REQUEST, flags, []
-            ),
-            barrier(),
-        ]
-        + after
-    )
+    flags = ofp.ONF_BF_ATOMIC | ofp.ONF_BF_ORDERED
+
+    def _bundled():
+        yield from before
+        yield parser.ONFBundleCtrlMsg(
+            None, bundle_id, ofp.ONF_BCT_OPEN_REQUEST, flags, []
+        )
+        for ofmsg in ofmsgs:
+            if is_flowmod(ofmsg):
+                ofmsg.xid = None
+                ofmsg.buf = None
+                yield parser.ONFBundleAddMsg(None, bundle_id, flags, ofmsg, [])
+        yield parser.ONFBundleCtrlMsg(
+            None, bundle_id, ofp.ONF_BCT_COMMIT_REQUEST, flags, []
+        )
+        yield barrier()
+        yield from after
+
+    return (len(before) + 1 + flowmods + 2 + len(after), _bundled())
+
+
+def bundle_ofmsgs(ofmsgs, bundle_id):
+    """Return bundle_ofmsgs_lazy()'s messages as a list, or None."""
+    bundled = bundle_ofmsgs_lazy(ofmsgs, bundle_id)
+    if bundled is None:
+        return None
+    return list(bundled[1])
 
 
 def desc_stats_request(datapath=None):
