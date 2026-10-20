@@ -19,6 +19,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import ctypes
 import difflib
 import logging
 
@@ -159,6 +160,9 @@ class Valve:
     # without one, and likewise for warm starts.
     ATOMIC_COLD_START_MAX_LOST = 3
     ATOMIC_WARM_START_MAX_LOST = 3
+    # After a bundle's commit, or an unbundled send of more flow messages
+    # than this, faucet hands the memory it has freed back to the OS.
+    TRIM_AFTER_FLOW_MSGS = 10000
 
     def __init__(self, dp, logname, metrics, notifier, dot1x):
         self.dot1x = dot1x
@@ -2505,6 +2509,7 @@ class Valve:
                 "switch committed the %s start's bundle %u"
                 % (restart_type, msg.bundle_id)
             )
+            _trim_memory()
 
     def _bundle_flow_msgs(self, flow_msgs, restart_type, ryu_dp):
         """Return a cold or warm start's flow_msgs in one atomic bundle, or None."""
@@ -2590,6 +2595,8 @@ class Valve:
                         self._bundle_open_xid = flow_msg.xid
                     elif flow_msg.type == valve_of.ofp.ONF_BCT_COMMIT_REQUEST:
                         self._bundle_commit_xid = flow_msg.xid
+            if not bundle and len(prepared_flow_msgs) > self.TRIM_AFTER_FLOW_MSGS:
+                _trim_memory()
 
         if flow_msgs is None:
             self.datapath_disconnect(now)
@@ -2608,6 +2615,21 @@ class Valve:
             list: OpenFlow messages, if any.
         """
         return self.switch_manager.flow_timeout(now, table_id, match)
+
+
+def _trim_memory():
+    """Hand free heap memory back to the OS (glibc only).
+
+    A large cold or warm start makes and frees millions of objects, and
+    the allocator otherwise keeps what they held for the process. It does
+    not collect garbage first: with a large config a full collection takes
+    long enough to hold up the events faucet handles, and the messages a
+    start sends need none to be freed.
+    """
+    try:
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except (OSError, AttributeError):
+        pass
 
 
 class TfmValve(Valve):
