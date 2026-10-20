@@ -119,6 +119,11 @@ class FaucetMetrics(PromClient):
             "faucet_cold_start_bundles_lost",
             "number of cold start bundles whose connection ended before DP committed them",
         )
+        self.faucet_cold_start_bundles_abandoned = self._dpid_counter(
+            "faucet_cold_start_bundles_abandoned",
+            "number of lost cold start bundles whose connection faucet ended "
+            "after sending their commit, before reading whether DP committed them",
+        )
         self.faucet_warm_start_bundles = self._dpid_counter(
             "faucet_warm_start_bundles",
             "number of warm starts sent to DP in one bundle",
@@ -135,6 +140,11 @@ class FaucetMetrics(PromClient):
             "faucet_warm_start_bundles_lost",
             "number of warm start bundles DP discarded, or whose connection ended, "
             "before DP committed them",
+        )
+        self.faucet_warm_start_bundles_abandoned = self._dpid_counter(
+            "faucet_warm_start_bundles_abandoned",
+            "number of lost warm start bundles whose connection faucet ended "
+            "after sending their commit, before reading whether DP committed them",
         )
         self.vlan_hosts_learned = self._gauge(
             "vlan_hosts_learned",
