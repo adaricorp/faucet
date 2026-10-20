@@ -22,6 +22,7 @@ from collections import defaultdict
 from faucet.conf import InvalidConfigError
 from faucet.config_parser_util import config_changed, CONFIG_HASH_FUNC
 from faucet.config_parser import dp_parser, dp_preparsed_parser
+from faucet.valve import collect_garbage
 from faucet.valve import valve_factory, SUPPORTED_HARDWARE
 from faucet.valve_util import dpid_log, stat_config_files
 
@@ -109,6 +110,9 @@ class ValvesManager:
         self.config_applied = {}
         self.config_watcher = ConfigWatcher()
         self.meta_dp_state = MetaDPState()
+        # True from applying a config until the configs it replaced are
+        # collected.
+        self._garbage_to_collect = False
 
     def update_dp_live_time(self, now):
         """
@@ -323,7 +327,26 @@ class ValvesManager:
         self.bgp.reset(self.valves)
         self.dot1x.reset(self.valves)
         self.update_config_applied(sent)
+        self._garbage_to_collect = True
+        self._collect_replaced_configs()
         return True
+
+    def _collect_replaced_configs(self):
+        """Collect the configs replaced, unless a switch is yet to answer a bundle.
+
+        A config is cycles, so only a full garbage collection frees the one
+        a reload replaces. That holds faucet up for a noticeable time with a
+        large config, and while a switch is yet to answer a cold or warm
+        start's bundle it could hold the bundle's last messages, its commit
+        among them, in the connection's send queue. So once it has applied a
+        config, faucet collects at once if no switch is, or else at the
+        first periodic service after every such bundle is answered or lost.
+        """
+        if self._garbage_to_collect and not any(
+            valve.awaiting_bundle() for valve in self.valves.values()
+        ):
+            self._garbage_to_collect = False
+            collect_garbage()
 
     def load_configs(self, now, new_config_file, delete_dp=None):
         """Load/apply new config to all Valves."""
@@ -369,6 +392,7 @@ class ValvesManager:
 
     def valve_flow_services(self, now, valve_service):
         """Call a method on all Valves and send any resulting flows."""
+        self._collect_replaced_configs()
         ofmsgs_by_valve = defaultdict(list)
         for valve in self.valves.values():
             other_valves = self._other_running_valves(valve)

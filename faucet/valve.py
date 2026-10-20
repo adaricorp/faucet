@@ -21,6 +21,7 @@
 
 import ctypes
 import difflib
+import gc
 import logging
 
 from collections import defaultdict, deque
@@ -430,6 +431,10 @@ class Valve:
         else:
             self._atomic_cold_start_failed = True
         self._reset_atomic_start_status()
+
+    def awaiting_bundle(self):
+        """Return True while the switch is yet to answer a start's bundle."""
+        return self._bundle_open is not None
 
     def _end_bundle(self):
         """Forget the bundle in flight, and return its restart type."""
@@ -2288,6 +2293,12 @@ def _trim_memory():
         ctypes.CDLL("libc.so.6").malloc_trim(0)
     except (OSError, AttributeError):
         pass
+
+
+def collect_garbage():
+    """Collect garbage, and hand the memory it frees back to the OS."""
+    gc.collect()
+    _trim_memory()
 
 
 class TfmValve(Valve):
