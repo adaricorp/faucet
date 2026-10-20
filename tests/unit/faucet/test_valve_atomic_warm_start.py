@@ -235,6 +235,14 @@ class ValveAtomicWarmStartTestBase(ValveTestBases.ValveTestNetwork):
             )
         )
 
+    def change_flows(self):
+        """Send the switch a flow mod without a bundle, as a packet in can."""
+        self.valve.send_flows(
+            self.ryu_dp,
+            [self.valve.dp.tables["vlan"].flowdrop(priority=1)],
+            self.mock_time(),
+        )
+
     def assert_bundled(self, sent):
         """Assert sent holds every flow mod in one ordered, atomic bundle."""
         self.assertFalse(
@@ -436,7 +444,7 @@ class ValveAtomicWarmStartTestCase(ValveAtomicWarmStartTestBase):
     def test_refused_bundle_after_flows_changed(self):
         """Test a bundle refused after flows changed since reconnects."""
         commit = self.assert_bundled(self.warm_start())
-        self.assert_not_bundled(self.warm_start(p3_vlans="v100"))
+        self.change_flows()
         self.assertIsNone(self.valve.oferror(commit_error(commit)))
         self.assertEqual((1, 0, 1, 0), self.bundle_counts())
         self.assertEqual(0, self.atomic_status())
@@ -510,7 +518,7 @@ class ValveAtomicWarmStartTestCase(ValveAtomicWarmStartTestBase):
         sent = self.warm_start()
         commit = self.assert_bundled(sent)
         (bundle_open,) = bundle_ctrls(sent, ofp.ONF_BCT_OPEN_REQUEST)
-        self.assert_not_bundled(self.warm_start(p3_vlans="v100"))
+        self.change_flows()
         self.assertIsNone(self.valve.oferror(open_error(bundle_open, self.ryu_dp)))
         self.assertEqual((1, 0, 0, 0), self.bundle_counts())
         # The switch times a bundle out once, and what it commits under the
@@ -518,6 +526,8 @@ class ValveAtomicWarmStartTestCase(ValveAtomicWarmStartTestBase):
         self.assertEqual([], self.valve.oferror(open_error(bundle_open, self.ryu_dp)))
         self.valve.bundle_ctrl_reply(commit_reply(commit))
         self.assertEqual((1, 0, 0, 0), self.bundle_counts())
+        # A warm start before the reconnect goes without a bundle.
+        self.assert_not_bundled(self.warm_start(p3_vlans="v100"))
         # The connection ends, and the next warm start is bundled again.
         self.assert_not_bundled(self.reconnect())
         self.assertEqual((1, 0, 0, 1), self.bundle_counts())
@@ -664,7 +674,7 @@ class ValveAtomicColdAndWarmStartTestCase(ValveAtomicWarmStartTestBase):
     OPTIONS = ("atomic_cold_start", "atomic_warm_start")
 
     def test_warm_start_after_cold_start(self):
-        """Test a warm start bundles once the cold start's bundle commits."""
+        """Test a warm start bundles behind the cold start's bundle, and after it."""
         self.valve.datapath_disconnect(self.mock_time())
         sent = self.sent(
             lambda: self.valve.send_flows(
@@ -674,15 +684,18 @@ class ValveAtomicColdAndWarmStartTestCase(ValveAtomicWarmStartTestBase):
             )
         )
         cold_commit = self.assert_bundled(sent)
-        self.assert_not_bundled(self.warm_start())
+        # Behind the cold start's bundle, which the switch commits first.
+        behind = self.assert_bundled(self.warm_start())
+        self.assertGreater(behind.bundle_id, cold_commit.bundle_id)
         self.valve.bundle_ctrl_reply(commit_reply(cold_commit))
+        self.valve.bundle_ctrl_reply(commit_reply(behind))
         commit = self.assert_bundled(self.warm_start(p3_vlans="v100"))
-        self.assertGreater(commit.bundle_id, cold_commit.bundle_id)
+        self.assertGreater(commit.bundle_id, behind.bundle_id)
         self.assertEqual((1, 1, 0, 0), self.bundle_counts("cold"))
-        self.assertEqual((1, 0, 0, 0), self.bundle_counts())
+        self.assertEqual((2, 1, 0, 0), self.bundle_counts())
         self.assertTrue(self.valve.oferror(commit_error(commit)))
         self.assertEqual((1, 1, 0, 0), self.bundle_counts("cold"))
-        self.assertEqual((1, 0, 1, 0), self.bundle_counts())
+        self.assertEqual((2, 1, 1, 0), self.bundle_counts())
         self.assertEqual(1, self.atomic_status("cold"))
         self.assertEqual(0, self.atomic_status())
         self.valve.datapath_disconnect(self.mock_time())
@@ -934,9 +947,10 @@ class FaucetBundleHandlersTestCase(unittest.TestCase):  # pytype: disable=module
             self.valve, flow_msgs, ryu_dp=self.ryu_dp
         )
         self._error_sends([]).assert_not_called()
-        self.ryu_dp.close.assert_not_called()
-        self._error_sends(None).assert_not_called()
-        self.ryu_dp.close.assert_called_once_with()
+        # Valve.send_flows() ends the connection, as for a cold reload.
+        self._error_sends(None).assert_called_once_with(
+            self.valve, None, ryu_dp=self.ryu_dp
+        )
 
     def test_bundle_ctrl_handler(self):
         """Test a bundle control reply goes to its valve."""
