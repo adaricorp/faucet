@@ -158,9 +158,18 @@ class ValveSwitchManager(ValveManagerBase):  # pylint: disable=too-many-public-m
         self.dp_highest_priority = dp_highest_priority
         self.faucet_dp_mac = faucet_dp_mac
         self.drop_spoofed_faucet_mac = drop_spoofed_faucet_mac
+        # The numbers of the ports, by VLAN ID, that a port specific flood
+        # flow has been added for since the switch was last cold started (no
+        # other port has one on the VLAN), or None if it has not been. A port
+        # stays in it until the next cold start, even once its flows are
+        # deleted, as a batch that adds a flow drops its delete.
+        # Valve.dp_init() keeps it for the switch from one config to the next.
+        self.flood_flow_ports = None
 
     def initialise_tables(self):
         """Initialise the flood table with filtering flows."""
+        # Only a cold start initialises the tables, after deleting every flow.
+        self.flood_flow_ports = {}
         ofmsgs = []
         for eth_dst, eth_dst_mask in (
             (valve_packet.CISCO_CDP_VTP_UDLD_ADDRESS, valve_packet.mac_byte_mask(6)),
@@ -350,10 +359,18 @@ class ValveSwitchManager(ValveManagerBase):  # pylint: disable=too-many-public-m
         flood_acts,
         add_match=None,
     ):  # pylint: disable=too-many-arguments,too-many-positional-arguments
+        if self.flood_flow_ports is not None:
+            self.flood_flow_ports.setdefault(vlan.vid, set()).add(port.number)
         flood_priority, match = self._build_flood_match_priority(
             port, vlan, eth_type, eth_dst, eth_dst_mask, add_match
         )
         return self._build_flood_rule(match, command, flood_acts, flood_priority)
+
+    def _port_flood_flows_may_exist(self, vlan, port):
+        """Return False if port has no port specific flood flow on vlan."""
+        if self.flood_flow_ports is None:
+            return True
+        return port.number in self.flood_flow_ports.get(vlan.vid, ())
 
     def _build_mask_flood_rules(
         self,
@@ -415,9 +432,11 @@ class ValveSwitchManager(ValveManagerBase):  # pylint: disable=too-many-public-m
                     vlan_output_ports - set([port.number]) == port_output_ports
                     and vlan_non_output_acts == port_non_output_acts
                 ):
-                    # Delete a potentially existing port specific flow
-                    # TODO: optimize, avoid generating delete for port if no existing flow.
-                    if not cold_start:
+                    # Delete a potentially existing port specific flow. A port
+                    # that has not had one on the VLAN has none to delete; one
+                    # that has keeps every delete, as a delete with no eth_type
+                    # also removes the port's flows that match one.
+                    if not cold_start and self._port_flood_flows_may_exist(vlan, port):
                         flood_priority, match = self._build_flood_match_priority(
                             port, vlan, eth_type, eth_dst, eth_dst_mask, add_match=None
                         )

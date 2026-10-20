@@ -192,6 +192,17 @@ class Valve:
             valve_util.close_logger(self.logger.logger)
         valve_util.close_logger(self.ofchannel_logger)
 
+    def _new_switch_manager(self):
+        """Return a switch manager for the config, for the switch as it is."""
+        switch_manager = valve_switch.valve_switch_factory(
+            self.logger, self.dp, self.pipeline, self.stack_manager
+        )
+        old_switch_manager = getattr(self, "switch_manager", None)
+        if old_switch_manager is not None:
+            # The switch keeps the flood flows added for the previous config.
+            switch_manager.flood_flow_ports = old_switch_manager.flood_flow_ports
+        return switch_manager
+
     def dp_init(self, new_dp=None, valves=None):
         """Initialize datapath state at connection/re/config time."""
         if new_dp:
@@ -265,9 +276,7 @@ class Valve:
             self.stack_manager,
         )
 
-        self.switch_manager = valve_switch.valve_switch_factory(
-            self.logger, self.dp, self.pipeline, self.stack_manager
-        )
+        self.switch_manager = self._new_switch_manager()
         self._coprocessor_manager = None
         copro_table = self.dp.tables.get("copro", None)
         if copro_table:
