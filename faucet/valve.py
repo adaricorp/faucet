@@ -2014,6 +2014,16 @@ class Valve:
         )
         return []
 
+    @staticmethod
+    def _unbundled(flow_msgs):
+        """Return a bundle's flow mods, if any, to send again without it."""
+        if flow_msgs is not None:
+            for flow_msg in flow_msgs:
+                # Each went in the bundle itself, and kept its bundle add's xid.
+                flow_msg.xid = None
+                flow_msg.buf = None
+        return flow_msgs
+
     def _refused_bundle(self, msg):
         """Handle the switch failing a bundle's commit, so applying none of it.
 
@@ -2023,7 +2033,7 @@ class Valve:
             list: a warm start's flow mods to send again without a bundle,
                 or None to reconnect, and cold start.
         """
-        flow_msgs = self._bundle_resend
+        flow_msgs = self._unbundled(self._bundle_resend)
         restart_type = self._end_bundle()
         self._inc_var("faucet_%s_start_bundles_refused" % restart_type)
         self._inc_var("of_errors")
@@ -2106,7 +2116,7 @@ class Valve:
         # id, so a commit after that applies only what was sent after the
         # timeout: the switch may apply part of the cold or warm start, and
         # has not committed the bundle faucet sent.
-        flow_msgs = self._bundle_resend
+        flow_msgs = self._unbundled(self._bundle_resend)
         restart_type = self._bundle_open
         self._inc_var("of_errors")
         error = "OFError type %s code %s" % (msg.type, msg.exp_type)
@@ -2178,8 +2188,8 @@ class Valve:
             )
             return None
         bundle_id = (self._bundle_id + 1) % 2**32
-        bundled_flow_msgs = valve_of.bundle_ofmsgs(flow_msgs, bundle_id)
-        if bundled_flow_msgs is None:
+        bundled = valve_of.bundle_ofmsgs_lazy(flow_msgs, bundle_id)
+        if bundled is None:
             self.logger.warning(
                 "%s start has group or meter changes, "
                 "so it %s the flows without a bundle" % (restart_type, verb)
@@ -2192,9 +2202,9 @@ class Valve:
             ]
         self.logger.info(
             "%s start %s the flows in one bundle (id %u, %u messages)"
-            % (restart_type, verb, bundle_id, len(bundled_flow_msgs))
+            % (restart_type, verb, bundle_id, bundled[0])
         )
-        return bundled_flow_msgs
+        return bundled[1]
 
     def send_flows(self, ryu_dp, flow_msgs, now):
         """Send flows to datapath (or disconnect an OF session).
