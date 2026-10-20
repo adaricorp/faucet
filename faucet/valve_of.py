@@ -1284,6 +1284,93 @@ def remove_covered_flowdels(deletes):
     return kept
 
 
+def _vid_blocks(vids):
+    """Return the fewest aligned (first VID, count) blocks that hold vids alone."""
+    blocks = []
+    vids = sorted(set(vids))
+    start = 0
+    while start < len(vids):
+        end = start
+        while end + 1 < len(vids) and vids[end + 1] == vids[end] + 1:
+            end += 1
+        low, high = vids[start], vids[end]
+        while low <= high:
+            size = 1
+            while low % (size * 2) == 0 and low + size * 2 - 1 <= high:
+                size *= 2
+            blocks.append((low, size))
+            low += size
+        start = end + 1
+    return blocks
+
+
+def merge_vid_flowdels(deletes, table_ids):
+    """Return deletes with the flow deletes that differ only in VLAN ID merged.
+
+    Non-strict deletes in a table of table_ids that match one VLAN ID each,
+    and are the same otherwise, become the fewest deletes of masked VLAN IDs
+    that match those VLAN IDs and no other. They remove the same flows as
+    long as no flow in those tables matches a VLAN ID with a mask other than
+    OFPVID_PRESENT's alone.
+    """
+    groups = {}
+    for index, ofmsg in enumerate(deletes):
+        if not _is_filterless_flowdel(ofmsg) or ofmsg.table_id not in table_ids:
+            continue
+        fields = dict(ofmsg.match.items())
+        vid = fields.pop("vlan_vid", None)
+        if not isinstance(vid, int) or not vid & ofp.OFPVID_PRESENT:
+            continue
+        try:
+            key = (
+                ofmsg.table_id,
+                ofmsg.priority,
+                ofmsg.cookie,
+                frozenset(fields.items()),
+            )
+        except TypeError:
+            continue
+        groups.setdefault(key, []).append((index, vid & ~ofp.OFPVID_PRESENT))
+    merged = {}
+    for members in groups.values():
+        blocks = _vid_blocks([vid for _, vid in members])
+        if len(blocks) >= len(members):
+            continue
+        first = deletes[members[0][0]]
+        fields = dict(first.match.items())
+        merged_deletes = []
+        for low, size in blocks:
+            fields["vlan_vid"] = low | ofp.OFPVID_PRESENT
+            if size > 1:
+                fields["vlan_vid"] = (
+                    low | ofp.OFPVID_PRESENT,
+                    (~(size - 1) & 0xFFF) | ofp.OFPVID_PRESENT,
+                )
+            merged_deletes.append(
+                parser.OFPFlowMod(
+                    datapath=None,
+                    cookie=first.cookie,
+                    cookie_mask=0,
+                    table_id=first.table_id,
+                    command=ofp.OFPFC_DELETE,
+                    priority=first.priority,
+                    out_port=ofp.OFPP_ANY,
+                    out_group=ofp.OFPG_ANY,
+                    flags=first.flags,
+                    match=match(fields),
+                )
+            )
+        merged[members[0][0]] = merged_deletes
+        for index, _ in members[1:]:
+            merged[index] = []
+    if not merged:
+        return deletes
+    merged_deletes = []
+    for index, ofmsg in enumerate(deletes):
+        merged_deletes.extend(merged.get(index, (ofmsg,)))
+    return merged_deletes
+
+
 # kind, random_order, suggest_barrier, flowkey
 _OFMSG_ORDER = (
     ("config", False, True, str, dedupe_ofmsgs),
@@ -1298,8 +1385,18 @@ _OFMSG_ORDER = (
 )
 
 
-def valve_flowreorder(input_ofmsgs, use_barriers=True):
-    """Reorder flows for better OFA performance."""
+def valve_flowreorder(input_ofmsgs, use_barriers=True, vid_merge_table_ids=()):
+    """Reorder flows for better OFA performance.
+
+    Args:
+        input_ofmsgs (list): OpenFlow messages.
+        use_barriers (bool): True to follow the deletes with a barrier.
+        vid_merge_table_ids (iterable): IDs of the tables in which no flow
+            matches a VLAN ID with a mask other than OFPVID_PRESENT's alone,
+            whose deletes of one VLAN ID each are merged.
+    Returns:
+        list: the messages to send, in order.
+    """
     # Move all deletes to be first, and add one barrier,
     # while optionally randomizing order. Platforms that do
     # parallel delete will perform better and platforms that
@@ -1329,7 +1426,10 @@ def valve_flowreorder(input_ofmsgs, use_barriers=True):
         by_kind["delete"] = remove_overlap_ofmsgs(deletes, addmod)
     deletes = by_kind.get("delete", None)
     if deletes:
-        by_kind["delete"] = remove_covered_flowdels(deletes)
+        deletes = remove_covered_flowdels(deletes)
+        if vid_merge_table_ids:
+            deletes = merge_vid_flowdels(deletes, frozenset(vid_merge_table_ids))
+        by_kind["delete"] = deletes
 
     for kind, _random_order, suggest_barrier, _flowkey, dedupe_func in _OFMSG_ORDER:
         ofmsgs = by_kind.get(kind, [])

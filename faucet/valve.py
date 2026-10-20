@@ -1856,6 +1856,25 @@ class Valve:
             "OFError type: %s code: %s %s" % (error_type, error_code, error_txt)
         )
 
+    def vid_merge_table_ids(self):
+        """Return the IDs of the tables whose deletes of VLAN IDs can be merged.
+
+        Open vSwitch takes a masked VLAN ID in a delete in any table, and a
+        table whose config matches VLAN IDs without a mask has no flow that
+        matches one with a mask: faucet makes none, which ValveTable.flowmod()
+        asserts of each flow it makes, as it does the rest of the table's
+        config. An ACL table's config is its ACLs', so is left out.
+        """
+        if self.dp.hardware != "Open vSwitch":
+            return frozenset()
+        return frozenset(
+            table.table_id
+            for table_name, table in self.dp.tables.items()
+            if table_name not in ("port_acl", "vlan_acl", "egress_acl")
+            and table.match_types
+            and table.match_types.get("vlan_vid", None) is False
+        )
+
     def prepare_send_flows(self, flow_msgs):
         """Prepare to send flows to datapath.
 
@@ -1865,7 +1884,9 @@ class Valve:
         if flow_msgs is None:
             return flow_msgs
         reordered_flow_msgs = valve_of.valve_flowreorder(
-            flow_msgs, use_barriers=self.USE_BARRIERS
+            flow_msgs,
+            use_barriers=self.USE_BARRIERS,
+            vid_merge_table_ids=self.vid_merge_table_ids(),
         )
         self.ofchannel_log(reordered_flow_msgs)
         self._inc_var("of_flowmsgs_sent", val=len(reordered_flow_msgs))
