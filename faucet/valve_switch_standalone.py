@@ -660,11 +660,16 @@ class ValveSwitchManager(ValveManagerBase):  # pylint: disable=too-many-public-m
                         priority=self.low_priority,
                     )
                 )
+            # add_port() adds each tagged VLAN's flow with exactly this match
+            # and priority, so delete it strictly: a switch finds a strict
+            # delete's flow directly, but searches its table for each one
+            # that is not, which for a port with many VLANs is many searches.
             for vlan in port.tagged_vlans:
                 ofmsgs.append(
                     self.vlan_table.flowdel(
                         self.vlan_table.match(in_port=port.number, vlan=vlan),
                         priority=self.low_priority,
+                        strict=True,
                     )
                 )
             if port.lacp:
