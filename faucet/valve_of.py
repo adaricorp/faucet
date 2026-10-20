@@ -1225,6 +1225,65 @@ def remove_overlap_ofmsgs(input_ofmsgs, overlap_input_ofmsgs):
     return input_ofmsgs_without_overlaps
 
 
+def _is_filterless_flowdel(ofmsg):
+    """Return True if ofmsg is a non-strict flow delete filtered by its match alone."""
+    return (
+        is_flowdel(ofmsg)
+        and ofmsg.command == ofp.OFPFC_DELETE
+        and ofmsg.out_port == ofp.OFPP_ANY
+        and ofmsg.out_group == ofp.OFPG_ANY
+        and not ofmsg.cookie_mask
+    )
+
+
+def remove_covered_flowdels(deletes):
+    """Return deletes less the flow deletes another one in the same table covers.
+
+    A non-strict delete removes every flow in its table that has each of its
+    match fields with its value, whatever the flow's priority and other
+    fields. So a delete in that table, strict or not, whose match has all of
+    those fields with the same values removes no flow the first does not. A
+    switch searches its table for every non-strict delete.
+    """
+    covering = {}
+    for ofmsg in deletes:
+        if _is_filterless_flowdel(ofmsg) and ofmsg.table_id != ofp.OFPTT_ALL:
+            fields = sorted(ofmsg.match.items(), key=lambda field: field[0])
+            names = tuple(name for name, _ in fields)
+            values = tuple(value for _, value in fields)
+            try:
+                hash(values)
+            except TypeError:
+                continue
+            covering.setdefault(ofmsg.table_id, {}).setdefault(names, set()).add(values)
+    if not covering:
+        return deletes
+    kept = []
+    for ofmsg in deletes:
+        table_covering = covering.get(getattr(ofmsg, "table_id", None), None)
+        if table_covering and is_flowdel(ofmsg):
+            match = dict(ofmsg.match.items())
+            own_names = tuple(sorted(match))
+            filterless = _is_filterless_flowdel(ofmsg)
+            covered = False
+            for names, values in table_covering.items():
+                # Equal non-strict deletes would each remove the other.
+                if filterless and names == own_names:
+                    continue
+                if not set(names).issubset(match):
+                    continue
+                try:
+                    covered = tuple(match[name] for name in names) in values
+                except TypeError:
+                    continue
+                if covered:
+                    break
+            if covered:
+                continue
+        kept.append(ofmsg)
+    return kept
+
+
 # kind, random_order, suggest_barrier, flowkey
 _OFMSG_ORDER = (
     ("config", False, True, str, dedupe_ofmsgs),
@@ -1268,6 +1327,9 @@ def valve_flowreorder(input_ofmsgs, use_barriers=True):
     addmod = by_kind.get("flowaddmod", None)
     if deletes and addmod:
         by_kind["delete"] = remove_overlap_ofmsgs(deletes, addmod)
+    deletes = by_kind.get("delete", None)
+    if deletes:
+        by_kind["delete"] = remove_covered_flowdels(deletes)
 
     for kind, _random_order, suggest_barrier, _flowkey, dedupe_func in _OFMSG_ORDER:
         ofmsgs = by_kind.get(kind, [])
