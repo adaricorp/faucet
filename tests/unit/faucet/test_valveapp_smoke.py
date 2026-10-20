@@ -177,6 +177,35 @@ vlans:
         )
         self.assertEqual(1, self._prom("dp_atomic_cold_start"))
 
+    def test_bundle_committed_after_cold_reload(self):
+        """Test a commit handled after a reload ends its connection counts.
+
+        A reload that cold starts the DP ends the connection, and the
+        switch's commit reply, queued behind the reload, is handled after it,
+        before the end of the connection.
+        """
+        commit = self._cold_start_bundle()[-1]
+        with open(os.environ["FAUCET_CONFIG"], "w", encoding="utf-8") as config:
+            config.write(
+                self.CONFIG.replace("dp_id: 1", "dp_id: 1\n        timeout: 600")
+            )
+        self.os_ken_app.reload_config(None)
+        self.assertTrue(self.ryu_dp.closed)
+        reply = valve_of.parser.ONFBundleCtrlMsg(
+            None, commit.bundle_id, valve_of.ofp.ONF_BCT_COMMIT_REPLY, 0, []
+        )
+        reply.xid = commit.xid
+        self.os_ken_app.bundle_ctrl_handler(self._event(reply))
+        self.os_ken_app.connect_or_disconnect_handler(dpset.EventDP(self.ryu_dp, False))
+        self.assertEqual(
+            [1, 1, 0, 0, 0],
+            [
+                self._prom("faucet_cold_start_bundles%s_total" % outcome)
+                for outcome in ("", "_committed", "_refused", "_lost", "_abandoned")
+            ],
+        )
+        self.assertEqual(1, self._prom("dp_atomic_cold_start"))
+
     def test_bundle_lost_to_new_connection(self):
         """Test cold starting a new connection loses a bundle on the old one.
 
