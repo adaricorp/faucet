@@ -750,6 +750,70 @@ def table_features(body):
     return parser.OFPTableFeaturesStatsRequest(datapath=None, body=body)
 
 
+# os_ken's OFPMatch makes an OpenFlow 1.0 style Flow and FlowWildcards for
+# every match, for its old set_*() API, which faucet does not use: a match
+# made from keywords is serialized from its OXM fields alone. Those two are
+# most of a match's memory, so every match faucet makes shares one of each.
+# A set_*() call on any match would change them for every match, and os_ken
+# would then serialize every match from them, so they refuse any change.
+class _Unchangeable:
+    """Refuse to change an attribute, as the matches faucet makes share this."""
+
+    def __setattr__(self, name, value):
+        raise TypeError(
+            "%s is shared by every match faucet makes, so %s cannot change"
+            % (type(self).__name__, name)
+        )
+
+    def __delattr__(self, name):
+        self.__setattr__(name, None)
+
+
+class _SharedFlow(_Unchangeable, parser.Flow):  # pylint: disable=too-few-public-methods
+    """The Flow that the matches faucet makes share."""
+
+
+class _SharedFlowWildcards(_Unchangeable, parser.FlowWildcards):
+    """The FlowWildcards that the matches faucet makes share."""
+
+
+def _unchangeable(cls, base):
+    """Return a cls with the attributes base() makes, which cannot change."""
+    shared = object.__new__(cls)
+    shared.__dict__.update(vars(base()))
+    return shared
+
+
+_SHARED_FLOW = _unchangeable(_SharedFlow, parser.Flow)
+_SHARED_FLOW_WILDCARDS = _unchangeable(_SharedFlowWildcards, parser.FlowWildcards)
+
+
+def _ofpmatch(match_fields):
+    """Return OFPMatch(**match_fields), sharing its Flow and FlowWildcards.
+
+    It is made as os_ken 3.1.0's OFPMatch.__init__() makes a match from
+    keywords; test_valve_of_match.py checks that the two agree.
+    """
+    ofmatch = parser.OFPMatch.__new__(parser.OFPMatch)
+    # os_ken makes ofproto's oxm_*() functions at import, unseen by pylint.
+    # pylint: disable=protected-access,no-member
+    ofmatch._wc = _SHARED_FLOW_WILDCARDS
+    ofmatch._flow = _SHARED_FLOW
+    ofmatch.fields = []
+    ofmatch.type = ofp.OFPMT_OXM
+    ofmatch.length = None
+    kwargs = dict(
+        ofp.oxm_normalize_user(key, value) for key, value in match_fields.items()
+    )
+    fields = [ofp.oxm_from_user(key, value) for key, value in kwargs.items()]
+    # As OFPMatch sorts them, by OXM type.
+    fields.sort(
+        key=lambda field: field[0][0] if isinstance(field[0], tuple) else field[0]
+    )
+    ofmatch._fields2 = [ofp.oxm_to_user(n, v, m) for n, v, m in fields]
+    return ofmatch
+
+
 def match(match_fields):
     """Return OpenFlow matches from dict.
 
@@ -758,7 +822,7 @@ def match(match_fields):
     Returns:
         ryu.ofproto.ofproto_v1_3_parser.OFPMatch: matches.
     """
-    return parser.OFPMatch(**match_fields)
+    return _ofpmatch(match_fields)
 
 
 @functools.lru_cache()
@@ -835,7 +899,7 @@ def match_from_dict(match_dict):
             ) from type_error
         kwargs[of_match] = encoded_field
 
-    return parser.OFPMatch(**kwargs)
+    return _ofpmatch(kwargs)
 
 
 def _match_ip_masked(ipa):
