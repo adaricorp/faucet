@@ -1443,8 +1443,13 @@ class Valve:
                 ofmsgs.extend(self.switch_manager.disable_forwarding(port))
                 if not cold_start:
                     ofmsgs.extend(self.switch_manager.del_port(port))
-                    ofmsgs.extend(self.switch_manager.add_port(port))
-                    ofmsgs.extend(self.add_vlans(port.vlans()))
+                    # Not a port going down: ports_delete() builds its VLANs
+                    # once all of its ports are down, and in a warm start,
+                    # flows added for the config being replaced would outlive
+                    # the new config's deletes in the same batch.
+                    if port.dyn_phys_up:
+                        ofmsgs.extend(self.switch_manager.add_port(port))
+                        ofmsgs.extend(self.add_vlans(port.vlans()))
         return ofmsgs
 
     def lldp_handler(self, now, pkt_meta, other_valves):
