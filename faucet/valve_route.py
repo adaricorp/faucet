@@ -345,19 +345,18 @@ class ValveRouteManager(ValveManagerBase):
         return ofmsgs
 
     def add_port(self, port):
-        """Restart the requests for the hosts expired with a port, now it is up.
+        """Restart the requests for next hops expired with a port, now it is up.
 
-        Those sent while the port was down could not reach them through it,
-        and an outage longer than the requests take would drop the hosts.
-        A host heard from since, on another port, is left as it is.
+        Those sent while the port was down could not reach them through it.
+        An outage longer than the requests take would drop a host, and would
+        leave a gateway a route uses requested only every
+        max_resolve_backoff_time. A next hop heard from since, on another
+        port, is left as it is.
         """
         for vlan in port.vlans():
             nexthop_cache = self._vlan_nexthop_cache(vlan)
             for ip_gw in vlan.pop_port_expired_gws(port, self.IPV):
-                if (
-                    vlan.ip_dsts_for_ip_gw(ip_gw)
-                    or self._cached_nexthop_eth_dst(vlan, ip_gw) is not None
-                ):
+                if self._cached_nexthop_eth_dst(vlan, ip_gw) is not None:
                     continue
                 nexthop_cache.pop(ip_gw, None)
                 vlan.add_route_gw(ip_gw)
@@ -673,7 +672,12 @@ class ValveRouteManager(ValveManagerBase):
             % (ip_gw, nexthop_cache_entry.age(now), vlan)
         )
         port = nexthop_cache_entry.port
-        if port is not None and not self.nexthop_dead(nexthop_cache_entry):
+        # The resolvers expire only a dead next hop, and never a gateway a
+        # route uses, however many of its requests have gone unanswered.
+        route_gw = vlan.ip_dsts_for_ip_gw(ip_gw) and not vlan.is_host_fib_route(ip_gw)
+        if port is not None and (
+            route_gw or not self.nexthop_dead(nexthop_cache_entry)
+        ):
             # Expired with its port, not by the resolvers: see add_port().
             vlan.add_port_expired_gw(port, ip_gw)
         self._del_vlan_nexthop_cache_entry(vlan, ip_gw)

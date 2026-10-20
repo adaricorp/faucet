@@ -833,6 +833,7 @@ vlans:
     STATIC_GWS = {4: "10.0.0.99", 6: "fc00::1:99"}
     OTHER_GWS = {4: "10.0.0.98", 6: "fc00::1:98"}
     ADDED_DSTS = {4: "10.98.0.0/24", 6: "fc00::98:0/112"}
+    GW_MAC = "00:00:00:01:00:99"
     TRUNK_PORT = 3
 
     def setUp(self):
@@ -903,10 +904,12 @@ vlans:
         self.rcv_packet(port, 0x100, match)
         self.assertIn(ip_network(host_ip), self._vlan().routes_by_ipv(ipv))
 
-    def _reply(self, ipv, port):
-        """Have the host answer faucet's request, by ARP or by ND."""
-        host_ip = self.HOST_IPS[ipv]
-        match = {"eth_src": self.HOST_MAC, "eth_dst": self._vlan().faucet_mac}
+    def _reply(self, ipv, port, host_ip=None, eth_src=None):
+        """Have the host, or host_ip at eth_src, answer faucet's request, by
+        ARP or by ND."""
+        if host_ip is None:
+            host_ip, eth_src = self.HOST_IPS[ipv], self.HOST_MAC
+        match = {"eth_src": eth_src, "eth_dst": self._vlan().faucet_mac}
         if ipv == 4:
             match.update(
                 {
@@ -1065,6 +1068,98 @@ vlans:
         self.assertEqual(2 * retries, len([run for run in requested if host_ip in run]))
         self.assertNotIn(host_ip, self._vlan().neigh_cache_by_ipv(ipv))
 
+    def _resolve_static_gw(self, ipv):
+        """Have the static routes' gateway answer faucet's request from the
+        trunk, and return its address."""
+        ip_gw = ip_address(self.STATIC_GWS[ipv])
+        self.assertTrue([run for run in self._resolvers(3, secs=2) if ip_gw in run])
+        self._reply(ipv, self.TRUNK_PORT, str(ip_gw), self.GW_MAC)
+        entry = self._vlan().neigh_cache_by_ipv(ipv)[ip_gw]
+        self.assertEqual(self.GW_MAC, entry.eth_src)
+        self.assertEqual(self.TRUNK_PORT, entry.port.number)
+        return ip_gw
+
+    def _runs_to_request(self, ip_gw):
+        """Run the resolvers every 2s, as faucet does, with nothing answering,
+        and return how many runs it takes to request ip_gw (one more than
+        max_resolve_backoff_time if it is not requested by then)."""
+        runs = self._valve().dp.max_resolve_backoff_time
+        for run in range(1, runs + 1):
+            if ip_gw in self._resolvers(1, secs=2)[0]:
+                return run
+        return runs + 1
+
+    def _test_route_gw_port_outage(self, ipv, secs, other_ports=True):
+        """Test a gateway a route uses, on a trunk down for secs, is requested
+        again by the second resolver run after the trunk is up, as a gateway
+        new to the cache is, and resolved when it answers. With no other port
+        of its VLAN up, no request goes out while the trunk is down."""
+        ip_gw = self._resolve_static_gw(ipv)
+        if not other_ports:
+            self.set_port_down(1)
+            self.set_port_down(2)
+        down = self._trunk_down(secs)
+        sent_down = len([run for run in down if ip_gw in run])
+        if other_ports:
+            self.assertGreater(sent_down, 0)
+        else:
+            self.assertEqual(0, sent_down)
+        self.set_port_up(self.TRUNK_PORT)
+        self.assertLessEqual(self._runs_to_request(ip_gw), 2)
+        # That request is lost: the next follows as soon, too.
+        self.assertLessEqual(self._runs_to_request(ip_gw), 2)
+        self._reply(ipv, self.TRUNK_PORT, str(ip_gw), self.GW_MAC)
+        entry = self._vlan().neigh_cache_by_ipv(ipv)[ip_gw]
+        self.assertEqual(self.GW_MAC, entry.eth_src)
+        self.assertEqual(self.TRUNK_PORT, entry.port.number)
+
+    def _test_route_gw_port_flaps(self, ipv):
+        """Test a gateway a route uses that stops answering, behind a trunk
+        that goes down again and again, is requested again at once only the
+        first time the trunk is up."""
+        ip_gw = self._resolve_static_gw(ipv)
+        self._trunk_down(300)
+        self.set_port_up(self.TRUNK_PORT)
+        self.assertLessEqual(self._runs_to_request(ip_gw), 2)
+        for _ in range(5):
+            self._trunk_down(300)
+            self.set_port_up(self.TRUNK_PORT)
+            entry = self._vlan().neigh_cache_by_ipv(ipv)[ip_gw]
+            self.assertGreater(entry.resolve_retries, 1)
+
+    def _test_route_gw_silent_port_outage(self, ipv):
+        """Test a gateway a route uses that missed more requests than a host
+        is sent before it is dead, and then went down with its trunk, is
+        requested again by the second resolver run after the trunk is up."""
+        valve = self._valve()
+        ip_gw = self._resolve_static_gw(ipv)
+        retries = valve.dp.max_host_fib_retry_count
+        self._resolvers(retries)
+        entry = self._vlan().neigh_cache_by_ipv(ipv)[ip_gw]
+        self.assertGreaterEqual(entry.resolve_retries, retries)
+        self.assertEqual(self.GW_MAC, entry.eth_src)
+        self._trunk_down(300)
+        self.set_port_up(self.TRUNK_PORT)
+        self.assertLessEqual(self._runs_to_request(ip_gw), 2)
+
+    def _test_route_gw_other_port_up(self, ipv):
+        """Test another port coming up while a gateway's trunk is down leaves
+        the gateway's requests as they were, to be restarted once the trunk
+        is up."""
+        ip_gw = self._resolve_static_gw(ipv)
+        self._trunk_down(300)
+        nexthop_cache = self._vlan().neigh_cache_by_ipv(ipv)
+        entry = nexthop_cache[ip_gw]
+        retries = entry.resolve_retries
+        self.assertGreater(retries, 1)
+        self.set_port_down(1)
+        self.set_port_up(1)
+        self.assertIs(entry, nexthop_cache.get(ip_gw))
+        self.assertEqual(retries, entry.resolve_retries)
+        self._resolvers(150, secs=2)
+        self.set_port_up(self.TRUNK_PORT)
+        self.assertLessEqual(self._runs_to_request(ip_gw), 2)
+
     def test_dead_host_ipv4(self):
         """Test an IPv4 host that stops replying is not resolved once dead."""
         self._test_dead_host(4)
@@ -1096,6 +1191,61 @@ vlans:
     def test_static_route_gw_ipv6(self):
         """Test an IPv6 gateway a route uses is always resolved."""
         self._test_static_route_gw(6)
+
+    def test_route_gw_port_outage_5m_ipv4(self):
+        """Test an IPv4 gateway a route uses is requested at once after a
+        5 minute outage of its port."""
+        self._test_route_gw_port_outage(4, 300)
+
+    def test_route_gw_port_outage_5m_ipv6(self):
+        """Test an IPv6 gateway a route uses is requested at once after a
+        5 minute outage of its port."""
+        self._test_route_gw_port_outage(6, 300)
+
+    def test_route_gw_port_outage_30s_ipv4(self):
+        """Test an IPv4 gateway a route uses is requested at once after a
+        30 second outage of its port."""
+        self._test_route_gw_port_outage(4, 30)
+
+    def test_route_gw_only_port_outage_ipv4(self):
+        """Test an IPv4 gateway a route uses is requested at once after a
+        5 minute outage of the only port up on its VLAN."""
+        self._test_route_gw_port_outage(4, 300, other_ports=False)
+
+    def test_route_gw_only_port_outage_ipv6(self):
+        """Test an IPv6 gateway a route uses is requested at once after a
+        5 minute outage of the only port up on its VLAN."""
+        self._test_route_gw_port_outage(6, 300, other_ports=False)
+
+    def test_route_gw_port_flaps_ipv4(self):
+        """Test a silent IPv4 gateway a route uses is requested again at
+        once only the first time its flapping port is up."""
+        self._test_route_gw_port_flaps(4)
+
+    def test_route_gw_port_flaps_ipv6(self):
+        """Test a silent IPv6 gateway a route uses is requested again at
+        once only the first time its flapping port is up."""
+        self._test_route_gw_port_flaps(6)
+
+    def test_route_gw_silent_port_outage_ipv4(self):
+        """Test an IPv4 gateway a route uses that went silent before its port
+        went down is requested at once after the outage."""
+        self._test_route_gw_silent_port_outage(4)
+
+    def test_route_gw_silent_port_outage_ipv6(self):
+        """Test an IPv6 gateway a route uses that went silent before its port
+        went down is requested at once after the outage."""
+        self._test_route_gw_silent_port_outage(6)
+
+    def test_route_gw_other_port_up_ipv4(self):
+        """Test another port up leaves an IPv4 gateway on a trunk still down
+        as it was."""
+        self._test_route_gw_other_port_up(4)
+
+    def test_route_gw_other_port_up_ipv6(self):
+        """Test another port up leaves an IPv6 gateway on a trunk still down
+        as it was."""
+        self._test_route_gw_other_port_up(6)
 
     def test_port_outage_10m_ipv4(self):
         """Test an IPv4 host is resolved again after a 10 minute outage."""
