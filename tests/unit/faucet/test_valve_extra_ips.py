@@ -31,6 +31,7 @@ from clib.fakeoftable import CONTROLLER_PORT, IN_PORT
 from clib.valve_test_lib import FAUCET_MAC, ValveTestBases
 from faucet import config_parser_util, valve_of, valve_packet
 from faucet.valve import Valve
+from faucet.valve_route import ExtraIPState
 
 from tests.unit.faucet.test_valve_config import ValveARPResponderTestBase
 
@@ -41,6 +42,8 @@ class ValveExtraIPsTestBase(ValveARPResponderTestBase):
     office lists 10.0.0.10 and 10.0.0.11 in faucet_extra_ips, and routes
     192.0.2.0/24 via 10.0.0.1. Ports 1 and 2 are untagged on office, port 3
     tags office and guest, port 4 is untagged on guest, and port 5 on lab.
+    With CLAIM, each test starts once FAUCET has claimed every address, and
+    a restart or a warm start claims those it lists anew (see claim()).
     """
 
     EXTRA_IPS = ["10.0.0.10", "10.0.0.11"]
@@ -49,6 +52,71 @@ class ValveExtraIPsTestBase(ValveARPResponderTestBase):
         "routes": [{"route": {"ip_dst": "192.0.2.0/24", "ip_gw": "10.0.0.1"}}],
     }
     OTHER_MAC = "00:00:00:01:00:02"
+    NO_MAC = "00:00:00:00:00:00"
+    CLAIM = True
+
+    def setUp(self):
+        """Setup the routed VLANs, and claim their faucet_extra_ips."""
+        super().setUp()
+        if self.CLAIM:
+            self.claim()
+
+    def restart(self, config):
+        """Cold start a new faucet and switch with the config, claim its
+        faucet_extra_ips, and return what claiming them sends."""
+        super().restart(config)
+        if self.CLAIM:
+            return self.claim()
+        return []
+
+    def warm_start(self, config):
+        """Warm start to config, claim the faucet_extra_ips it adds, and return
+        what is sent to the switch."""
+        ofmsgs = super().warm_start(config)
+        if self.CLAIM:
+            ofmsgs = ofmsgs + self.claim()
+        return ofmsgs
+
+    def unclaimed(self):
+        """Return the faucet_extra_ips of the running config that FAUCET has
+        not claimed."""
+        return sorted(
+            str(extra_ip)
+            for vlan in self.valves_manager.valves[self.DP_ID].dp.vlans.values()
+            for extra_ip in vlan.faucet_extra_ips
+            if vlan.dyn_extra_ip_state[extra_ip].state != ExtraIPState.CLAIMED
+        )
+
+    def switch_live(self):
+        """Have the switch send FAUCET a packet in, as it does once it has
+        flows after a cold start: LLDP from a neighbour on port 5."""
+        with mock.patch.object(self.valves_manager, "valve_flow_services"):
+            self.rcv_packet(
+                5,
+                0,
+                {
+                    "eth_src": "00:00:00:05:00:01",
+                    "eth_dst": "01:80:c2:00:00:0e",
+                    "chassis_id": "00:00:00:05:00:01",
+                    "port_id": 1,
+                },
+            )
+
+    def claim(self):
+        """Have FAUCET probe for the faucet_extra_ips of the running config
+        until it claims them all, once the switch sends packet ins, and
+        return what it sends meanwhile."""
+        ofmsgs = []
+        if self.unclaimed():
+            dp = self.valves_manager.valves[self.DP_ID].dp
+            if not dp.packet_in_since_cold_start():
+                self.switch_live()
+            for _ in range(30):
+                ofmsgs.extend(self.resolvers(1))
+                if not self.unclaimed():
+                    break
+        self.assertEqual([], self.unclaimed())
+        return ofmsgs
 
     def config(self, vlans=None, interfaces=None, arp_responder=True):
         """Return the config, with office's faucet_extra_ips and route unless
@@ -174,14 +242,14 @@ class ValveExtraIPsTestBase(ValveARPResponderTestBase):
     def requested(ofmsgs):
         """Return the addresses ofmsgs send an ARP request for, or send an
         ARP reply or an IPv4 packet to: not gratuitous ARP, which announces
-        its address."""
+        its address, nor an ARP probe, which looks for a host using it."""
         requested = set()
         for pkt_out in ValveTestBases.packet_outs_from_flows(ofmsgs):
             pkt = valve_packet.parse_packet_in_pkt(bytes(pkt_out.data), None)[0]
             arp_pkt = pkt.get_protocol(arp.arp)
             ipv4_pkt = pkt.get_protocol(ipv4.ipv4)
             if arp_pkt is not None:
-                if arp_pkt.src_ip != arp_pkt.dst_ip:
+                if arp_pkt.src_ip not in (arp_pkt.dst_ip, "0.0.0.0"):
                     requested.add(arp_pkt.dst_ip)
             elif ipv4_pkt is not None:
                 requested.add(ipv4_pkt.dst)
@@ -195,6 +263,41 @@ class ValveExtraIPsTestBase(ValveARPResponderTestBase):
         ofmsgs.extend(valve.state_expire(now, None).get(valve, []))
         self.apply_ofmsgs(ofmsgs)
         return ofmsgs
+
+    def arp_in(self, port, opcode, src_ip, dst_ip, **kwargs):
+        """Have FAUCET handle ARP the switch sends it from a port on office,
+        tagged as the switch sends it: to eth_dst or broadcast, from eth_src
+        or HOST_MAC, with src_mac or eth_src as the sender MAC."""
+        eth_src = kwargs.get("eth_src", self.HOST_MAC)
+        eth_dst = kwargs.get("eth_dst", self.BROADCAST_MAC)
+        pkt = valve_packet.build_pkt_header(
+            0x100, eth_src, eth_dst, valve_of.ether.ETH_TYPE_ARP
+        )
+        pkt.add_protocol(
+            arp.arp(
+                opcode=opcode,
+                src_mac=kwargs.get("src_mac", eth_src),
+                src_ip=src_ip,
+                dst_mac=self.NO_MAC if opcode == arp.ARP_REQUEST else eth_dst,
+                dst_ip=dst_ip,
+            )
+        )
+        pkt.serialize()
+        valve = self.valves_manager.valves[self.DP_ID]
+        msg = namedtuple(
+            "null_msg", ("match", "in_port", "data", "total_len", "cookie", "reason")
+        )(
+            {"in_port": port},
+            port,
+            pkt.data,
+            len(pkt.data),
+            valve.dp.cookie,
+            valve_of.ofp.OFPR_ACTION,
+        )
+        self.valves_manager.valve_packet_in(self.mock_time(0), valve, msg)
+        ofmsgs = self.last_flows_to_dp[self.DP_ID]
+        self.last_flows_to_dp[self.DP_ID] = []
+        self.apply_ofmsgs(ofmsgs)
 
     def assert_not_local(self, address, vid=0x100):
         """Assert FAUCET has no next hop, route or gateway for an address."""
@@ -505,8 +608,6 @@ class ValveExtraIPsLocalTestCase(ValveExtraIPsTestBase):
 class ValveExtraIPsAnnounceTestCase(ValveExtraIPsTestBase):
     """Test FAUCET announces faucet_extra_ips."""
 
-    NO_MAC = "00:00:00:00:00:00"
-
     def packet_in(self, port, vid, match):
         """Have FAUCET handle a packet in between two runs of its services."""
         with mock.patch.object(self.valves_manager, "valve_flow_services"):
@@ -595,21 +696,22 @@ class ValveExtraIPsAnnounceTestCase(ValveExtraIPsTestBase):
         )
 
     def test_cold_start(self):
-        """Test a cold start announces each address once, then sends a
-        request from it to the route's gateway once its MAC is known, and
-        that a cold start of the switch announces them again."""
+        """Test claiming each address announces it once, then a request from
+        it is sent to the route's gateway once its MAC is known, and that a
+        cold start of the switch announces them again."""
+        self.assertEqual(self.gratuitous(), self.announced(self.restart(self.config())))
         for _ in range(2):
-            self.assertEqual(self.gratuitous(), self.announced(self.resolvers(1)))
             self.assertEqual([], self.announced(self.resolvers(1)))
             self.learn_gateway()
             self.assertEqual(self.requests(), self.announced(self.resolvers(1)))
             self.assertEqual([], self.announced(self.resolvers(1)))
             self.cold_start()
+            self.assertEqual(self.gratuitous(), self.announced(self.resolvers(1)))
 
     def test_gateway_subnet(self):
         """Test the request from an address goes only to the gateways in its
         own subnet, tagged on a tagged port."""
-        self.restart(
+        claimed = self.restart(
             self.extra_ips_config(
                 ["10.0.0.10", "10.1.0.10"],
                 office={
@@ -622,10 +724,7 @@ class ValveExtraIPsAnnounceTestCase(ValveExtraIPsTestBase):
             )
         )
         extra_ips = ["10.0.0.10", "10.1.0.10"]
-        self.assertEqual(
-            self.gratuitous(extra_ips),
-            self.announced(self.resolvers(1), extra_ips),
-        )
+        self.assertEqual(self.gratuitous(extra_ips), self.announced(claimed, extra_ips))
         self.learn_gateway()
         self.learn_gateway("10.1.0.1", port=3)
         self.assertEqual(
@@ -637,9 +736,11 @@ class ValveExtraIPsAnnounceTestCase(ValveExtraIPsTestBase):
         )
 
     def test_paced(self):
-        """Test at most 16 addresses of a VLAN are announced at a time."""
+        """Test at most 16 addresses of a VLAN are announced at a time, as
+        after a cold start of the switch."""
         extra_ips = ["10.0.0.%u" % host for host in range(10, 30)]
         self.restart(self.extra_ips_config(extra_ips))
+        self.cold_start()
         announced = []
         for count in (16, 4, 0):
             sent = self.announced(self.resolvers(1), extra_ips)
@@ -671,62 +772,26 @@ class ValveExtraIPsAnnounceTestCase(ValveExtraIPsTestBase):
         self.assertEqual([], self.announced(self.resolvers(1)))
 
     def test_added(self):
-        """Test a warm start announces the addresses it adds alone, including
-        one listed again after it was removed."""
+        """Test a warm start claims and announces the addresses it adds alone,
+        including one listed again after it was removed."""
         self.resolvers(1)
-        self.warm_start(self.extra_ips_config(["10.0.0.11", "10.0.0.12"]))
         extra_ips = ["10.0.0.10", "10.0.0.11", "10.0.0.12"]
         self.assertEqual(
             self.gratuitous(["10.0.0.12"]),
-            self.announced(self.resolvers(1), extra_ips),
+            self.announced(
+                self.warm_start(self.extra_ips_config(["10.0.0.11", "10.0.0.12"])),
+                extra_ips,
+            ),
         )
-        self.warm_start(self.config())
         self.assertEqual(
             self.gratuitous(["10.0.0.10"]),
-            self.announced(self.resolvers(1), extra_ips),
+            self.announced(self.warm_start(self.config()), extra_ips),
         )
 
 
 class ValveExtraIPsForeignTestCase(ValveExtraIPsTestBase):
     """Test ARP from other hosts using faucet_extra_ips is counted, and
     forwarded as it was before."""
-
-    NO_MAC = "00:00:00:00:00:00"
-
-    def arp_in(self, port, opcode, src_ip, dst_ip, **kwargs):
-        """Have FAUCET handle ARP the switch sends it from a port on office,
-        tagged as the switch sends it: to eth_dst or broadcast, from eth_src
-        or HOST_MAC, with src_mac or eth_src as the sender MAC."""
-        eth_src = kwargs.get("eth_src", self.HOST_MAC)
-        eth_dst = kwargs.get("eth_dst", self.BROADCAST_MAC)
-        pkt = valve_packet.build_pkt_header(
-            0x100, eth_src, eth_dst, valve_of.ether.ETH_TYPE_ARP
-        )
-        pkt.add_protocol(
-            arp.arp(
-                opcode=opcode,
-                src_mac=kwargs.get("src_mac", eth_src),
-                src_ip=src_ip,
-                dst_mac=self.NO_MAC if opcode == arp.ARP_REQUEST else eth_dst,
-                dst_ip=dst_ip,
-            )
-        )
-        pkt.serialize()
-        valve = self.valves_manager.valves[self.DP_ID]
-        msg = namedtuple(
-            "null_msg", ("match", "in_port", "data", "total_len", "cookie", "reason")
-        )(
-            {"in_port": port},
-            port,
-            pkt.data,
-            len(pkt.data),
-            valve.dp.cookie,
-            valve_of.ofp.OFPR_ACTION,
-        )
-        self.valves_manager.valve_packet_in(self.mock_time(0), valve, msg)
-        ofmsgs = self.last_flows_to_dp[self.DP_ID]
-        self.last_flows_to_dp[self.DP_ID] = []
-        self.apply_ofmsgs(ofmsgs)
 
     def extra_ip_metrics(self, extra_ip="10.0.0.10", vid=0x100):
         """Return an address's vlan_extra_ip_state and the count of ARP from

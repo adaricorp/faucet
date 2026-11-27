@@ -809,18 +809,36 @@ or a name. The following attributes can be configured:
       - list of strings (IPv4 addresses)
       - None
       - Further IPv4 addresses in this VLAN's faucet_vips subnets that the
-        switch answers ARP for with faucet_mac, as it does for the VIPs;
-        needs arp_responder. Faucet announces each with gratuitous ARP when
-        a cold start or a config change adds it, and sends an ARP request
-        from it to each route gateway in its subnet once per
-        arp_neighbor_timeout. ARP whose sender is one of them goes to Faucet
-        too, which counts what another host using one broadcasts or sends to
-        faucet_mac in vlan_extra_ip_foreign_arp, and logs the host's MAC and
-        port; vlan_extra_ip_state reports each as 1, claimed. Faucet routes
-        nothing to them itself: IPv4 traffic to one that no ACL has changed
-        is dropped. Not a VIP of any VLAN, a network or broadcast address, a
-        route's ip_gw or the destination of a /32 route, nor listed on two
-        VLANs.
+        switch answers ARP for with faucet_mac, as it does for the VIPs, once
+        Faucet has claimed them; needs arp_responder. Faucet probes for each
+        before it claims it, as RFC 5227 has a host do: three ARP probes at
+        least a second apart, then at least two seconds without an answer.
+        It starts once the switch has sent Faucet a packet in since it last
+        connected, so a switch that sends none has no address claimed, and
+        probes for at most 16 addresses of a VLAN at a time, taking the rest
+        in turn as those are claimed or held. Faucet does not hear a host it
+        will not learn, such as one past its port's or VLAN's max_hosts, so
+        it can claim an address such a host uses. If another host uses the
+        address, or probes for it as well, Faucet holds back from it, and
+        probes again once it has heard nothing from that host for at least 2
+        seconds, a wait that doubles each time the host answers a round of
+        probes, up to 10 minutes.
+        Faucet never gives up an address it has claimed, but probes for it
+        once per arp_neighbor_timeout, and probes again before it answers
+        with a new faucet_mac.
+        vlan_extra_ip_state reports each as 0 (probing), 1 (claimed) or 2
+        (held), vlan_extra_ip_state_changes counts its changes, and
+        vlan_extra_ip_state_change_time is the time of the last, or of when
+        Faucet started or the address was listed. Faucet announces each with
+        gratuitous ARP once it claims it, and again after a cold start, and
+        sends an ARP request from it to each route gateway in its subnet once
+        per arp_neighbor_timeout. ARP whose sender is one of them goes to
+        Faucet too, which counts what another host using one broadcasts or
+        sends to faucet_mac in vlan_extra_ip_foreign_arp, and logs the host's
+        MAC and port. Faucet routes nothing to them itself: IPv4 traffic to
+        one that no ACL has changed is dropped, claimed or not. Not a VIP of
+        any VLAN, a network or broadcast address, a route's ip_gw or the
+        destination of a /32 route, nor listed on two VLANs.
     * - max_hosts
       - integer
       - 255

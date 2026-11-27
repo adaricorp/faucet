@@ -178,6 +178,9 @@ class VLAN(Conf):
         # By each of faucet_extra_ips announced, when to refresh it, and the
         # gateways told of it since.
         self.dyn_extra_ip_refresh = {}
+        # By each of faucet_extra_ips, whether the switch answers for it
+        # (valve_route.ExtraIPState), which a cold start of the switch keeps.
+        self.dyn_extra_ip_state = {}
         self.dyn_host_cache = None
         self.dyn_host_cache_by_port = None
         self.dyn_host_cache_stats_stale = None

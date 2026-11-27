@@ -94,6 +94,40 @@ class NextHop:
         return self.__str__()
 
 
+class ExtraIPState:  # pylint: disable=too-few-public-methods
+    """Whether the switch answers ARP for one of a VLAN's faucet_extra_ips.
+
+    FAUCET probes for the address before the switch answers for it, as RFC
+    5227 has a host probe for an address before it uses it, and claims it if
+    no other host answers. It holds back from one another host uses, and
+    probes for it again later. It never gives up an address it has claimed.
+    """
+
+    __slots__ = [
+        "backoff",
+        "change_time",
+        "next_time",
+        "probes",
+        "state",
+    ]
+
+    PROBING = 0
+    CLAIMED = 1
+    HELD = 2
+    NAMES = ("probing", "claimed", "held")
+
+    def __init__(self, now):
+        self.state = self.PROBING
+        # When the state last changed, or the address was listed.
+        self.change_time = now
+        # The probes sent in the round in progress.
+        self.probes = 0
+        # When the next probe is due, or the address is claimed.
+        self.next_time = None
+        # The seconds held back from the address, while held.
+        self.backoff = 0
+
+
 class ValveRouteManager(ValveManagerBase):
     """Base class to implement RIB/FIB."""
 
@@ -618,12 +652,15 @@ class ValveRouteManager(ValveManagerBase):
         none but IPv4's."""
         return []
 
-    def extra_ips_due(self, _vlan, _now):
+    def extra_ips_due(self, _vlan, _now, _live=True):
         """Return the ARP due for a VLAN's faucet_extra_ips: none but IPv4's."""
         return []
 
     def del_extra_ip_metrics(self, _vlan, _extra_ips):
         """Remove the metrics of some of a VLAN's faucet_extra_ips: IPv4's."""
+
+    def keep_extra_ip_states(self, _vlan, _new_vlan):
+        """Keep the state of a VLAN's faucet_extra_ips in a new config: IPv4's."""
 
     def add_vlan(self, vlan, cold_start):
         """Add a VLAN."""
@@ -1648,10 +1685,19 @@ class ValveIPv4RouteManager(ValveRouteManager):
     IP_PKT = ipv4.ipv4
     # The sender address of an ARP probe (RFC 5227).
     ARP_PROBE_SPA = ipaddress.ip_network("0.0.0.0/32")
-    # The most of a VLAN's faucet_extra_ips announced at a time.
+    # The most of a VLAN's faucet_extra_ips probed for or announced at a time.
     EXTRA_IP_ANNOUNCE_PER_CYCLE = 16
-    # vlan_extra_ip_state of an address the switch answers for.
-    EXTRA_IP_CLAIMED = 1
+    # Probing for one of faucet_extra_ips, as RFC 5227 has a host probe for an
+    # address before it uses it: the probes in a round, the seconds at least
+    # between them, and the seconds after the last before the switch answers
+    # for the address, if no other host has.
+    EXTRA_IP_PROBE_NUM = 3
+    EXTRA_IP_PROBE_INTERVAL = 1
+    EXTRA_IP_ANNOUNCE_WAIT = 2
+    # The seconds FAUCET waits before it probes again for an address another
+    # host uses, doubling from the first to the last.
+    EXTRA_IP_HOLD_MIN = 2
+    EXTRA_IP_HOLD_MAX = 600
 
     def advertise(self, _vlan):
         return []
@@ -1751,8 +1797,9 @@ class ValveIPv4RouteManager(ValveRouteManager):
             return self.global_vlan
         return vlan
 
-    def _extra_ip_flows(self, vlan, extra_ip):
-        """Return the flows for one of a VLAN's faucet_extra_ips.
+    def _extra_ip_answers(self, vlan, extra_ip):
+        """Return the flows that answer ARP for one of a VLAN's
+        faucet_extra_ips, once FAUCET has claimed it.
 
         The switch answers a request for the address from the VIP's subnet
         with faucet_mac, as it does for the VIP, but sends nothing to the
@@ -1761,16 +1808,9 @@ class ValveIPv4RouteManager(ValveRouteManager):
         to take the address finds it in use, and copies the probe to the
         controller. As for a VIP, there is a flow for the VLAN, which answers
         tagged ports, and one for each running port it is untagged on.
-
-        IPv4 traffic to the address is sent to the VIP table, as it is for a
-        VIP, and dropped there. The drop matches no VLAN, as traffic routed
-        from another VLAN reaches the VIP table too, through the FIB flow for
-        the address's subnet. ARP from the address goes to the controller
-        (see _extra_ip_sender_matches()).
         """
         faucet_vip = vlan.vip_map(extra_ip)
         target_host = self._host_ip_to_host_int(extra_ip)
-        priority = self._route_priority(target_host)
         ofmsgs = []
         for port in [None] + [port for port in vlan.untagged if port.running()]:
             ofmsgs.append(self._arp_responder(vlan, faucet_vip, target_host, port=port))
@@ -1779,6 +1819,46 @@ class ValveIPv4RouteManager(ValveRouteManager):
                     vlan, faucet_vip, target_host, port=port, probe=True
                 )
             )
+        return ofmsgs
+
+    def _extra_ip_probes_seen(self, vlan, extra_ip):
+        """Return the flow that sends another host's ARP probes for one of a
+        VLAN's faucet_extra_ips to the controller and on, unanswered, until
+        FAUCET claims the address. It has the match and priority of the flow
+        for the VLAN that answers them after (see _extra_ip_answers()), which
+        replaces it."""
+        faucet_vip = vlan.vip_map(extra_ip)
+        target_host = self._host_ip_to_host_int(extra_ip)
+        match, priority = self._arp_responder_match(
+            vlan, faucet_vip, target_host, probe=True
+        )
+        return self.vip_table.flowcontroller(
+            match,
+            priority=priority,
+            inst=self.pipeline.accept_to_l2_forwarding(),
+            max_len=valve_packet.VLAN_ARP_PKT_SIZE,
+        )
+
+    def _extra_ip_flows(self, vlan, extra_ip):
+        """Return the flows for one of a VLAN's faucet_extra_ips.
+
+        Once FAUCET has claimed the address, the switch answers ARP for it
+        (see _extra_ip_answers()). Until then, requests for it go on as for
+        any other host's address, and probes for it go to the controller too.
+
+        IPv4 traffic to the address is sent to the VIP table, as it is for a
+        VIP, and dropped there, whether FAUCET has claimed it or not. The drop
+        matches no VLAN, as traffic routed from another VLAN reaches the VIP
+        table too, through the FIB flow for the address's subnet. ARP from
+        the address goes to the controller (see _extra_ip_sender_matches()).
+        """
+        target_host = self._host_ip_to_host_int(extra_ip)
+        priority = self._route_priority(target_host)
+        state = vlan.dyn_extra_ip_state[extra_ip]
+        if state.state == ExtraIPState.CLAIMED:
+            ofmsgs = self._extra_ip_answers(vlan, extra_ip)
+        else:
+            ofmsgs = [self._extra_ip_probes_seen(vlan, extra_ip)]
         ofmsgs.append(
             self.fib_table.flowmod(
                 self._route_match(self._extra_ip_fib_vlan(vlan), target_host),
@@ -1921,7 +2001,8 @@ class ValveIPv4RouteManager(ValveRouteManager):
         return ofmsgs
 
     def add_extra_ips(self, vlan, extra_ips):
-        """Add the flows for some of a VLAN's faucet_extra_ips.
+        """Add the flows for some of a VLAN's faucet_extra_ips, and probe for
+        each that the VLAN lists anew before the switch answers for it.
 
         Args:
             vlan (VLAN): the VLAN that lists them.
@@ -1931,24 +2012,31 @@ class ValveIPv4RouteManager(ValveRouteManager):
         """
         ofmsgs = []
         for extra_ip in sorted(extra_ips):
+            state = vlan.dyn_extra_ip_state.get(extra_ip, None)
+            if state is None:
+                # Listed anew, or FAUCET has started: all are probed for.
+                state = ExtraIPState(time.time())
+                vlan.dyn_extra_ip_state[extra_ip] = state
             ofmsgs.extend(self._purge_extra_ip(vlan, extra_ip))
             ofmsgs.extend(self._extra_ip_flows(vlan, extra_ip))
-            self._add_extra_ip_metrics(vlan, extra_ip)
+            self._add_extra_ip_metrics(vlan, extra_ip, state)
         return ofmsgs
 
     def _extra_ip_labels(self, vlan, extra_ip):
         """Return the metric labels of one of a VLAN's faucet_extra_ips."""
         return dict(self.prom_labels, vlan=vlan.vid, ip=str(extra_ip))
 
-    def _add_extra_ip_metrics(self, vlan, extra_ip):
-        """Report one of a VLAN's faucet_extra_ips, claimed, keeping the count
-        of foreign ARP an address listed already has, and starting it at 0
-        for one listed anew rather than reporting nothing."""
+    def _add_extra_ip_metrics(self, vlan, extra_ip, state):
+        """Report one of a VLAN's faucet_extra_ips in its state, keeping the
+        counts an address listed already has, and starting them at 0 for one
+        listed anew rather than reporting nothing."""
         if self.set_var is None or self.inc_var is None:
             return
         labels = self._extra_ip_labels(vlan, extra_ip)
-        self.set_var("vlan_extra_ip_state", self.EXTRA_IP_CLAIMED, labels)
-        self.inc_var("vlan_extra_ip_foreign_arp", labels, 0)
+        self.set_var("vlan_extra_ip_state", state.state, labels)
+        self.set_var("vlan_extra_ip_state_change_time", state.change_time, labels)
+        for var in ("vlan_extra_ip_foreign_arp", "vlan_extra_ip_state_changes"):
+            self.inc_var(var, labels, 0)
 
     def del_extra_ip_metrics(self, vlan, extra_ips):
         """Remove the metrics of some of a VLAN's faucet_extra_ips.
@@ -1962,8 +2050,46 @@ class ValveIPv4RouteManager(ValveRouteManager):
             return
         for extra_ip in sorted(extra_ips):
             labels = self._extra_ip_labels(vlan, extra_ip)
-            for var in ("vlan_extra_ip_state", "vlan_extra_ip_foreign_arp"):
+            for var in (
+                "vlan_extra_ip_state",
+                "vlan_extra_ip_state_changes",
+                "vlan_extra_ip_state_change_time",
+                "vlan_extra_ip_foreign_arp",
+            ):
                 self.remove_var(var, labels)
+
+    def keep_extra_ip_states(self, vlan, new_vlan):
+        """Give a new config's VLAN the state of each of the faucet_extra_ips
+        it still lists, and forget those it does not, so that FAUCET probes
+        for one again if it is listed again.
+
+        A VLAN whose config is otherwise unchanged shares its state with the
+        new config's already (see Conf.merge_dyn()). If the VLAN's faucet_mac
+        changes, FAUCET probes again for the addresses it has claimed or is
+        probing for, as other hosts know them by the old MAC.
+
+        Args:
+            vlan (VLAN): the VLAN in the running config.
+            new_vlan (VLAN): the VLAN with its VID in the new config.
+        """
+        states = new_vlan.dyn_extra_ip_state
+        if states is not vlan.dyn_extra_ip_state:
+            states.update(vlan.dyn_extra_ip_state)
+        for extra_ip in set(states) - new_vlan.faucet_extra_ips:
+            del states[extra_ip]
+        if new_vlan.faucet_mac == vlan.faucet_mac:
+            return
+        now = time.time()
+        for extra_ip in sorted(states):
+            state = states[extra_ip]
+            if state.state == ExtraIPState.HELD:
+                continue
+            state.probes = 0
+            state.next_time = None
+            if state.state == ExtraIPState.CLAIMED:
+                self._extra_ip_set_state(
+                    new_vlan, extra_ip, state, ExtraIPState.PROBING, now
+                )
 
     def del_extra_ips(self, vlan, extra_ips):
         """Delete the flows for some of a VLAN's faucet_extra_ips, strictly.
@@ -1987,6 +2113,10 @@ class ValveIPv4RouteManager(ValveRouteManager):
             # The switch has lost the flows that answered for them, so others
             # may have stopped using faucet_mac for them: announce them again.
             vlan.dyn_extra_ip_refresh.clear()
+            # Nor could answers to probes have reached FAUCET while the switch
+            # had no flows: a round of them starts over.
+            for state in vlan.dyn_extra_ip_state.values():
+                state.probes = 0
         ofmsgs = super().add_vlan(vlan, cold_start)
         ofmsgs.extend(self.add_extra_ips(vlan, vlan.faucet_extra_ips))
         return ofmsgs
@@ -2035,41 +2165,116 @@ class ValveIPv4RouteManager(ValveRouteManager):
             told_gws.add(ip_gw)
         return ofmsgs
 
-    def extra_ips_due(self, vlan, now):
-        """Return the ARP that announces a VLAN's faucet_extra_ips, as it is due.
+    def _extra_ip_announce(self, vlan, extra_ip, now):
+        """Return the ARP due that announces one of a VLAN's faucet_extra_ips,
+        which FAUCET has claimed (see extra_ips_due())."""
+        ofmsgs = []
+        refresh = vlan.dyn_extra_ip_refresh.get(extra_ip, None)
+        if refresh is None:
+            ofmsgs.extend(self._extra_ip_gratuitous(vlan, extra_ip))
+        if refresh is None or refresh[0] <= now:
+            refresh = (now + self.neighbor_timeout, set())
+            vlan.dyn_extra_ip_refresh[extra_ip] = refresh
+        ofmsgs.extend(self._extra_ip_gw_requests(vlan, extra_ip, refresh[1]))
+        return ofmsgs
 
-        Faucet announces each address that has not been, as when it is added
-        or the switch cold starts, with a gratuitous ARP request and reply,
-        flooded with faucet_mac. It also sends an ARP request from the address
-        to each route gateway in its subnet, once the gateway's MAC is known,
-        and again once per neighbor timeout, since a host records the sender
-        of a request to it (RFC 826) whether or not it heeds gratuitous ARP.
-        At most EXTRA_IP_ANNOUNCE_PER_CYCLE addresses of a VLAN send any of
-        these in one call, the rest in later ones.
+    def _extra_ip_probe(self, vlan, extra_ip):
+        """Return an ARP probe (RFC 5227) for one of a VLAN's faucet_extra_ips,
+        flooded with faucet_mac: none if no port of the VLAN is running."""
+        return vlan.flood_pkt(
+            valve_packet.arp_request,
+            self.multi_out,
+            vlan.faucet_mac,
+            valve_of.mac.BROADCAST_STR,
+            self.ARP_PROBE_SPA.network_address,
+            extra_ip,
+        )
+
+    def _extra_ip_set_state(self, vlan, extra_ip, state, new_state, now):
+        """Move one of a VLAN's faucet_extra_ips to a new state, and report it."""
+        state.state = new_state
+        state.change_time = now
+        self.logger.info(
+            "VLAN %u faucet_extra_ips %s is now %s"
+            % (vlan.vid, extra_ip, ExtraIPState.NAMES[new_state])
+        )
+        if self.set_var is None or self.inc_var is None:
+            return
+        labels = self._extra_ip_labels(vlan, extra_ip)
+        self.set_var("vlan_extra_ip_state", new_state, labels)
+        self.set_var("vlan_extra_ip_state_change_time", now, labels)
+        self.inc_var("vlan_extra_ip_state_changes", labels)
+
+    def _extra_ip_probe_due(self, vlan, extra_ip, state, now, live):
+        """Return the probe due for one of a VLAN's faucet_extra_ips, if any,
+        or the flows that answer for it, if FAUCET claims it now.
+
+        FAUCET claims an address it is probing for, or holds, once a round of
+        EXTRA_IP_PROBE_NUM probes has had no answer for EXTRA_IP_ANNOUNCE_WAIT
+        seconds after the last (see _extra_ip_conflict() for an answer). A
+        round goes on only while the switch is live (see extra_ips_due()). A
+        claimed address is probed for once per neighbor timeout, so that a
+        host that has taken it without probing answers, and is counted, but
+        FAUCET never gives it up.
+        """
+        if state.next_time is not None and now < state.next_time:
+            return []
+        if state.state == ExtraIPState.CLAIMED:
+            ofmsgs = self._extra_ip_probe(vlan, extra_ip)
+            if ofmsgs:
+                state.next_time = now + self.neighbor_timeout
+            return ofmsgs
+        if not live:
+            return []
+        if state.probes == self.EXTRA_IP_PROBE_NUM:
+            state.probes = 0
+            state.next_time = now + self.neighbor_timeout
+            self._extra_ip_set_state(vlan, extra_ip, state, ExtraIPState.CLAIMED, now)
+            return self._extra_ip_answers(vlan, extra_ip)
+        ofmsgs = self._extra_ip_probe(vlan, extra_ip)
+        if ofmsgs:
+            state.probes += 1
+            state.next_time = now + self.EXTRA_IP_PROBE_INTERVAL
+            if state.probes == self.EXTRA_IP_PROBE_NUM:
+                state.next_time = now + self.EXTRA_IP_ANNOUNCE_WAIT
+        return ofmsgs
+
+    def extra_ips_due(self, vlan, now, live=True):
+        """Return the ARP and flows due for a VLAN's faucet_extra_ips.
+
+        FAUCET probes for each address before the switch answers for it, and
+        claims it if no other host answers (see _extra_ip_probe_due()). Faucet
+        announces each address it has claimed that it has not announced, as
+        when it claims it or the switch cold starts, with a gratuitous ARP
+        request and reply, flooded with faucet_mac. It also sends an ARP
+        request from the address to each route gateway in its subnet, once
+        the gateway's MAC is known, and again once per neighbor timeout, since
+        a host records the sender of a request to it (RFC 826) whether or not
+        it heeds gratuitous ARP. At most EXTRA_IP_ANNOUNCE_PER_CYCLE addresses
+        of a VLAN send any of these in one call, the rest in later ones.
 
         Args:
             vlan (VLAN): the VLAN that lists them.
             now (float): seconds since epoch.
+            live (bool): True if the switch has sent a packet in since its last
+                cold start: until then, answers to probes could be lost.
         Returns:
             list: OpenFlow messages.
         """
         ofmsgs = []
-        announced = 0
+        sent = 0
         for extra_ip in sorted(vlan.faucet_extra_ips):
-            if announced == self.EXTRA_IP_ANNOUNCE_PER_CYCLE:
+            if sent == self.EXTRA_IP_ANNOUNCE_PER_CYCLE:
                 break
-            extra_ip_ofmsgs = []
-            refresh = vlan.dyn_extra_ip_refresh.get(extra_ip, None)
-            if refresh is None:
-                extra_ip_ofmsgs.extend(self._extra_ip_gratuitous(vlan, extra_ip))
-            if refresh is None or refresh[0] <= now:
-                refresh = (now + self.neighbor_timeout, set())
-                vlan.dyn_extra_ip_refresh[extra_ip] = refresh
-            extra_ip_ofmsgs.extend(
-                self._extra_ip_gw_requests(vlan, extra_ip, refresh[1])
-            )
+            state = vlan.dyn_extra_ip_state.get(extra_ip, None)
+            if state is None:
+                # The VLAN has not been added to the switch.
+                continue
+            extra_ip_ofmsgs = self._extra_ip_probe_due(vlan, extra_ip, state, now, live)
+            if state.state == ExtraIPState.CLAIMED:
+                extra_ip_ofmsgs.extend(self._extra_ip_announce(vlan, extra_ip, now))
             if extra_ip_ofmsgs:
-                announced += 1
+                sent += 1
                 ofmsgs.extend(extra_ip_ofmsgs)
         return ofmsgs
 
@@ -2213,13 +2418,35 @@ class ValveIPv4RouteManager(ValveRouteManager):
         self.extra_ip_log_times[key] = now
         return True
 
+    def _extra_ip_conflict(self, now, vlan, extra_ip):
+        """Hold back from one of a VLAN's faucet_extra_ips that another host
+        uses, unless FAUCET has claimed it.
+
+        FAUCET probes for a held address again once it has heard nothing from
+        the other host for the back-off. That starts at EXTRA_IP_HOLD_MIN, and
+        doubles, up to EXTRA_IP_HOLD_MAX, each time the other host answers a
+        round of probes.
+        """
+        state = vlan.dyn_extra_ip_state.get(extra_ip, None)
+        if state is None or state.state == ExtraIPState.CLAIMED:
+            return
+        if state.state == ExtraIPState.PROBING:
+            state.backoff = self.EXTRA_IP_HOLD_MIN
+            self._extra_ip_set_state(vlan, extra_ip, state, ExtraIPState.HELD, now)
+        elif state.probes:
+            state.backoff = min(2 * state.backoff, self.EXTRA_IP_HOLD_MAX)
+        state.probes = 0
+        state.next_time = now + state.backoff
+
     def _extra_ip_arp(self, now, pkt_meta, arp_pkt):
         """Count ARP from another host using one of the VLAN's faucet_extra_ips.
 
         Such ARP has the address as its sender, and is counted and logged
-        with the host's MAC and port, though FAUCET does not give the address
-        up. A probe for the address is logged too. ARP from faucet_mac is
-        another datapath's, announcing the same address, and is ignored.
+        with the host's MAC and port. FAUCET holds back from the address if
+        it has not claimed it yet, as it does if another host probes for it,
+        which is logged too, but never gives up one it has claimed (see
+        _extra_ip_conflict()). ARP from faucet_mac is another datapath's,
+        announcing the same address, and is ignored.
 
         Faucet handles only ARP to faucet_mac or a multicast address (see
         Valve._control_plane_handler()), so the other host's ARP to other
@@ -2240,6 +2467,7 @@ class ValveIPv4RouteManager(ValveRouteManager):
                     "%s on %s sent ARP from %s, which VLAN %u lists in faucet_extra_ips"
                     % (pkt_meta.eth_src, pkt_meta.port, extra_ip, vlan.vid)
                 )
+            self._extra_ip_conflict(now, vlan, extra_ip)
         elif (
             arp_pkt.opcode == arp.ARP_REQUEST
             and pkt_meta.l3_src == self.ARP_PROBE_SPA.network_address
@@ -2251,6 +2479,7 @@ class ValveIPv4RouteManager(ValveRouteManager):
                     "%s on %s probed for %s, which VLAN %u lists in faucet_extra_ips"
                     % (pkt_meta.eth_src, pkt_meta.port, extra_ip, vlan.vid)
                 )
+            self._extra_ip_conflict(now, vlan, extra_ip)
 
     def _control_plane_arp_handler(self, now, pkt_meta):
         """Handle ARP packets destined for the router"""
