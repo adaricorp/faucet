@@ -196,6 +196,7 @@ class Valve:
         """Initialize datapath state at connection/re/config time."""
         if new_dp:
             self._del_extra_ip_metrics(new_dp)
+            self._keep_extra_ip_states(new_dp)
             dps = None
             if valves:
                 dps = [valve.dp for valve in valves]
@@ -1519,6 +1520,7 @@ class Valve:
         Returns:
             dict: OpenFlow messages, if any by Valve.
         """
+        self.dp.dyn_last_packet_in_time = now
         if pkt_meta.vlan is None:
             return self._non_vlan_rcv_packet(now, other_valves, pkt_meta)
         return self._vlan_rcv_packet(now, other_valves, pkt_meta)
@@ -1765,6 +1767,19 @@ class Valve:
             if removed:
                 for route_manager in self._route_manager_by_ipv.values():
                     route_manager.del_extra_ip_metrics(vlan, removed)
+
+    def _keep_extra_ip_states(self, new_dp):
+        """Keep whether the switch answers for each of the faucet_extra_ips
+        that a new config still lists on their VLAN, however it is applied.
+
+        Args:
+            new_dp (DP): new dataplane configuration.
+        """
+        for vid, vlan in self.dp.vlans.items():
+            new_vlan = new_dp.vlans.get(vid, None)
+            if new_vlan is not None:
+                for route_manager in self._route_manager_by_ipv.values():
+                    route_manager.keep_extra_ip_states(vlan, new_vlan)
 
     def _changed_port_expire_vids(self, new_dp, changed_ports, expire_vids):
         """Return the VLAN IDs to expire next hops on, for changed ports.
@@ -2145,18 +2160,23 @@ class Valve:
         return route_manager.del_route(vlan, ip_dst)
 
     def resolve_gateways(self, now, _other_valves):
-        """Call route managers to re/resolve gateways, and to announce
-        faucet_extra_ips.
+        """Call route managers to re/resolve gateways, and to probe for and
+        announce faucet_extra_ips.
 
         Returns:
             dict: OpenFlow messages, if any by Valve.
         """
         ofmsgs = []
         if self.dp.dyn_running:
+            # Probes for faucet_extra_ips wait for the switch to send packet
+            # ins after a cold start, as until then answers could be lost.
+            # Any packet in will do: the probes follow the cold start's flows
+            # to the switch, so only packet ins need to reach FAUCET again.
+            live = self.dp.packet_in_since_cold_start()
             for route_manager in self._route_manager_by_ipv.values():
                 for vlan in self.dp.vlans.values():
                     ofmsgs.extend(route_manager.resolve_gateways(vlan, now))
-                    ofmsgs.extend(route_manager.extra_ips_due(vlan, now))
+                    ofmsgs.extend(route_manager.extra_ips_due(vlan, now, live))
         if ofmsgs:
             return {self: ofmsgs}
         return {}

@@ -264,6 +264,7 @@ class DP(Conf):
         self.drop_broadcast_source_address = None
         self.drop_spoofed_faucet_mac = None
         self.dyn_last_coldstart_time = None
+        self.dyn_last_packet_in_time = None
         self.dyn_running = False
         self.dyn_up_port_nos = None
         self.egress_pipeline = None
@@ -343,6 +344,7 @@ class DP(Conf):
         self.dyn_running = prev_dp.dyn_running
         self.dyn_up_port_nos = set(prev_dp.dyn_up_port_nos)
         self.dyn_last_coldstart_time = prev_dp.dyn_last_coldstart_time
+        self.dyn_last_packet_in_time = prev_dp.dyn_last_packet_in_time
         for number in self.ports:
             self.ports[number].clone_dyn_state(prev_dp.ports.get(number))
         if self.stack:
@@ -354,6 +356,15 @@ class DP(Conf):
         self.dyn_running = True
         for vlan in self.vlans.values():
             vlan.reset_caches()
+
+    def packet_in_since_cold_start(self):
+        """Return True if the switch has sent a packet in since its last cold
+        start, so that packets from it reach FAUCET again."""
+        return (
+            self.dyn_last_packet_in_time is not None
+            and self.dyn_last_coldstart_time is not None
+            and self.dyn_last_packet_in_time >= self.dyn_last_coldstart_time
+        )
 
     def check_config(self):
         """Check configuration of this dp"""

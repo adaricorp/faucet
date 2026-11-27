@@ -130,7 +130,18 @@ class FaucetMetrics(PromClient):
         )
         self.vlan_extra_ip_state = self._gauge(
             "vlan_extra_ip_state",
-            "state of one of a VLAN's faucet_extra_ips (1 claimed)",
+            "state of one of a VLAN's faucet_extra_ips (0 probing, 1 claimed, 2 held)",
+            self.REQUIRED_LABELS + ["vlan", "ip"],
+        )
+        self.vlan_extra_ip_state_changes = self._counter(
+            "vlan_extra_ip_state_changes",
+            "number of changes in the state of one of a VLAN's faucet_extra_ips",
+            self.REQUIRED_LABELS + ["vlan", "ip"],
+        )
+        self.vlan_extra_ip_state_change_time = self._gauge(
+            "vlan_extra_ip_state_change_time",
+            "time the state of one of a VLAN's faucet_extra_ips last changed, "
+            "or it was listed",
             self.REQUIRED_LABELS + ["vlan", "ip"],
         )
         self.faucet_config_table_names = self._gauge(
