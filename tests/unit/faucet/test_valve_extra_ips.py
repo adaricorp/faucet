@@ -2,6 +2,8 @@
 
 """Unit tests run as PYTHONPATH=../../.. python3 ./test_valve_extra_ips.py."""
 
+# pylint: disable=too-many-lines
+
 # Copyright (C) 2015 Research and Innovation Advanced Network New Zealand Ltd.
 # Copyright (C) 2015--2019 The Contributors
 #
@@ -17,6 +19,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from collections import namedtuple
 from ipaddress import ip_address, ip_network
 import unittest
 from unittest import mock
@@ -80,7 +83,8 @@ class ValveExtraIPsTestBase(ValveARPResponderTestBase):
 
     def address_flows(self, address):
         """Return the flows on the switch that match an address exactly, as
-        the ARP target or the IPv4 destination, with their table's name."""
+        the ARP target or sender or the IPv4 destination, with their table's
+        name."""
         dp = self.valves_manager.valves[self.DP_ID].dp
         names = {table.table_id: name for name, table in dp.tables.items()}
         return [
@@ -90,7 +94,7 @@ class ValveExtraIPsTestBase(ValveARPResponderTestBase):
             if any(
                 flow.match_values.get(key) == flow.match_to_bits(key, address)
                 and flow.match_masks[key] == flow.match_to_bits(key, -1)
-                for key in ("arp_tpa", "ipv4_dst")
+                for key in ("arp_tpa", "arp_spa", "ipv4_dst")
             )
         ]
 
@@ -242,9 +246,13 @@ class ValveExtraIPsAnswerTestCase(ValveExtraIPsTestBase):
         """Test each address has a flow for its VLAN and for each running port
         the VLAN is untagged on, for requests and for probes, above the VIP's
         controller flows, and a FIB flow to the VIP table, where its traffic
-        is dropped."""
+        is dropped, and that ARP from it goes to the controller, and is
+        forwarded unless it is a reply to faucet_mac, above them all."""
         route_priority = self.route_manager().route_priority
         dp = self.valves_manager.valves[self.DP_ID].dp
+        l2_table_id = self.valves_manager.valves[
+            self.DP_ID
+        ].pipeline.output_table.table_id
         for extra_ip in self.EXTRA_IPS:
             with self.subTest(extra_ip=extra_ip):
                 flows = self.address_flows(extra_ip)
@@ -290,6 +298,9 @@ class ValveExtraIPsAnswerTestCase(ValveExtraIPsTestBase):
                     [
                         ("ipv4_fib", route_priority + 32, [dp.tables["vip"].table_id]),
                         ("vip", route_priority + 32, []),
+                        ("vip", route_priority + 35, [None, l2_table_id]),
+                        ("vip", route_priority + 35, [None, l2_table_id]),
+                        ("vip", route_priority + 36, [None]),
                     ],
                     others,
                 )
@@ -305,17 +316,18 @@ class ValveExtraIPsAnswerTestCase(ValveExtraIPsTestBase):
 
     def test_serialize(self):
         """Test the switch is sent flows OpenFlow 1.3 can encode."""
+        hosts = [(extra_ip, "255.255.255.255") for extra_ip in self.EXTRA_IPS]
         ofmsgs = [
             ofmsg
             for ofmsg in self.cold_start()
             if valve_of.is_flowaddmod(ofmsg)
             and (
                 dict(ofmsg.match.items()).get("arp_tpa") in self.EXTRA_IPS
-                or dict(ofmsg.match.items()).get("ipv4_dst")
-                in [(extra_ip, "255.255.255.255") for extra_ip in self.EXTRA_IPS]
+                or dict(ofmsg.match.items()).get("arp_spa") in hosts
+                or dict(ofmsg.match.items()).get("ipv4_dst") in hosts
             )
         ]
-        self.assertEqual(2 * 8, len(ofmsgs))
+        self.assertEqual(2 * 11, len(ofmsgs))
         for ofmsg in ofmsgs:
             valve_of.verify_flowmod(ofmsg)
 
@@ -354,7 +366,7 @@ class ValveExtraIPsAnswerTestCase(ValveExtraIPsTestBase):
             for extra_ip in self.EXTRA_IPS
             for _, flow in self.address_flows(extra_ip)
         }
-        self.assertEqual(16, len(extra_flows))
+        self.assertEqual(22, len(extra_flows))
         others = [flow for flow in self.flows() if flow[1] not in extra_flows]
         pipeline = self.valves_manager.valves[self.DP_ID].dp.pipeline_str()
         self.restart(self.extra_ips_config([]))
@@ -675,6 +687,219 @@ class ValveExtraIPsAnnounceTestCase(ValveExtraIPsTestBase):
         )
 
 
+class ValveExtraIPsForeignTestCase(ValveExtraIPsTestBase):
+    """Test ARP from other hosts using faucet_extra_ips is counted, and
+    forwarded as it was before."""
+
+    NO_MAC = "00:00:00:00:00:00"
+
+    def arp_in(self, port, opcode, src_ip, dst_ip, **kwargs):
+        """Have FAUCET handle ARP the switch sends it from a port on office,
+        tagged as the switch sends it: to eth_dst or broadcast, from eth_src
+        or HOST_MAC, with src_mac or eth_src as the sender MAC."""
+        eth_src = kwargs.get("eth_src", self.HOST_MAC)
+        eth_dst = kwargs.get("eth_dst", self.BROADCAST_MAC)
+        pkt = valve_packet.build_pkt_header(
+            0x100, eth_src, eth_dst, valve_of.ether.ETH_TYPE_ARP
+        )
+        pkt.add_protocol(
+            arp.arp(
+                opcode=opcode,
+                src_mac=kwargs.get("src_mac", eth_src),
+                src_ip=src_ip,
+                dst_mac=self.NO_MAC if opcode == arp.ARP_REQUEST else eth_dst,
+                dst_ip=dst_ip,
+            )
+        )
+        pkt.serialize()
+        valve = self.valves_manager.valves[self.DP_ID]
+        msg = namedtuple(
+            "null_msg", ("match", "in_port", "data", "total_len", "cookie", "reason")
+        )(
+            {"in_port": port},
+            port,
+            pkt.data,
+            len(pkt.data),
+            valve.dp.cookie,
+            valve_of.ofp.OFPR_ACTION,
+        )
+        self.valves_manager.valve_packet_in(self.mock_time(0), valve, msg)
+        ofmsgs = self.last_flows_to_dp[self.DP_ID]
+        self.last_flows_to_dp[self.DP_ID] = []
+        self.apply_ofmsgs(ofmsgs)
+
+    def extra_ip_metrics(self, extra_ip="10.0.0.10", vid=0x100):
+        """Return an address's vlan_extra_ip_state and the count of ARP from
+        other hosts using it, each None if not reported."""
+        labels = dict(
+            self.valves_manager.valves[self.DP_ID].dp.base_prom_labels(),
+            vlan=str(vid),
+            ip=extra_ip,
+        )
+        return tuple(
+            self.registry.get_sample_value(var, labels)
+            for var in ("vlan_extra_ip_state", "vlan_extra_ip_foreign_arp_total")
+        )
+
+    def arp_out(self, port, opcode, src_ip, dst_ip, eth_dst=None):
+        """Return the ports the switch sends ARP from HOST_MAC on a port to."""
+        eth_dst = eth_dst or self.BROADCAST_MAC
+        return sorted(
+            self.outputs(
+                dict(
+                    self.arp_request(port, 0, src_ip, dst_ip, opcode=opcode),
+                    eth_dst=eth_dst,
+                    arp_tha=self.NO_MAC if opcode == arp.ARP_REQUEST else eth_dst,
+                )
+            )
+        )
+
+    def test_forwarded(self):
+        """Test ARP from an address goes to the controller and on as before,
+        unanswered even when it is a gratuitous request or a request for the
+        VIP, but for ARP to faucet_mac, which goes to the controller alone."""
+        self.learn("10.0.0.2", port=2)
+        flooded = [1, 2, 3, CONTROLLER_PORT]
+        for opcode, dst_ip, eth_dst, outputs in (
+            (arp.ARP_REQUEST, "10.0.0.10", None, flooded),
+            (arp.ARP_REPLY, "10.0.0.10", None, flooded),
+            (arp.ARP_REQUEST, "10.0.0.2", None, flooded),
+            (arp.ARP_REQUEST, "10.0.0.254", None, flooded),
+            (arp.ARP_REQUEST, "10.0.0.2", self.OTHER_MAC, [2, CONTROLLER_PORT]),
+            (arp.ARP_REPLY, "10.0.0.2", self.OTHER_MAC, [2, CONTROLLER_PORT]),
+            (arp.ARP_REQUEST, "10.0.0.254", FAUCET_MAC, [CONTROLLER_PORT]),
+            (arp.ARP_REPLY, "10.0.0.254", FAUCET_MAC, [CONTROLLER_PORT]),
+        ):
+            with self.subTest(opcode=opcode, dst_ip=dst_ip, eth_dst=eth_dst):
+                self.assertEqual(
+                    outputs, self.arp_out(1, opcode, "10.0.0.10", dst_ip, eth_dst)
+                )
+
+    def test_counted(self):
+        """Test the ARP faucet handles from another host using an address is
+        counted, on a tagged port or not, and logged with the host's MAC and port once
+        per neighbor timeout; but not its ARP to other hosts, which faucet
+        does not handle."""
+        timeout = self.valves_manager.valves[self.DP_ID].dp.arp_neighbor_timeout
+        with mock.patch.object(self.route_manager().logger, "warning") as warning:
+            for count, (port, opcode, dst_ip, eth_dst) in enumerate(
+                (
+                    (1, arp.ARP_REQUEST, "10.0.0.10", self.BROADCAST_MAC),
+                    (1, arp.ARP_REPLY, "10.0.0.10", self.BROADCAST_MAC),
+                    (3, arp.ARP_REQUEST, "10.0.0.254", self.BROADCAST_MAC),
+                    (1, arp.ARP_REPLY, "10.0.0.254", FAUCET_MAC),
+                ),
+                start=1,
+            ):
+                self.arp_in(port, opcode, "10.0.0.10", dst_ip, eth_dst=eth_dst)
+                self.assertEqual((1, count), self.extra_ip_metrics())
+            self.arp_in(
+                1, arp.ARP_REPLY, "10.0.0.10", "10.0.0.2", eth_dst=self.OTHER_MAC
+            )
+            self.assertEqual((1, 4), self.extra_ip_metrics())
+            self.assertEqual((1, 0), self.extra_ip_metrics("10.0.0.11"))
+            message = (
+                "%s on Port 1 sent ARP from 10.0.0.10, "
+                "which VLAN 256 lists in faucet_extra_ips"
+            )
+            self.assertEqual(
+                [mock.call(message % self.HOST_MAC)], warning.call_args_list
+            )
+            self.mock_time(timeout - 1)
+            self.arp_in(1, arp.ARP_REQUEST, "10.0.0.10", "10.0.0.10")
+            self.assertEqual(1, warning.call_count)
+            self.mock_time(1)
+            self.arp_in(1, arp.ARP_REQUEST, "10.0.0.10", "10.0.0.10")
+            self.assertEqual(2, warning.call_count)
+        self.assertEqual((1, 6), self.extra_ip_metrics())
+
+    def test_own_mac_ignored(self):
+        """Test ARP from faucet_mac using an address, as another datapath's
+        announcements carry, is not counted, whether it is the Ethernet source
+        or the sender MAC."""
+        for eth_src, src_mac in (
+            (FAUCET_MAC, FAUCET_MAC),
+            (self.HOST_MAC, FAUCET_MAC),
+            (FAUCET_MAC, self.HOST_MAC),
+        ):
+            with self.subTest(eth_src=eth_src, src_mac=src_mac):
+                self.arp_in(
+                    1,
+                    arp.ARP_REQUEST,
+                    "10.0.0.10",
+                    "10.0.0.10",
+                    eth_src=eth_src,
+                    src_mac=src_mac,
+                )
+                self.assertEqual((1, 0), self.extra_ip_metrics())
+        self.arp_in(1, arp.ARP_REQUEST, "10.0.0.10", "10.0.0.10")
+        self.assertEqual((1, 1), self.extra_ip_metrics())
+
+    def test_probe_logged(self):
+        """Test another host's probe for an address is logged once per
+        neighbor timeout, though ARP from the address was logged, and not
+        counted, and that no other probe is, nor a reply from a probe's sender
+        address."""
+        timeout = self.valves_manager.valves[self.DP_ID].dp.arp_neighbor_timeout
+        self.arp_in(1, arp.ARP_REQUEST, "10.0.0.10", "10.0.0.10")
+        with mock.patch.object(self.route_manager().logger, "info") as info:
+            for _ in range(2):
+                for eth_src, opcode, dst_ip in (
+                    (self.HOST_MAC, arp.ARP_REQUEST, "10.0.0.10"),
+                    (self.HOST_MAC, arp.ARP_REQUEST, "10.0.0.10"),
+                    (FAUCET_MAC, arp.ARP_REQUEST, "10.0.0.11"),
+                    (self.HOST_MAC, arp.ARP_REPLY, "10.0.0.11"),
+                    (self.HOST_MAC, arp.ARP_REQUEST, "10.0.0.12"),
+                ):
+                    self.arp_in(1, opcode, "0.0.0.0", dst_ip, eth_src=eth_src)
+                self.mock_time(timeout)
+        message = (
+            "%s on Port 1 probed for 10.0.0.10, "
+            "which VLAN 256 lists in faucet_extra_ips"
+        )
+        self.assertEqual(
+            [mock.call(message % self.HOST_MAC)] * 2,
+            [call for call in info.call_args_list if "probed" in call.args[0]],
+        )
+        self.assertEqual((1, 1), self.extra_ip_metrics())
+
+    def test_metrics(self):
+        """Test each address is reported claimed, with no ARP from other hosts
+        counted, once the switch connects; that its count is kept as the
+        addresses or the VLAN change or the switch reconnects; and that its
+        metrics go with the address, or with its VLAN."""
+        guest = {"faucet_extra_ips": ["10.2.0.10"]}
+        self.restart(self.config(vlans={"guest": guest}))
+        for extra_ip, vid in (
+            ("10.0.0.10", 0x100),
+            ("10.0.0.11", 0x100),
+            ("10.2.0.10", 0x200),
+        ):
+            self.assertEqual((1, 0), self.extra_ip_metrics(extra_ip, vid))
+        self.arp_in(1, arp.ARP_REQUEST, "10.0.0.10", "10.0.0.10")
+        office = {"faucet_extra_ips": ["10.0.0.10", "10.0.0.12"]}
+        for vlans in (
+            {"office": office, "guest": guest},
+            {"office": dict(office, max_hosts=2), "guest": guest},
+        ):
+            with self.subTest(vlans=vlans):
+                self.warm_start(self.config(vlans=vlans))
+                self.assertEqual((1, 1), self.extra_ip_metrics())
+                self.assertEqual((None, None), self.extra_ip_metrics("10.0.0.11"))
+                self.assertEqual((1, 0), self.extra_ip_metrics("10.0.0.12"))
+        self.disconnect_dp()
+        self.connect_dp()
+        self.assertEqual((1, 1), self.extra_ip_metrics())
+        self.warm_start(
+            self.config(
+                vlans={"office": office, "guest": None},
+                interfaces={3: {"tagged_vlans": ["office"]}, 4: {"native_vlan": "lab"}},
+            )
+        )
+        self.assertEqual((None, None), self.extra_ip_metrics("10.2.0.10", 0x200))
+        self.assertEqual((1, 1), self.extra_ip_metrics())
+
+
 class ValveExtraIPsWarmTestBase(ValveExtraIPsTestBase):
     """Warm start changes of faucet_extra_ips."""
 
@@ -699,7 +924,10 @@ class ValveExtraIPsWarmTestBase(ValveExtraIPsTestBase):
                 if not valve_of.is_flowmod(ofmsg):
                     continue
                 match = dict(ofmsg.match.items())
-                address = match.get("arp_tpa", match.get("ipv4_dst", (None,))[0])
+                address = match.get(
+                    "arp_tpa",
+                    match.get("ipv4_dst", match.get("arp_spa", (None,)))[0],
+                )
                 self.assertIn(address, addresses, msg=str(ofmsg))
         return ofmsgs
 

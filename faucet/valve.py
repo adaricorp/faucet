@@ -199,6 +199,7 @@ class Valve:
     def dp_init(self, new_dp=None, valves=None):
         """Initialize datapath state at connection/re/config time."""
         if new_dp:
+            self._del_extra_ip_metrics(new_dp)
             dps = None
             if valves:
                 dps = [valve.dp for valve in valves]
@@ -310,6 +311,10 @@ class Valve:
                 self.dp.routers,
                 self.stack_manager,
                 arp_responder=self.dp.arp_responder,
+                inc_var=self._inc_var,
+                set_var=self._set_var,
+                remove_var=self._remove_var,
+                prom_labels=self.dp.base_prom_labels(),
             )
             self._route_manager_by_ipv[route_manager.IPV] = route_manager
             for vlan in self.dp.vlans.values():
@@ -1752,6 +1757,23 @@ class Valve:
                 )
                 extra_ip_changes[vid] = (removed, added)
         return extra_ip_changes
+
+    def _del_extra_ip_metrics(self, new_dp):
+        """Remove the metrics of the faucet_extra_ips that a new config no
+        longer lists on their VLAN, however it is applied. Those still listed
+        keep theirs, through a change to the VLAN as well.
+
+        Args:
+            new_dp (DP): new dataplane configuration.
+        """
+        for vid, vlan in self.dp.vlans.items():
+            removed = vlan.faucet_extra_ips
+            new_vlan = new_dp.vlans.get(vid, None)
+            if new_vlan is not None:
+                removed = removed - new_vlan.faucet_extra_ips
+            if removed:
+                for route_manager in self._route_manager_by_ipv.values():
+                    route_manager.del_extra_ip_metrics(vlan, removed)
 
     def _changed_port_expire_vids(self, new_dp, changed_ports, expire_vids):
         """Return the VLAN IDs to expire next hops on, for changed ports.
