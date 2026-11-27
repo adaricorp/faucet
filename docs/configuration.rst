@@ -813,10 +813,14 @@ or a name. The following attributes can be configured:
         needs arp_responder. Faucet announces each with gratuitous ARP when
         a cold start or a config change adds it, and sends an ARP request
         from it to each route gateway in its subnet once per
-        arp_neighbor_timeout. Faucet routes nothing to them itself: IPv4
-        traffic to one that no ACL has changed is dropped. Not a VIP of any
-        VLAN, a network or broadcast address, a route's ip_gw or the
-        destination of a /32 route, nor listed on two VLANs.
+        arp_neighbor_timeout. ARP whose sender is one of them goes to Faucet
+        too, which counts what another host using one broadcasts or sends to
+        faucet_mac in vlan_extra_ip_foreign_arp, and logs the host's MAC and
+        port; vlan_extra_ip_state reports each as 1, claimed. Faucet routes
+        nothing to them itself: IPv4 traffic to one that no ACL has changed
+        is dropped. Not a VIP of any VLAN, a network or broadcast address, a
+        route's ip_gw or the destination of a /32 route, nor listed on two
+        VLANs.
     * - max_hosts
       - integer
       - 255

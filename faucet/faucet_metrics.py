@@ -123,6 +123,16 @@ class FaucetMetrics(PromClient):
             "number of times learning was banned on a VLAN",
             self.REQUIRED_LABELS + ["vlan"],
         )
+        self.vlan_extra_ip_foreign_arp = self._counter(
+            "vlan_extra_ip_foreign_arp",
+            "number of ARP packets from other hosts using a VLAN's faucet_extra_ips",
+            self.REQUIRED_LABELS + ["vlan", "ip"],
+        )
+        self.vlan_extra_ip_state = self._gauge(
+            "vlan_extra_ip_state",
+            "state of one of a VLAN's faucet_extra_ips (1 claimed)",
+            self.REQUIRED_LABELS + ["vlan", "ip"],
+        )
         self.faucet_config_table_names = self._gauge(
             "faucet_config_table_names",
             "number to names map of FAUCET pipeline tables",

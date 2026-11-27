@@ -116,6 +116,11 @@ class ValveRouteManager(ValveManagerBase):
         "routers",
         "vip_table",
         "switch_manager",
+        "inc_var",
+        "set_var",
+        "remove_var",
+        "prom_labels",
+        "extra_ip_log_times",
     ]
 
     IPV = 0
@@ -144,8 +149,17 @@ class ValveRouteManager(ValveManagerBase):
         routers,
         stack_manager,
         arp_responder=False,
+        inc_var=None,
+        set_var=None,
+        remove_var=None,
+        prom_labels=None,
     ):
         self.notify = notify
+        self.inc_var = inc_var
+        self.set_var = set_var
+        self.remove_var = remove_var
+        self.prom_labels = prom_labels
+        self.extra_ip_log_times = {}
         self.logger = logger
         self.global_vlan = AnonVLAN(global_vlan)
         self.neighbor_timeout = neighbor_timeout
@@ -527,6 +541,9 @@ class ValveRouteManager(ValveManagerBase):
     def extra_ips_due(self, _vlan, _now):
         """Return the ARP due for a VLAN's faucet_extra_ips: none but IPv4's."""
         return []
+
+    def del_extra_ip_metrics(self, _vlan, _extra_ips):
+        """Remove the metrics of some of a VLAN's faucet_extra_ips: IPv4's."""
 
     def add_vlan(self, vlan, cold_start):
         """Add a VLAN."""
@@ -1501,6 +1518,8 @@ class ValveIPv4RouteManager(ValveRouteManager):
     ARP_PROBE_SPA = ipaddress.ip_network("0.0.0.0/32")
     # The most of a VLAN's faucet_extra_ips announced at a time.
     EXTRA_IP_ANNOUNCE_PER_CYCLE = 16
+    # vlan_extra_ip_state of an address the switch answers for.
+    EXTRA_IP_CLAIMED = 1
 
     def advertise(self, _vlan):
         return []
@@ -1614,7 +1633,8 @@ class ValveIPv4RouteManager(ValveRouteManager):
         IPv4 traffic to the address is sent to the VIP table, as it is for a
         VIP, and dropped there. The drop matches no VLAN, as traffic routed
         from another VLAN reaches the VIP table too, through the FIB flow for
-        the address's subnet.
+        the address's subnet. ARP from the address goes to the controller
+        (see _extra_ip_sender_matches()).
         """
         faucet_vip = vlan.vip_map(extra_ip)
         target_host = self._host_ip_to_host_int(extra_ip)
@@ -1640,7 +1660,58 @@ class ValveIPv4RouteManager(ValveRouteManager):
                 priority=priority,
             )
         )
+        for match, priority, forward in self._extra_ip_sender_matches(vlan, extra_ip):
+            inst = ()
+            if forward:
+                inst = self.pipeline.accept_to_l2_forwarding()
+            ofmsgs.append(
+                self.vip_table.flowcontroller(
+                    match,
+                    priority=priority,
+                    inst=inst,
+                    max_len=valve_packet.VLAN_ARP_PKT_SIZE,
+                )
+            )
         return ofmsgs
+
+    def _extra_ip_sender_matches(self, vlan, extra_ip):
+        """Return the match and priority of each flow for ARP on a VLAN whose
+        sender is one of its faucet_extra_ips, and whether it forwards it.
+
+        Such ARP is from another host using the address, or from another
+        datapath announcing it with faucet_mac, and goes to the controller,
+        which counts the first. ARP to faucet_mac goes to the controller
+        alone, as any other host's does, and the rest is forwarded too, so
+        that the switch does not take the other host's own ARP from it. The
+        flows are above those that answer requests for the address, so that
+        a gratuitous request for it is not answered.
+        """
+        priority = self.route_priority + extra_ip.max_prefixlen + 3
+        sender = ipaddress.ip_network(extra_ip)
+        return [
+            (
+                self.vip_table.match(
+                    vlan=vlan,
+                    eth_type=valve_of.ether.ETH_TYPE_ARP,
+                    eth_dst=vlan.faucet_mac,
+                    arp_spa=sender,
+                ),
+                priority + 1,
+                False,
+            ),
+        ] + [
+            (
+                self.vip_table.match(
+                    vlan=vlan,
+                    eth_type=valve_of.ether.ETH_TYPE_ARP,
+                    arp_op=arp_op,
+                    arp_spa=sender,
+                ),
+                priority,
+                True,
+            )
+            for arp_op in (arp.ARP_REQUEST, arp.ARP_REPLY)
+        ]
 
     def _extra_ip_port_deletes(self, vlan, extra_ip, port):
         """Return strict deletes of the flows that answer ARP for one of a
@@ -1688,6 +1759,10 @@ class ValveIPv4RouteManager(ValveRouteManager):
         ofmsgs = []
         for port in [None] + list(vlan.untagged):
             ofmsgs.extend(self._extra_ip_port_deletes(vlan, extra_ip, port))
+        for match, priority, _ in self._extra_ip_sender_matches(vlan, extra_ip):
+            ofmsgs.append(
+                self.vip_table.flowdel(match=match, priority=priority, strict=True)
+            )
         if not self.global_routing:
             target_host = self._host_ip_to_host_int(extra_ip)
             ofmsgs.append(
@@ -1726,7 +1801,37 @@ class ValveIPv4RouteManager(ValveRouteManager):
         for extra_ip in sorted(extra_ips):
             ofmsgs.extend(self._purge_extra_ip(vlan, extra_ip))
             ofmsgs.extend(self._extra_ip_flows(vlan, extra_ip))
+            self._add_extra_ip_metrics(vlan, extra_ip)
         return ofmsgs
+
+    def _extra_ip_labels(self, vlan, extra_ip):
+        """Return the metric labels of one of a VLAN's faucet_extra_ips."""
+        return dict(self.prom_labels, vlan=vlan.vid, ip=str(extra_ip))
+
+    def _add_extra_ip_metrics(self, vlan, extra_ip):
+        """Report one of a VLAN's faucet_extra_ips, claimed, keeping the count
+        of foreign ARP an address listed already has, and starting it at 0
+        for one listed anew rather than reporting nothing."""
+        if self.set_var is None or self.inc_var is None:
+            return
+        labels = self._extra_ip_labels(vlan, extra_ip)
+        self.set_var("vlan_extra_ip_state", self.EXTRA_IP_CLAIMED, labels)
+        self.inc_var("vlan_extra_ip_foreign_arp", labels, 0)
+
+    def del_extra_ip_metrics(self, vlan, extra_ips):
+        """Remove the metrics of some of a VLAN's faucet_extra_ips.
+
+        Args:
+            vlan (VLAN): the VLAN that listed them, in the config that added
+                their metrics.
+            extra_ips (iterable): the addresses.
+        """
+        if self.remove_var is None:
+            return
+        for extra_ip in sorted(extra_ips):
+            labels = self._extra_ip_labels(vlan, extra_ip)
+            for var in ("vlan_extra_ip_state", "vlan_extra_ip_foreign_arp"):
+                self.remove_var(var, labels)
 
     def del_extra_ips(self, vlan, extra_ips):
         """Delete the flows for some of a VLAN's faucet_extra_ips, strictly.
@@ -1966,6 +2071,55 @@ class ValveIPv4RouteManager(ValveRouteManager):
             ofmsgs.extend(self.resolve_expire_hosts(vlan, now, resolve_all=False))
         return ofmsgs
 
+    def _extra_ip_log_due(self, now, vlan, extra_ip, kind):
+        """Return True if ARP of a kind about one of a VLAN's faucet_extra_ips
+        is to be logged: once per neighbor timeout."""
+        key = (vlan.vid, extra_ip, kind)
+        last_time = self.extra_ip_log_times.get(key, None)
+        if last_time is not None and now - last_time < self.neighbor_timeout:
+            return False
+        self.extra_ip_log_times[key] = now
+        return True
+
+    def _extra_ip_arp(self, now, pkt_meta, arp_pkt):
+        """Count ARP from another host using one of the VLAN's faucet_extra_ips.
+
+        Such ARP has the address as its sender, and is counted and logged
+        with the host's MAC and port, though FAUCET does not give the address
+        up. A probe for the address is logged too. ARP from faucet_mac is
+        another datapath's, announcing the same address, and is ignored.
+
+        Faucet handles only ARP to faucet_mac or a multicast address (see
+        Valve._control_plane_handler()), so the other host's ARP to other
+        hosts is counted only in the packet counts of the switch's flows for
+        ARP from the address (see _extra_ip_sender_matches()).
+        """
+        vlan = pkt_meta.vlan
+        if vlan.faucet_mac in (pkt_meta.eth_src, arp_pkt.src_mac):
+            return
+        if vlan.is_extra_ip(pkt_meta.l3_src):
+            extra_ip = pkt_meta.l3_src
+            if self.inc_var is not None:
+                self.inc_var(
+                    "vlan_extra_ip_foreign_arp", self._extra_ip_labels(vlan, extra_ip)
+                )
+            if self._extra_ip_log_due(now, vlan, extra_ip, "foreign"):
+                self.logger.warning(
+                    "%s on %s sent ARP from %s, which VLAN %u lists in faucet_extra_ips"
+                    % (pkt_meta.eth_src, pkt_meta.port, extra_ip, vlan.vid)
+                )
+        elif (
+            arp_pkt.opcode == arp.ARP_REQUEST
+            and pkt_meta.l3_src == self.ARP_PROBE_SPA.network_address
+            and vlan.is_extra_ip(pkt_meta.l3_dst)
+        ):
+            extra_ip = pkt_meta.l3_dst
+            if self._extra_ip_log_due(now, vlan, extra_ip, "probe"):
+                self.logger.info(
+                    "%s on %s probed for %s, which VLAN %u lists in faucet_extra_ips"
+                    % (pkt_meta.eth_src, pkt_meta.port, extra_ip, vlan.vid)
+                )
+
     def _control_plane_arp_handler(self, now, pkt_meta):
         """Handle ARP packets destined for the router"""
         ofmsgs = []
@@ -1974,6 +2128,7 @@ class ValveIPv4RouteManager(ValveRouteManager):
         arp_pkt = pkt_meta.pkt.get_protocol(arp.arp)
         if arp_pkt is None:
             return ofmsgs
+        self._extra_ip_arp(now, pkt_meta, arp_pkt)
         opcode = arp_pkt.opcode
         if opcode == arp.ARP_REQUEST:
             if pkt_meta.eth_dst in (
