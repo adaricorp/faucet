@@ -123,7 +123,8 @@ string names given to the datapath, or the OFP datapath id.
         Faucet's MAC. The switch does not apply Faucet's learning limits: a
         host Faucet will not learn, for example because its port or VLAN
         has reached max_hosts, still learns the gateway's MAC from the
-        switch, though Faucet still routes no traffic back to it. Changing
+        switch, though Faucet still routes no traffic back to it. The switch
+        answers for each VLAN's faucet_extra_ips in the same way. Changing
         this option cold starts the datapath.
     * - description
       - string
@@ -804,6 +805,18 @@ or a name. The following attributes can be configured:
       - string (MAC address)
       - None
       - Set MAC for FAUCET VIPs on this VLAN
+    * - faucet_extra_ips
+      - list of strings (IPv4 addresses)
+      - None
+      - Further IPv4 addresses in this VLAN's faucet_vips subnets that the
+        switch answers ARP for with faucet_mac, as it does for the VIPs;
+        needs arp_responder. Faucet announces each with gratuitous ARP when
+        a cold start or a config change adds it, and sends an ARP request
+        from it to each route gateway in its subnet once per
+        arp_neighbor_timeout. Faucet routes nothing to them itself: IPv4
+        traffic to one that no ACL has changed is dropped. Not a VIP of any
+        VLAN, a network or broadcast address, a route's ip_gw or the
+        destination of a /32 route, nor listed on two VLANs.
     * - max_hosts
       - integer
       - 255

@@ -101,7 +101,7 @@ VIP Table
 - Operations:
     - Send traffic destined for FAUCET VIPs including IPv4 ARP and IPv6 ND to the controller, and traffic for unresolved hosts in connected IP subnets (if proactively learning).
     - IPv4 ARP/IPv6 ND traffic may be flooded also (sent to FLOOD)
-    - With ``arp_responder``, also match ``arp_op, arp_spa, in_port, vlan_vid``, and answer ARP requests for IPv4 FAUCET VIPs back out the port they came in on, as well as sending them to the controller
+    - With ``arp_responder``, also match ``arp_op, arp_spa, in_port, ipv4_dst, vlan_vid``, and answer ARP requests for IPv4 FAUCET VIPs back out the port they came in on, as well as sending them to the controller. Answer ARP requests and probes for a VLAN's ``faucet_extra_ips`` the same way, sending only the probes to the controller, and drop IPv4 traffic to them
 
 ETH_DST_HAIRPIN Table
 ~~~~~~~~~~~~~~~~~~~~~

@@ -1709,7 +1709,8 @@ class Valve:
             vid
             for vid in changed_vids - lacp_vids
             if self.dp.vlans[vid].ignore_subconf(
-                new_dp.vlans[vid], ignore_keys=["acls_in", "description"]
+                new_dp.vlans[vid],
+                ignore_keys=["acls_in", "description", "faucet_extra_ips"],
             )
             and old_peers.get(vid, set()) == new_peers.get(vid, set())
         }
@@ -1720,6 +1721,37 @@ class Valve:
             if not kept_vids & expire_vids:
                 return (kept_vids, expire_vids)
             kept_vids -= expire_vids
+
+    def _extra_ip_changes(self, new_dp):
+        """Return the faucet_extra_ips each VLAN in both configs loses and gains.
+
+        They are applied address by address, on a VLAN whose config is
+        otherwise unchanged too, so that one is added or removed without
+        changing the VLAN's other flows.
+
+        Args:
+            new_dp (DP): new dataplane configuration.
+        Returns:
+            dict: by VLAN ID, the addresses removed and the addresses added.
+        """
+        extra_ip_changes = {}
+        for vid, vlan in self.dp.vlans.items():
+            new_vlan = new_dp.vlans.get(vid, None)
+            if new_vlan is None:
+                continue
+            removed = vlan.faucet_extra_ips - new_vlan.faucet_extra_ips
+            added = new_vlan.faucet_extra_ips - vlan.faucet_extra_ips
+            if removed or added:
+                self.logger.info(
+                    "VLAN %s faucet_extra_ips added %s, removed %s"
+                    % (
+                        vid,
+                        ", ".join(str(ipa) for ipa in sorted(added)) or "none",
+                        ", ".join(str(ipa) for ipa in sorted(removed)) or "none",
+                    )
+                )
+                extra_ip_changes[vid] = (removed, added)
+        return extra_ip_changes
 
     def _changed_port_expire_vids(self, new_dp, changed_ports, expire_vids):
         """Return the VLAN IDs to expire next hops on, for changed ports.
@@ -1909,6 +1941,11 @@ class Valve:
         if routers_change is not None:
             restart_type = "warm"
 
+        # So is a change to the faucet_extra_ips of a VLAN.
+        extra_ip_changes = self._extra_ip_changes(new_dp)
+        if extra_ip_changes:
+            restart_type = "warm"
+
         # Nothing changed, nothing to check.
         if restart_type is None:
             self.dp_init(new_dp)
@@ -1956,6 +1993,11 @@ class Valve:
                     keep_routing_vids=kept_routing_vids,
                 )
             )
+        # The flows for the faucet_extra_ips a VLAN loses go as they were
+        # added, by the running config.
+        for vid, (removed, _) in sorted(extra_ip_changes.items()):
+            for route_manager in self._route_manager_by_ipv.values():
+                ofmsgs.extend(route_manager.del_extra_ips(self.dp.vlans[vid], removed))
 
         self.dp_init(new_dp, valves)
 
@@ -2002,6 +2044,12 @@ class Valve:
             for route_manager in self._route_manager_by_ipv.values():
                 ofmsgs.extend(route_manager.add_routed_vlan_routes(vlan))
         ofmsgs.extend(self._replay_gained_peers(routers_change))
+        # A changed VLAN was added back with all its faucet_extra_ips.
+        for vid, (_, added) in sorted(extra_ip_changes.items()):
+            if vid in changed_vids:
+                continue
+            for route_manager in self._route_manager_by_ipv.values():
+                ofmsgs.extend(route_manager.add_extra_ips(self.dp.vlans[vid], added))
         if self.stack_manager:
             ofmsgs.extend(self.stack_manager.add_tunnel_acls())
         return restart_type, ofmsgs
@@ -2084,7 +2132,8 @@ class Valve:
         return route_manager.del_route(vlan, ip_dst)
 
     def resolve_gateways(self, now, _other_valves):
-        """Call route managers to re/resolve gateways.
+        """Call route managers to re/resolve gateways, and to announce
+        faucet_extra_ips.
 
         Returns:
             dict: OpenFlow messages, if any by Valve.
@@ -2094,6 +2143,7 @@ class Valve:
             for route_manager in self._route_manager_by_ipv.values():
                 for vlan in self.dp.vlans.values():
                     ofmsgs.extend(route_manager.resolve_gateways(vlan, now))
+                    ofmsgs.extend(route_manager.extra_ips_due(vlan, now))
         if ofmsgs:
             return {self: ofmsgs}
         return {}
