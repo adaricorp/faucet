@@ -5479,6 +5479,134 @@ dps:
             cp.dp_parser,
         )
 
+    EXTRA_IPS_CONFIG = """
+vlans:
+    office:
+        vid: 100
+        faucet_vips: ["10.0.0.254/24", "10.1.0.254/24", "fc00::254/64"]
+        faucet_extra_ips: %s
+        routes:
+            - route:
+                ip_dst: "192.0.2.0/24"
+                ip_gw: "10.0.0.1"
+            - route:
+                ip_dst: "%s"
+                ip_gw: "10.0.0.2"
+    guest:
+        vid: 200
+        faucet_vips: ["10.2.0.254/24", "10.0.0.253/24"]
+        faucet_extra_ips: %s
+    lab:
+        vid: 300
+dps:
+    sw1:
+        dp_id: 0x1
+        arp_responder: %s
+        interfaces:
+            1:
+                native_vlan: office
+            2:
+                native_vlan: guest
+            3:
+                native_vlan: lab
+"""
+
+    def extra_ips_config(
+        self,
+        office_ips="[]",
+        guest_ips="[]",
+        route_dst="198.51.100.0/24",
+        arp_responder=True,
+    ):
+        """Return a config with faucet_extra_ips on office and guest."""
+        return self.EXTRA_IPS_CONFIG % (office_ips, route_dst, guest_ips, arp_responder)
+
+    def test_extra_ips_accepted(self):
+        """Test faucet_extra_ips accepted in any VIP subnet of their VLAN, and
+        kept as a set of addresses, empty by default."""
+        dp = self._get_dps_as_dict(
+            self.extra_ips_config(
+                office_ips='["10.0.0.11", "10.0.0.10", "10.1.0.1"]',
+                guest_ips='["10.2.0.1", "10.0.0.12"]',
+                route_dst="10.0.0.13/32",
+            )
+        )[0x1]
+        for vid, extra_ips in (
+            (100, ["10.0.0.10", "10.0.0.11", "10.1.0.1"]),
+            (200, ["10.0.0.12", "10.2.0.1"]),
+            (300, []),
+        ):
+            vlan = dp.vlans[vid]
+            self.assertIsInstance(vlan.faucet_extra_ips, frozenset)
+            self.assertEqual(
+                extra_ips, sorted(str(ipa) for ipa in vlan.faucet_extra_ips)
+            )
+            for ipa in vlan.faucet_extra_ips:
+                self.assertEqual(4, ipa.version)
+                self.assertTrue(vlan.is_extra_ip(ipa))
+                self.assertIsNone(vlan.ip_in_vip_subnet(ipa))
+        # Listed in another order, they make the same config.
+        other = self._get_dps_as_dict(
+            self.extra_ips_config(
+                office_ips='["10.1.0.1", "10.0.0.10", "10.0.0.11"]',
+                guest_ips='["10.0.0.12", "10.2.0.1"]',
+                route_dst="10.0.0.13/32",
+            )
+        )[0x1]
+        self.assertTrue(dp.vlans[100].ignore_subconf(other.vlans[100]))
+        self.assertTrue(dp.ignore_subconf(other))
+        # However their hashes fall, as an address's depends on the process:
+        # enough of them that some share a slot of the set.
+        addresses = ['"10.0.0.%u"' % host for host in range(20, 60)]
+        vlans = [
+            self._get_dps_as_dict(
+                self.extra_ips_config(office_ips="[%s]" % ", ".join(order))
+            )[0x1].vlans[100]
+            for order in (addresses, addresses[::-1])
+        ]
+        self.assertEqual(40, len(vlans[0].faucet_extra_ips))
+        self.assertTrue(vlans[0].ignore_subconf(vlans[1]))
+        # A route that starts at an address, but is not a host route to it.
+        self.check_config_success(
+            self.extra_ips_config(office_ips='["10.0.0.10"]', route_dst="10.0.0.10/31"),
+            cp.dp_parser,
+        )
+        # None at all needs no arp_responder.
+        self.check_config_success(
+            self.extra_ips_config(arp_responder=False), cp.dp_parser
+        )
+
+    def test_extra_ips_refused(self):
+        """Test each faucet_extra_ips entry FAUCET cannot treat as its own
+        address on the VLAN is refused, for its own reason."""
+        for office_ips, guest_ips, route_dst, arp_responder, error in (
+            ('["10.0.0.10"]', "[]", "198.51.100.0/24", False, "need arp_responder"),
+            ('"10.0.0.10"', "[]", "198.51.100.0/24", True, "must be <class 'list'>"),
+            ("[167772170]", "[]", "198.51.100.0/24", True, "must be a string"),
+            ('["10.0.0.10/32"]', "[]", "198.51.100.0/24", True, "Invalid IP"),
+            ('["fc00::10"]', "[]", "198.51.100.0/24", True, "not an IPv4"),
+            ('["10.2.0.1"]', "[]", "198.51.100.0/24", True, "no faucet_vips subnet"),
+            ('["10.0.0.254"]', "[]", "198.51.100.0/24", True, "is a VIP"),
+            ('["10.0.0.0"]', "[]", "198.51.100.0/24", True, "network or broadcast"),
+            ('["10.1.0.255"]', "[]", "198.51.100.0/24", True, "network or broadcast"),
+            ('["10.0.0.10", "10.0.0.10"]', "[]", "198.51.100.0/24", True, "twice"),
+            ('["10.0.0.10"]', '["10.0.0.10"]', "198.51.100.0/24", True, "on VLANs"),
+            ('["10.0.0.253"]', "[]", "198.51.100.0/24", True, "VIP of VLAN 200"),
+            ('["10.0.0.1"]', "[]", "198.51.100.0/24", True, "via faucet_extra_ips"),
+            ("[]", '["10.0.0.1"]', "198.51.100.0/24", True, "via faucet_extra_ips"),
+            ('["10.0.0.10"]', "[]", "10.0.0.10/32", True, "to a faucet_extra_ips"),
+            ("[]", '["10.0.0.10"]', "10.0.0.10/32", True, "to a faucet_extra_ips"),
+        ):
+            with self.subTest(office_ips=office_ips, guest_ips=guest_ips, error=error):
+                success, err = self.run_function_with_config(
+                    self.extra_ips_config(
+                        office_ips, guest_ips, route_dst, arp_responder
+                    ),
+                    cp.dp_parser,
+                )
+                self.assertFalse(success)
+                self.assertIn(error, str(err))
+
     def test_nd_timeout_too_big(self):
         """Test config rejected when timeout is too big."""
         config = """

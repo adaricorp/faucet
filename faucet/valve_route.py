@@ -235,6 +235,9 @@ class ValveRouteManager(ValveManagerBase):
     def _resolve_gw_on_vlan(self, vlan, faucet_vip, ip_gw):
         """Return flood packet-out actions for gw resolving"""
         ofmsgs = []
+        if vlan.is_extra_ip(ip_gw):
+            # FAUCET's own address, which it never resolves.
+            return ofmsgs
         stack_ofmsgs = self._flood_stack_links(
             self._gw_resolve_pkt(),
             vlan,
@@ -510,6 +513,20 @@ class ValveRouteManager(ValveManagerBase):
 
     def _add_faucet_vip_nd(self, vlan, priority, faucet_vip, faucet_vip_host):
         raise NotImplementedError  # pragma: no cover
+
+    def add_extra_ips(self, _vlan, _extra_ips):
+        """Return the flows for some of a VLAN's faucet_extra_ips: none but
+        IPv4's."""
+        return []
+
+    def del_extra_ips(self, _vlan, _extra_ips):
+        """Return deletes of the flows for some of a VLAN's faucet_extra_ips:
+        none but IPv4's."""
+        return []
+
+    def extra_ips_due(self, _vlan, _now):
+        """Return the ARP due for a VLAN's faucet_extra_ips: none but IPv4's."""
+        return []
 
     def add_vlan(self, vlan, cold_start):
         """Add a VLAN."""
@@ -1300,10 +1317,12 @@ class ValveRouteManager(ValveManagerBase):
         router = self._router_for_vlan(vlan)
         if router is not None:
             vlan, _ = router.vip_map(ip_gw)
-            return vlan
-        if vlan.vip_map(ip_gw):
-            return vlan
-        return None
+        elif not vlan.vip_map(ip_gw):
+            return None
+        if vlan is not None and vlan.is_extra_ip(ip_gw):
+            # FAUCET's own address is no gateway.
+            return None
+        return vlan
 
     def add_route(self, vlan, ip_gw, ip_dst):
         """Add a route to the RIB.
@@ -1326,6 +1345,14 @@ class ValveRouteManager(ValveManagerBase):
             )
             return ofmsgs
         if vlan.is_faucet_vip(ip_dst):
+            return ofmsgs
+        if ip_dst.prefixlen == ip_dst.max_prefixlen and vlan.is_extra_ip(
+            ip_dst.network_address
+        ):
+            self.logger.warning(
+                "Not adding route %s via %s, as VLAN %u lists %s in faucet_extra_ips"
+                % (ip_dst, ip_gw, vlan.vid, ip_dst.network_address)
+            )
             return ofmsgs
         routes = self._vlan_routes(vlan)
         if routes.get(ip_dst, None) == ip_gw:
@@ -1470,6 +1497,10 @@ class ValveIPv4RouteManager(ValveRouteManager):
     ICMP_SIZE = valve_packet.VLAN_ICMP_ECHO_REQ_SIZE
     CONTROL_ETH_TYPES = (valve_of.ether.ETH_TYPE_IP, valve_of.ether.ETH_TYPE_ARP)  # type: ignore
     IP_PKT = ipv4.ipv4
+    # The sender address of an ARP probe (RFC 5227).
+    ARP_PROBE_SPA = ipaddress.ip_network("0.0.0.0/32")
+    # The most of a VLAN's faucet_extra_ips announced at a time.
+    EXTRA_IP_ANNOUNCE_PER_CYCLE = 16
 
     def advertise(self, _vlan):
         return []
@@ -1497,57 +1528,313 @@ class ValveIPv4RouteManager(ValveRouteManager):
         """
         return faucet_vip.network.prefixlen < 31
 
-    def _arp_responder_match(self, vlan, faucet_vip, faucet_vip_host, port=None):
-        """Return the match and priority of a flow that answers ARP for a VIP.
+    def _arp_responder_match(
+        self, vlan, faucet_vip, target_host, port=None, probe=False
+    ):
+        """Return the match and priority of a flow that answers ARP for an
+        address: a VIP, or one of faucet_extra_ips in the VIP's subnet.
 
         Given a port the VLAN is untagged on, the flow matches that port, at a
-        priority above the VLAN's own flow, which answers tagged ports.
+        priority above the VLAN's own flow, which answers tagged ports. With
+        probe, it matches an ARP probe for the address (RFC 5227), whose
+        sender address is 0.0.0.0, rather than a request from the subnet.
         """
         in_port = None
         priority = self.route_priority + faucet_vip.ip.max_prefixlen + 1
         if port is not None:
             in_port = port.number
             priority += 1
+        arp_spa = faucet_vip.network
+        if probe:
+            arp_spa = self.ARP_PROBE_SPA
         match = self.vip_table.match(
             in_port=in_port,
             vlan=vlan,
             eth_type=valve_of.ether.ETH_TYPE_ARP,
             arp_op=arp.ARP_REQUEST,
-            nw_dst=faucet_vip_host,
-            arp_spa=faucet_vip.network,
+            nw_dst=target_host,
+            arp_spa=arp_spa,
         )
         return match, priority
 
-    def _arp_responder(self, vlan, faucet_vip, faucet_vip_host, port=None):
-        """Return a flow that answers ARP requests for a VIP on the switch.
+    def _arp_responder(self, vlan, faucet_vip, target_host, port=None, probe=False):
+        """Return a flow that answers ARP requests for an address on the switch.
 
-        The request goes to the controller unchanged first, which learns the
-        host and answers it too. The switch then rewrites it into the reply
-        and sends it back out the port it came in on, which it can do while
-        the controller is busy. Given a port the VLAN is untagged on, the
-        flow matches that port and sends the reply untagged.
+        A request for a VIP goes to the controller unchanged first, which
+        learns the host and answers it too, and so does a probe. The switch
+        then rewrites it into the reply and sends it back out the port it came
+        in on, which it can do while the controller is busy. Given a port the
+        VLAN is untagged on, the flow matches that port and sends the reply
+        untagged.
         """
-        actions = [
-            valve_of.output_controller(valve_packet.VLAN_ARP_PKT_SIZE),
-            valve_of.copy_field("eth_src", "eth_dst", 48),
-            self.vip_table.set_field(eth_src=vlan.faucet_mac),
-            self.vip_table.set_field(arp_op=arp.ARP_REPLY),
-            valve_of.copy_field("arp_sha", "arp_tha", 48),
-            self.vip_table.set_field(arp_sha=vlan.faucet_mac),
-            valve_of.copy_field("arp_spa", "arp_tpa", 32),
-            self.vip_table.set_field(arp_spa=str(faucet_vip.ip)),
-        ]
+        actions = []
+        if probe or target_host.ip == faucet_vip.ip:
+            actions.append(valve_of.output_controller(valve_packet.VLAN_ARP_PKT_SIZE))
+        actions.extend(
+            [
+                valve_of.copy_field("eth_src", "eth_dst", 48),
+                self.vip_table.set_field(eth_src=vlan.faucet_mac),
+                self.vip_table.set_field(arp_op=arp.ARP_REPLY),
+                valve_of.copy_field("arp_sha", "arp_tha", 48),
+                self.vip_table.set_field(arp_sha=vlan.faucet_mac),
+                valve_of.copy_field("arp_spa", "arp_tpa", 32),
+                self.vip_table.set_field(arp_spa=str(target_host.ip)),
+            ]
+        )
         if port is not None:
             actions.append(valve_of.pop_vlan())
         actions.append(valve_of.output_in_port())
         match, priority = self._arp_responder_match(
-            vlan, faucet_vip, faucet_vip_host, port
+            vlan, faucet_vip, target_host, port, probe
         )
         return self.vip_table.flowmod(
             match,
             priority=priority,
             inst=(valve_of.apply_actions(actions),),
         )
+
+    def _extra_ip_fib_vlan(self, vlan):
+        """Return the VLAN the FIB flow for one of a VLAN's faucet_extra_ips
+        matches."""
+        if self.global_routing:
+            return self.global_vlan
+        return vlan
+
+    def _extra_ip_flows(self, vlan, extra_ip):
+        """Return the flows for one of a VLAN's faucet_extra_ips.
+
+        The switch answers a request for the address from the VIP's subnet
+        with faucet_mac, as it does for the VIP, but sends nothing to the
+        controller: FAUCET learns no host from it, as the address is its own.
+        It also answers an ARP probe for the address, so that a device about
+        to take the address finds it in use, and copies the probe to the
+        controller. As for a VIP, there is a flow for the VLAN, which answers
+        tagged ports, and one for each running port it is untagged on.
+
+        IPv4 traffic to the address is sent to the VIP table, as it is for a
+        VIP, and dropped there. The drop matches no VLAN, as traffic routed
+        from another VLAN reaches the VIP table too, through the FIB flow for
+        the address's subnet.
+        """
+        faucet_vip = vlan.vip_map(extra_ip)
+        target_host = self._host_ip_to_host_int(extra_ip)
+        priority = self._route_priority(target_host)
+        ofmsgs = []
+        for port in [None] + [port for port in vlan.untagged if port.running()]:
+            ofmsgs.append(self._arp_responder(vlan, faucet_vip, target_host, port=port))
+            ofmsgs.append(
+                self._arp_responder(
+                    vlan, faucet_vip, target_host, port=port, probe=True
+                )
+            )
+        ofmsgs.append(
+            self.fib_table.flowmod(
+                self._route_match(self._extra_ip_fib_vlan(vlan), target_host),
+                priority=priority,
+                inst=(self.fib_table.goto(self.vip_table),),
+            )
+        )
+        ofmsgs.append(
+            self.vip_table.flowdrop(
+                self.vip_table.match(eth_type=self.ETH_TYPE, nw_dst=target_host),
+                priority=priority,
+            )
+        )
+        return ofmsgs
+
+    def _extra_ip_port_deletes(self, vlan, extra_ip, port):
+        """Return strict deletes of the flows that answer ARP for one of a
+        VLAN's faucet_extra_ips on a port it is untagged on, or with no port,
+        of the VLAN's own."""
+        faucet_vip = vlan.vip_map(extra_ip)
+        target_host = self._host_ip_to_host_int(extra_ip)
+        ofmsgs = []
+        for probe in (False, True):
+            match, priority = self._arp_responder_match(
+                vlan, faucet_vip, target_host, port=port, probe=probe
+            )
+            ofmsgs.append(
+                self.vip_table.flowdel(match=match, priority=priority, strict=True)
+            )
+        return ofmsgs
+
+    def _extra_ip_unvlanned_deletes(self, extra_ip):
+        """Return strict deletes of the flows for one of faucet_extra_ips that
+        match no VLAN of the config: the drop, and with global routing, the
+        FIB flow."""
+        target_host = self._host_ip_to_host_int(extra_ip)
+        priority = self._route_priority(target_host)
+        ofmsgs = [
+            self.vip_table.flowdel(
+                match=self.vip_table.match(eth_type=self.ETH_TYPE, nw_dst=target_host),
+                priority=priority,
+                strict=True,
+            )
+        ]
+        if self.global_routing:
+            ofmsgs.append(
+                self.fib_table.flowdel(
+                    match=self._route_match(self.global_vlan, target_host),
+                    priority=priority,
+                    strict=True,
+                )
+            )
+        return ofmsgs
+
+    def _extra_ip_deletes(self, vlan, extra_ip):
+        """Return strict deletes of every flow for one of a VLAN's
+        faucet_extra_ips, each with the match and priority it was added with,
+        so that the address goes without touching any other flow."""
+        ofmsgs = []
+        for port in [None] + list(vlan.untagged):
+            ofmsgs.extend(self._extra_ip_port_deletes(vlan, extra_ip, port))
+        if not self.global_routing:
+            target_host = self._host_ip_to_host_int(extra_ip)
+            ofmsgs.append(
+                self.fib_table.flowdel(
+                    match=self._route_match(vlan, target_host),
+                    priority=self._route_priority(target_host),
+                    strict=True,
+                )
+            )
+        ofmsgs.extend(self._extra_ip_unvlanned_deletes(extra_ip))
+        return ofmsgs
+
+    def _purge_extra_ip(self, vlan, extra_ip):
+        """Forget what FAUCET learned of an address before it was listed in
+        faucet_extra_ips: its next hop, the routes via it, its host route
+        among them, and its place among the gateways it resolves."""
+        ofmsgs = []
+        if self._vlan_nexthop_cache_entry(vlan, extra_ip) is not None:
+            self._del_vlan_nexthop_cache_entry(vlan, extra_ip)
+        for ip_dst in sorted(vlan.ip_dsts_for_ip_gw(extra_ip)):
+            ofmsgs.extend(self.del_route(vlan, ip_dst))
+        # Deleting its last route leaves the address among the route gateways.
+        vlan.forget_extra_ip_gws(extra_ip)
+        return ofmsgs
+
+    def add_extra_ips(self, vlan, extra_ips):
+        """Add the flows for some of a VLAN's faucet_extra_ips.
+
+        Args:
+            vlan (VLAN): the VLAN that lists them.
+            extra_ips (iterable): the addresses.
+        Returns:
+            list: OpenFlow messages.
+        """
+        ofmsgs = []
+        for extra_ip in sorted(extra_ips):
+            ofmsgs.extend(self._purge_extra_ip(vlan, extra_ip))
+            ofmsgs.extend(self._extra_ip_flows(vlan, extra_ip))
+        return ofmsgs
+
+    def del_extra_ips(self, vlan, extra_ips):
+        """Delete the flows for some of a VLAN's faucet_extra_ips, strictly.
+
+        Args:
+            vlan (VLAN): the VLAN that listed them, in the config that added
+                their flows.
+            extra_ips (iterable): the addresses.
+        Returns:
+            list: OpenFlow messages.
+        """
+        ofmsgs = []
+        for extra_ip in sorted(extra_ips):
+            ofmsgs.extend(self._extra_ip_deletes(vlan, extra_ip))
+            # Announced again if listed again.
+            vlan.dyn_extra_ip_refresh.pop(extra_ip, None)
+        return ofmsgs
+
+    def add_vlan(self, vlan, cold_start):
+        if cold_start:
+            # The switch has lost the flows that answered for them, so others
+            # may have stopped using faucet_mac for them: announce them again.
+            vlan.dyn_extra_ip_refresh.clear()
+        ofmsgs = super().add_vlan(vlan, cold_start)
+        ofmsgs.extend(self.add_extra_ips(vlan, vlan.faucet_extra_ips))
+        return ofmsgs
+
+    def _extra_ip_gratuitous(self, vlan, extra_ip):
+        """Return a gratuitous ARP request and reply for one of a VLAN's
+        faucet_extra_ips, flooded with faucet_mac."""
+        ofmsgs = []
+        for pkt_builder in (valve_packet.arp_request, valve_packet.arp_reply):
+            ofmsgs.extend(
+                vlan.flood_pkt(
+                    pkt_builder,
+                    self.multi_out,
+                    vlan.faucet_mac,
+                    valve_of.mac.BROADCAST_STR,
+                    extra_ip,
+                    extra_ip,
+                )
+            )
+        return ofmsgs
+
+    def _extra_ip_gw_requests(self, vlan, extra_ip, told_gws):
+        """Return an ARP request from one of a VLAN's faucet_extra_ips to each
+        route gateway in its subnet with a MAC that is not in told_gws, and
+        add those gateways to told_gws."""
+        ofmsgs = []
+        faucet_vip = vlan.vip_map(extra_ip)
+        for ip_gw in sorted(vlan.dyn_route_gws_by_ipv[self.IPV] - told_gws):
+            nexthop = self._vlan_nexthop_cache_entry(vlan, ip_gw)
+            if (
+                ip_gw not in faucet_vip.network
+                or nexthop is None
+                or nexthop.eth_src is None
+            ):
+                continue
+            ofmsgs.append(
+                vlan.pkt_out_port(
+                    valve_packet.arp_request,
+                    nexthop.port,
+                    vlan.faucet_mac,
+                    nexthop.eth_src,
+                    extra_ip,
+                    ip_gw,
+                )
+            )
+            told_gws.add(ip_gw)
+        return ofmsgs
+
+    def extra_ips_due(self, vlan, now):
+        """Return the ARP that announces a VLAN's faucet_extra_ips, as it is due.
+
+        Faucet announces each address that has not been, as when it is added
+        or the switch cold starts, with a gratuitous ARP request and reply,
+        flooded with faucet_mac. It also sends an ARP request from the address
+        to each route gateway in its subnet, once the gateway's MAC is known,
+        and again once per neighbor timeout, since a host records the sender
+        of a request to it (RFC 826) whether or not it heeds gratuitous ARP.
+        At most EXTRA_IP_ANNOUNCE_PER_CYCLE addresses of a VLAN send any of
+        these in one call, the rest in later ones.
+
+        Args:
+            vlan (VLAN): the VLAN that lists them.
+            now (float): seconds since epoch.
+        Returns:
+            list: OpenFlow messages.
+        """
+        ofmsgs = []
+        announced = 0
+        for extra_ip in sorted(vlan.faucet_extra_ips):
+            if announced == self.EXTRA_IP_ANNOUNCE_PER_CYCLE:
+                break
+            extra_ip_ofmsgs = []
+            refresh = vlan.dyn_extra_ip_refresh.get(extra_ip, None)
+            if refresh is None:
+                extra_ip_ofmsgs.extend(self._extra_ip_gratuitous(vlan, extra_ip))
+            if refresh is None or refresh[0] <= now:
+                refresh = (now + self.neighbor_timeout, set())
+                vlan.dyn_extra_ip_refresh[extra_ip] = refresh
+            extra_ip_ofmsgs.extend(
+                self._extra_ip_gw_requests(vlan, extra_ip, refresh[1])
+            )
+            if extra_ip_ofmsgs:
+                announced += 1
+                ofmsgs.extend(extra_ip_ofmsgs)
+        return ofmsgs
 
     def _add_faucet_vip_nd(self, vlan, priority, faucet_vip, faucet_vip_host):
         ofmsgs = []
@@ -1625,6 +1912,9 @@ class ValveIPv4RouteManager(ValveRouteManager):
         if self.arp_responder:
             # The ARP responder flows match the VLAN, so no other VLAN uses them.
             ofmsgs.append(self.vip_table.flowdel(match=self.vip_table.match(vlan=vlan)))
+            # Nor those of its faucet_extra_ips that match no VLAN.
+            for extra_ip in sorted(vlan.faucet_extra_ips):
+                ofmsgs.extend(self._extra_ip_unvlanned_deletes(extra_ip))
         return ofmsgs
 
     def del_port(self, port):
@@ -1650,6 +1940,8 @@ class ValveIPv4RouteManager(ValveRouteManager):
                 ofmsgs.append(
                     self.vip_table.flowdel(match=match, priority=priority, strict=True)
                 )
+        for extra_ip in sorted(vlan.faucet_extra_ips):
+            ofmsgs.extend(self._extra_ip_port_deletes(vlan, extra_ip, port))
         return ofmsgs
 
     def _add_host_fib_route_from_reply(self, now, pkt_meta):

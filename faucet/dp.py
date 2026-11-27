@@ -603,12 +603,16 @@ class DP(Conf):
 
         # Answering ARP for a VIP on the switch rewrites the request into the
         # reply, in the VLAN and for untagged ports on the port it came in on.
+        # So do faucet_extra_ips, and IPv4 traffic routed to one is dropped: keyed
+        # on the option, not on any address being listed, so that listing the
+        # first one changes no pipeline.
         if self.arp_responder and "vip" in table_configs:
             table = table_configs["vip"]
             table.match_types += (
                 ("arp_op", False),
                 ("arp_spa", True),
                 ("in_port", False),
+                ("ipv4_dst", True),
                 ("vlan_vid", False),
             )
             table.set_fields = ("arp_op", "arp_sha", "arp_spa", "eth_src")
@@ -1401,6 +1405,52 @@ class DP(Conf):
             acl.finalize()
         for router in self.routers.values():
             router.finalize()
+        self._check_extra_ips()
+
+    def _check_extra_ips(self):
+        """Check each VLAN's faucet_extra_ips against the datapath.
+
+        The switch answers for them only with arp_responder. An address is
+        FAUCET's own on one VLAN, so it is neither listed on another, nor
+        another VLAN's VIP, nor a route's gateway; nor a route's destination
+        as a host route, whose FIB flow would be the address's own.
+        """
+        vips = {
+            vip.ip: vlan.vid for vlan in self.vlans.values() for vip in vlan.faucet_vips
+        }
+        listed = {}
+        for vlan in self.vlans.values():
+            for extra_ip in vlan.faucet_extra_ips:
+                test_config_condition(
+                    not self.arp_responder,
+                    "VLAN %s faucet_extra_ips need arp_responder" % vlan.vid,
+                )
+                test_config_condition(
+                    extra_ip in listed,
+                    "faucet_extra_ips entry %s is on VLANs %s and %s"
+                    % (extra_ip, listed.get(extra_ip), vlan.vid),
+                )
+                test_config_condition(
+                    extra_ip in vips,
+                    "faucet_extra_ips entry %s is a VIP of VLAN %s"
+                    % (extra_ip, vips.get(extra_ip)),
+                )
+                listed[extra_ip] = vlan.vid
+        if not listed:
+            return
+        for vlan in self.vlans.values():
+            for ip_dst, ip_gw in vlan.routes_by_ipv(4).items():
+                test_config_condition(
+                    ip_gw in listed,
+                    "VLAN %s route to %s is via faucet_extra_ips entry %s"
+                    % (vlan.vid, ip_dst, ip_gw),
+                )
+                test_config_condition(
+                    ip_dst.prefixlen == ip_dst.max_prefixlen
+                    and ip_dst.network_address in listed,
+                    "VLAN %s route to %s is to a faucet_extra_ips entry"
+                    % (vlan.vid, ip_dst),
+                )
 
     def finalize(self):
         """Need to configure OF tables as very last step."""
@@ -1550,7 +1600,8 @@ class DP(Conf):
             self.vlans,
             new_dp.vlans,
             diff=True,
-            ignore_keys=frozenset(["acls_in"]),
+            # An edit of faucet_extra_ips alone is applied address by address.
+            ignore_keys=frozenset(["acls_in", "faucet_extra_ips"]),
         )
         changed_acl_vlans = set()
         for vlan_id in same_vlans:

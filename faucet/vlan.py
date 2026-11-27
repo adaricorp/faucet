@@ -98,6 +98,8 @@ class VLAN(Conf):
         "faucet_vips": None,
         "faucet_mac": FAUCET_MAC,
         # set MAC for FAUCET VIPs on this VLAN
+        "faucet_extra_ips": None,
+        # Further IPv4 addresses in the VIP subnets to answer ARP for (arp_responder).
         "unicast_flood": True,
         "routes": None,
         "max_hosts": 256,
@@ -128,6 +130,7 @@ class VLAN(Conf):
         "acls_out": list,
         "faucet_vips": list,
         "faucet_mac": str,
+        "faucet_extra_ips": list,
         "unicast_flood": bool,
         "routes": list,
         "max_hosts": int,
@@ -151,6 +154,7 @@ class VLAN(Conf):
         self.dot1x_untagged = None
         self.dp_id = None
         self.edge_learn_stack_root = None
+        self.faucet_extra_ips = None
         self.faucet_mac = None
         self.faucet_vips = None
         self.max_hosts = None
@@ -171,6 +175,9 @@ class VLAN(Conf):
         self.untagged = []
         self.dot1x_untagged = []
 
+        # By each of faucet_extra_ips announced, when to refresh it, and the
+        # gateways told of it since.
+        self.dyn_extra_ip_refresh = {}
         self.dyn_host_cache = None
         self.dyn_host_cache_by_port = None
         self.dyn_host_cache_stats_stale = None
@@ -192,6 +199,7 @@ class VLAN(Conf):
         self._set_default("vid", self._id)
         self._set_default("name", str(self._id))
         self._set_default("faucet_vips", [])
+        self._set_default("faucet_extra_ips", [])
 
     def check_config(self):
         super().check_config()
@@ -252,6 +260,7 @@ class VLAN(Conf):
                     faucet_vip.network.prefixlen == faucet_vip.max_prefixlen,
                     "VIP cannot be a host address",
                 )
+        self._check_extra_ips()
 
         if self.routes:
             test_config_condition(
@@ -284,6 +293,50 @@ class VLAN(Conf):
                     "ip_gw version does not match the ip_dst version",
                 )
                 self.add_route(ip_dst, ip_gw)
+
+    def _check_extra_ips(self):
+        """Check faucet_extra_ips, and store them as a frozenset of addresses.
+
+        Each must be an IPv4 address in one of the VLAN's VIP subnets, other
+        than a VIP or the subnet's network or broadcast address, and listed
+        once.
+        """
+        extra_ips = []
+        for ip_str in self.faucet_extra_ips:
+            test_config_condition(
+                not isinstance(ip_str, str),
+                "faucet_extra_ips entry %s must be a string" % ip_str,
+            )
+            extra_ip = self._check_ip_str(ip_str)
+            test_config_condition(
+                extra_ip.version != 4,
+                "faucet_extra_ips entry %s is not an IPv4 address" % extra_ip,
+            )
+            vips = [vip for vip in self.faucet_vips if extra_ip in vip.network]
+            test_config_condition(
+                not vips,
+                "faucet_extra_ips entry %s is in no faucet_vips subnet" % extra_ip,
+            )
+            for vip in vips:
+                test_config_condition(
+                    extra_ip == vip.ip,
+                    "faucet_extra_ips entry %s is a VIP" % extra_ip,
+                )
+                test_config_condition(
+                    extra_ip
+                    in (vip.network.network_address, vip.network.broadcast_address),
+                    "faucet_extra_ips entry %s is the network or broadcast address of %s"
+                    % (extra_ip, vip.network),
+                )
+            test_config_condition(
+                extra_ip in extra_ips,
+                "faucet_extra_ips entry %s is listed twice" % extra_ip,
+            )
+            extra_ips.append(extra_ip)
+        # Added in address order: conf_hash() keeps a set's iteration order,
+        # which can follow the order its members were added in, and the same
+        # addresses listed in another order must make the same config.
+        self.faucet_extra_ips = frozenset(sorted(extra_ips))
 
     @staticmethod
     def vid_valid(vid):
@@ -698,8 +751,23 @@ class VLAN(Conf):
             faucet_vip = self.vip_map(ipa)
         return faucet_vip and ipa == faucet_vip.ip
 
+    def is_extra_ip(self, ipa):
+        """Return True if IP is one of this VLAN's faucet_extra_ips."""
+        return ipa in self.faucet_extra_ips
+
+    def forget_extra_ip_gws(self, ipa):
+        """Stop resolving one of this VLAN's faucet_extra_ips as a gateway."""
+        self.dyn_host_gws_by_ipv[ipa.version].discard(ipa)
+        self.dyn_route_gws_by_ipv[ipa.version].discard(ipa)
+
     def ip_in_vip_subnet(self, ipa, faucet_vip=None):
-        """Return faucet_vip if IP in same IP network as a VIP on this VLAN."""
+        """Return faucet_vip if IP in same IP network as a VIP on this VLAN.
+
+        Not for one of faucet_extra_ips, which FAUCET treats as its own, so it
+        never learns or resolves one as a host.
+        """
+        if self.is_extra_ip(ipa):
+            return None
         if faucet_vip is None:
             faucet_vip = self.vip_map(ipa)
         if faucet_vip:
