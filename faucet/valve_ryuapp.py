@@ -122,7 +122,8 @@ class OSKenAppBase(app_manager.OSKenApp):
         makes room in its event queue, and a sender waits whenever it cannot
         take a place in the queue at once: when the queue is full, or when
         other senders are already waiting for a place. So the reconfigure
-        event is sent from a new greenlet, which can wait.
+        event is sent from here only when it can take a place at once, and
+        otherwise from a new greenlet, which can wait.
 
         Args:
             sigid (int): signal received.
@@ -131,6 +132,24 @@ class OSKenAppBase(app_manager.OSKenApp):
             self.close()
             sys.exit(0)
         if sigid == signal.SIGHUP:
+            self._send_reconfigure()
+
+    def _send_reconfigure(self):
+        """Queue a reload, ahead of every event the hub takes in after it.
+
+        A greenlet spawned to send it runs only when the hub next wakes, and
+        on an idle controller what wakes the hub is the next event, such as
+        a packet in, which would then be queued ahead of the reload and
+        handled under the config the signal replaced. So the reload is sent
+        at once when the queue has a place free and no other sender is
+        waiting for one, as then sending it cannot wait.
+        """
+        places = self._events_sem
+        # A place free (counter), and no sender waiting (balance is the
+        # places free less the senders waiting).
+        if 0 < places.counter == places.balance:
+            self.send_event(self.__class__.__name__, EventReconfigure())
+        else:
             hub.spawn(self.send_event, self.__class__.__name__, EventReconfigure())
 
     @staticmethod

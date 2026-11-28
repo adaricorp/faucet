@@ -46,6 +46,10 @@ class EventSignal(event.EventBase):  # pylint: disable=too-few-public-methods
     """Event whose handler takes a signal."""
 
 
+class EventAfter(event.EventBase):  # pylint: disable=too-few-public-methods
+    """Event sent after a signal, as a packet in arriving after it."""
+
+
 class SignalApp(OSKenAppBase):
     """An app that records its reloads."""
 
@@ -109,6 +113,11 @@ class SignalApp(OSKenAppBase):
         self.log.append("signal")
         signal.raise_signal(signal.SIGHUP)
 
+    @set_ev_cls(EventAfter, MAIN_DISPATCHER)
+    def after_handler(self, _ryu_event):
+        """Record an event sent after a signal."""
+        self.log.append("after")
+
     @set_ev_cls(EventReconfigure, MAIN_DISPATCHER)
     def reload_config(self, _ryu_event):
         """Record a reload."""
@@ -153,6 +162,20 @@ class OSKenAppSignalTest(unittest.TestCase):  # pytype: disable=module-attr
         signal.raise_signal(signal.SIGHUP)
         self._wait_for_reloads(1)
         self.assertEqual(["reload"], self.app.log)
+
+    def test_sighup_reloads_before_a_later_event(self):
+        """Test an event sent after a SIGHUP is handled after its reload.
+
+        Nothing wakes the hub between the two, as on an idle controller
+        whose next event after a SIGHUP is a packet in.
+        """
+        signal.raise_signal(signal.SIGHUP)
+        self.app.send_event(self.app.name, EventAfter())
+        self._wait_for_reloads(1)
+        deadline = time.monotonic() + self.TIMEOUT
+        while "after" not in self.app.log and time.monotonic() < deadline:
+            hub.sleep(0.01)
+        self.assertEqual(["reload", "after"], self.app.log)
 
     def test_sighup_event_loop_full_queue(self):
         """Test SIGHUPs reload when they interrupt the event loop with its queue full."""
